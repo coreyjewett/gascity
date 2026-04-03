@@ -1,22 +1,26 @@
 # Gas City — Home Manager module.
 #
-# Installs gc and all runtime dependencies.
-# Designed to be used via the project flake:
+# Usage in your flake.nix:
 #
-#   inputs.gascity.url = "github:gastownhall/gascity";
+#   inputs = {
+#     gascity.url = "github:gastownhall/gascity";
+#     beads.url = "github:gastownhall/beads";  # >=0.61.0; nixpkgs ships 0.42.0
+#   };
 #
-#   home-manager.sharedModules = [ inputs.gascity.homeManagerModules.default ];
+#   home-manager.sharedModules = [
+#     inputs.gascity.homeManagerModules.default
+#     { programs.gascity.enable = true; }
+#   ];
 #
-#   programs.gascity.enable = true;
-#
-# Runtime dep versions pinned in deps.env:
-#   DOLT_VERSION=1.85.0   BD_COMMIT=9d9d0e53   BR_VERSION=0.1.20
+#   # In your home config, add bd from the beads flake:
+#   home.packages = [ inputs.beads.packages.${system}.default ];
 { inputs, ... }:
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.programs.gascity;
-  gcPkg = inputs.gascity.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  system = pkgs.stdenv.hostPlatform.system;
+  gcPkg = inputs.gascity.packages.${system}.default;
 in
 {
   options.programs.gascity = {
@@ -34,12 +38,13 @@ in
       pkgs.procps   # pgrep
       pkgs.lsof
 
-      # Beads work-tracking backend
-      pkgs.dolt
-      pkgs.util-linux  # flock
-      # bd (beads CLI) — not yet in nixpkgs; install via:
-      #   https://github.com/gastownhall/beads/releases
-      # Or set GC_BEADS=file to bypass the beads backend entirely.
+      # Beads backend deps
+      pkgs.dolt       # >=1.85.0 per deps.env
+      pkgs.util-linux # flock
+
+      # bd (beads CLI) — nixpkgs ships 0.42.0 which is too old.
+      # Add inputs.beads.url = "github:gastownhall/beads" to your flake
+      # and include inputs.beads.packages.${system}.default here.
     ];
   };
 }
