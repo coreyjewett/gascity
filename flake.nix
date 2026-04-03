@@ -40,7 +40,6 @@
         }
       );
 
-      # Explicit apps output — what `nix run` resolves to
       apps = forAllSystems (
         { self, system, ... }:
         {
@@ -51,30 +50,21 @@
         }
       );
 
-      # nix develop — full development environment with all runtime deps
       devShells = forAllSystems (
         { pkgs, ... }:
         {
           default = pkgs.mkShell {
             packages = [
-              # Build toolchain
               pkgs.go
-
-              # Runtime deps (required — see contrib/nix/README.md)
               pkgs.tmux
               pkgs.git
               pkgs.jq
               pkgs.procps # pgrep
               pkgs.lsof
-
-              # Beads work-tracking backend
-              # Pinned versions from deps.env:
-              #   DOLT_VERSION=1.85.0  BD_COMMIT=9d9d0e53
               pkgs.dolt
               pkgs.util-linux # flock
-              # bd (beads CLI) not in nixpkgs — install separately:
-              #   https://github.com/gastownhall/beads/releases
-              # Or set GC_BEADS=file to skip the beads backend entirely.
+              # bd (beads CLI >=0.61.0) — nixpkgs ships 0.42.0 which is too old.
+              # Add to your shell via: nix shell github:gastownhall/beads
             ];
 
             shellHook = ''
@@ -82,15 +72,16 @@
               echo "  build:   go build ./cmd/gc"
               echo "  test:    go test ./..."
               echo "  install: make install"
-              echo ""
-              echo "Runtime deps: tmux git jq pgrep lsof dolt flock"
-              echo "bd (beads CLI) must be installed separately — see contrib/nix/README.md"
+              if ! command -v bd >/dev/null 2>&1; then
+                echo ""
+                echo "  Warning: bd (beads CLI) not found."
+                echo "  Add it: nix shell github:gastownhall/beads"
+              fi
             '';
           };
         }
       );
 
-      # home-manager module — usage: inputs.gascity.homeManagerModules.default
       homeManagerModules.default = import ./contrib/nix/hm-module.nix { inputs = { gascity = self; }; };
       homeManagerModules.gascity = import ./contrib/nix/hm-module.nix { inputs = { gascity = self; }; };
 
