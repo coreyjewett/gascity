@@ -1,7 +1,7 @@
 # Gas City — Nix package derivation.
 #
 # Used two ways:
-#   1. From the project flake (src = self, version from flake)
+#   1. From the project flake (src = self, version from flake outputs)
 #   2. From nixpkgs (src = fetchFromGitHub { ... }, version pinned there)
 #
 # To update for a new release:
@@ -32,18 +32,24 @@ buildGoModule {
   # They cannot run in the Nix build sandbox.
   doCheck = false;
 
+  # Build only the gc binary, not the genschema tool
+  subPackages = [ "cmd/gc" ];
+
+  # Relax the go directive to whatever Go version nixpkgs provides.
+  # GOTOOLCHAIN=auto permits patch-level upgrades within the sandbox.
+  postPatch = ''
+    goVer="$(go env GOVERSION | sed 's/^go//')"
+    go mod edit -go="$goVer"
+  '';
+  env.GOTOOLCHAIN = "auto";
+
   # Mirrors Makefile LDFLAGS:
-  #   -X main.version=$(VERSION)
-  #   -X main.commit=$(COMMIT)
-  #   -X main.date=$(BUILD_TIME)
+  #   -X main.version=$(VERSION)  -X main.commit=$(COMMIT)  -X main.date=$(BUILD_TIME)
   ldflags = [
     "-s"
     "-w"
     "-X main.version=${version}"
   ];
-
-  # Build only the gc binary, not genschema
-  subPackages = [ "cmd/gc" ];
 
   meta = {
     description = "Orchestration-builder SDK for multi-agent systems";
@@ -55,7 +61,7 @@ buildGoModule {
 
       Runtime dependencies (not managed by this derivation):
         Required:  tmux, git, jq, pgrep, lsof
-        Beads backend: dolt (>=1.85.0), bd/beads (>=0.61.0), flock
+        Beads backend (default): dolt (>=1.85.0), bd/beads (>=0.61.0), flock
         Set GC_BEADS=file to skip the beads backend deps.
     '';
     homepage = "https://github.com/gastownhall/gascity";
