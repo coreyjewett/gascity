@@ -31,6 +31,7 @@ func createPoolSessionBead(
 		"template":             template,
 		"agent_name":           template,
 		"state":                "creating",
+		"pending_create_claim": "true",
 		"generation":           "1",
 		"continuation_epoch":   "1",
 		"instance_token":       sessionpkg.NewInstanceToken(),
@@ -182,11 +183,16 @@ func lookupPoolSessionNames(store beads.Store, template string) (map[string]stri
 	if store == nil {
 		return result, nil
 	}
-	all, err := store.ListByLabel(sessionBeadLabel, 0)
+	all, err := store.List(beads.ListQuery{
+		Label: sessionBeadLabel,
+	})
 	if err != nil {
 		return result, err
 	}
 	for _, b := range all {
+		if !sessionpkg.IsSessionBeadOrRepairable(b) {
+			continue
+		}
 		if b.Status == "closed" || b.Metadata["pool_slot"] == "" {
 			continue
 		}

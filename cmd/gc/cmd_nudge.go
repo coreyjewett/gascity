@@ -675,7 +675,9 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, sp runtime.Provider, qui
 		return false, nil
 	}
 	msg := formatNudgeRuntimeMessage(items)
-	if err := deliverImmediateNudge(sp, target.sessionName, runtime.TextContent(msg)); err != nil {
+	// Queued nudges are background delivery, not user-initiated sends. Keep
+	// them on the provider's regular nudge path instead of the immediate path.
+	if err := sp.Nudge(target.sessionName, runtime.TextContent(msg)); err != nil {
 		telemetry.RecordNudge(context.Background(), target.agentKey(), err)
 		if recErr := recordQueuedNudgeFailure(target.cityPath, queuedNudgeIDs(items), err, time.Now()); recErr != nil {
 			return false, recErr
@@ -787,7 +789,7 @@ func blockedQueuedNudgeReason(store beads.Store, item queuedNudge) (string, bool
 		}
 		return "", false, err
 	}
-	if wait.Type != waitBeadType {
+	if !session.IsWaitBead(wait) {
 		return "wait-reference-invalid", true, nil
 	}
 	switch wait.Metadata["state"] {

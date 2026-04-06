@@ -5,6 +5,8 @@
 package main
 
 import (
+	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -434,8 +436,9 @@ func healExpiredTimers(session *beads.Bead, store beads.Store, clk clock.Clock) 
 			batch := map[string]string{
 				"quarantined_until": "",
 				"wake_attempts":     "0",
+				"churn_count":       "0",
 			}
-			if session.Metadata["sleep_reason"] == "quarantine" {
+			if session.Metadata["sleep_reason"] == "quarantine" || session.Metadata["sleep_reason"] == "context-churn" {
 				batch["sleep_reason"] = ""
 			}
 			if err := store.SetMetadataBatch(session.ID, batch); err == nil {
@@ -493,15 +496,25 @@ func recordWakeFailure(session *beads.Bead, store beads.Store, clk clock.Clock) 
 	if session.Metadata == nil {
 		session.Metadata = make(map[string]string)
 	}
-	// Clear session_key so the next start gets a fresh conversation.
-	// Prevents crash loops when the key references a conversation that
-	// no longer exists (e.g., deleted, or aimux account rotation).
-	if session.Metadata["session_key"] != "" {
+	// Clear session_key and started_config_hash so the next start gets a
+	// fresh conversation. Clearing session_key triggers backfill of a new
+	// UUID; clearing started_config_hash ensures resolveSessionCommand
+	// treats the next wake as a first start (--session-id) rather than a
+	// resume (--resume) of a conversation that no longer exists.
+	//
+	// checkStability runs after healState, and healState may already have
+	// cleared session_key for an unexpected death before recordWakeFailure
+	// runs. Clear started_config_hash whenever either field is set so the
+	// recovery remains correct in that call order and for any skewed state
+	// left behind by older builds.
+	if session.Metadata["session_key"] != "" || session.Metadata["started_config_hash"] != "" {
 		_ = store.SetMetadataBatch(session.ID, map[string]string{
 			"session_key":                "",
+			"started_config_hash":        "",
 			"continuation_reset_pending": "true",
 		})
 		session.Metadata["session_key"] = ""
+		session.Metadata["started_config_hash"] = ""
 		session.Metadata["continuation_reset_pending"] = "true"
 	}
 	if attempts >= defaultMaxWakeAttempts {
@@ -536,6 +549,122 @@ func clearWakeFailures(session *beads.Bead, store beads.Store) {
 			session.Metadata[k] = v
 		}
 	}
+}
+
+// checkChurn detects repeated non-productive wake→die cycles (context
+// exhaustion death spirals). Unlike checkStability which catches rapid
+// crashes (< stabilityThreshold), this catches sessions that survive past
+// the stability threshold but die before being productive.
+//
+// Returns true if a churn event was recorded (caller should skip further
+// processing for this session).
+func checkChurn(session *beads.Bead, cfg *config.City, alive bool, dt *drainTracker, store beads.Store, clk clock.Clock) bool {
+	if alive {
+		return false
+	}
+	// Subprocess sessions exit intentionally — not churn.
+	if cfg != nil && cfg.Session.Provider == "subprocess" {
+		return false
+	}
+	// Intentional drains are not churn.
+	if dt != nil && dt.get(session.ID) != nil {
+		return false
+	}
+	lastWoke := session.Metadata["last_woke_at"]
+	if lastWoke == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, lastWoke)
+	if err != nil {
+		return false
+	}
+	elapsed := clk.Now().Sub(t)
+	// Only fires for sessions in the "churn band": survived past
+	// stabilityThreshold (so checkStability didn't fire) but died
+	// before churnProductivityThreshold (so not productive).
+	if elapsed < stabilityThreshold {
+		return false
+	}
+	if elapsed >= churnProductivityThreshold {
+		// Session was productive — clear any stale churn count so it
+		// doesn't carry over and cause premature quarantine next time.
+		clearChurn(session, store)
+		return false
+	}
+
+	recordChurn(session, store, clk)
+	// Clear last_woke_at so this death is not re-counted next tick
+	// (edge-triggered, same pattern as checkStability).
+	_ = store.SetMetadata(session.ID, "last_woke_at", "")
+	session.Metadata["last_woke_at"] = ""
+	return true
+}
+
+// recordChurn increments the churn counter and clears session_key on
+// every churn event to force a fresh conversation on next wake. When
+// the counter reaches defaultMaxChurnCycles, the session is quarantined.
+func recordChurn(session *beads.Bead, store beads.Store, clk clock.Clock) {
+	count, _ := strconv.Atoi(session.Metadata["churn_count"])
+	count++
+
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string)
+	}
+
+	// Always clear session_key on churn — context exhaustion means the
+	// conversation itself is the problem. A fresh conversation avoids
+	// re-hitting the same wall.
+	clearBatch := map[string]string{
+		"session_key":                "",
+		"continuation_reset_pending": "true",
+	}
+	if session.Metadata["session_key"] != "" {
+		_ = store.SetMetadataBatch(session.ID, clearBatch)
+		for k, v := range clearBatch {
+			session.Metadata[k] = v
+		}
+	}
+
+	if count >= defaultMaxChurnCycles {
+		qUntil := clk.Now().Add(defaultQuarantineDuration).UTC().Format(time.RFC3339)
+		batch := map[string]string{
+			"churn_count":       strconv.Itoa(count),
+			"quarantined_until": qUntil,
+			"sleep_reason":      "context-churn",
+		}
+		if err := store.SetMetadataBatch(session.ID, batch); err == nil {
+			for k, v := range batch {
+				session.Metadata[k] = v
+			}
+		}
+		return
+	}
+
+	_ = store.SetMetadata(session.ID, "churn_count", strconv.Itoa(count))
+	session.Metadata["churn_count"] = strconv.Itoa(count)
+}
+
+// clearChurn resets the churn counter for a productive session.
+func clearChurn(session *beads.Bead, store beads.Store) {
+	if session.Metadata["churn_count"] == "" || session.Metadata["churn_count"] == "0" {
+		return
+	}
+	_ = store.SetMetadata(session.ID, "churn_count", "0")
+	session.Metadata["churn_count"] = "0"
+}
+
+// productiveLongEnough returns true if the session has been alive past
+// churnProductivityThreshold — long enough to have done useful work.
+func productiveLongEnough(session beads.Bead, clk clock.Clock) bool {
+	lastWoke := session.Metadata["last_woke_at"]
+	if lastWoke == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, lastWoke)
+	if err != nil {
+		return false
+	}
+	return clk.Now().Sub(t) >= churnProductivityThreshold
 }
 
 // stableLongEnough returns true if the session has been alive past stabilityThreshold.
@@ -609,8 +738,35 @@ func healState(session *beads.Bead, alive bool, store beads.Store, clk clock.Clo
 		session.Metadata = make(map[string]string)
 	}
 	if session.Metadata["state"] != target {
-		_ = store.SetMetadata(session.ID, "state", target)
-		session.Metadata["state"] = target
+		batch := map[string]string{"state": target}
+		// When a session with a resume key dies unexpectedly (no drain
+		// in progress), clear the resume identity so the next start uses a
+		// fresh conversation instead of retrying stale resume metadata.
+		// Skip this for deliberate drains where the key is still valid for
+		// future resume.
+		//
+		// Default is "clear key" (safe for crash loops). Any new sleep_reason
+		// that represents a deliberate drain must be added here to preserve
+		// the resume key. See sleep_reason assignment sites across the codebase.
+		if target == "asleep" && (session.Metadata["session_key"] != "" || session.Metadata["started_config_hash"] != "") {
+			prevState := session.Metadata["state"]
+			sleepReason := session.Metadata["sleep_reason"]
+			isDraining := sleepReason == "idle" || sleepReason == "idle-timeout" ||
+				sleepReason == "no-wake-reason" || sleepReason == "config-drift" ||
+				sleepReason == "drained" || sleepReason == "user-hold" ||
+				sleepReason == "wait-hold"
+			if !isDraining && (prevState == "active" || prevState == "awake" || prevState == "creating") {
+				batch["session_key"] = ""
+				batch["started_config_hash"] = ""
+				batch["continuation_reset_pending"] = "true"
+			}
+		}
+		if err := store.SetMetadataBatch(session.ID, batch); err != nil {
+			fmt.Fprintf(os.Stderr, "healState: SetMetadataBatch %s: %v\n", session.ID, err) //nolint:errcheck
+		}
+		for k, v := range batch {
+			session.Metadata[k] = v
+		}
 	}
 }
 

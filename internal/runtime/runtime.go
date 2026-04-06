@@ -17,9 +17,18 @@ import (
 // requested name.
 var ErrSessionExists = errors.New("session already exists")
 
+// ErrSessionInitializing reports that a session's infrastructure exists but is
+// still starting up (e.g., K8s pod is running but tmux hasn't started yet).
+// Callers should back off and retry rather than treating it as a failure.
+var ErrSessionInitializing = errors.New("session is initializing")
+
 // ErrInteractionUnsupported reports that a provider does not implement the
 // structured pending/respond interaction capability for the requested session.
 var ErrInteractionUnsupported = errors.New("session interaction is unsupported")
+
+// ErrSessionDiedDuringStartup reports that a provider created a session
+// process, but it exited before startup completed successfully.
+var ErrSessionDiedDuringStartup = errors.New("session died during startup")
 
 // ContentBlock represents a content element in a message.
 // Type is "text" or "file_path".

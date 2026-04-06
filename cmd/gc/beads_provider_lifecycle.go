@@ -73,6 +73,10 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 	// passthroughEnv() includes it for all agent sessions.
 	readDoltPort(cityPath)
 	beadsPrefix := config.EffectiveHQPrefix(cfg)
+	// Leave doltDatabase empty unless the caller knows a canonical server DB
+	// identity that differs from the bead prefix. New managed bd stores still
+	// default to prefix-named databases, but older/imported metadata may carry
+	// a different dolt_database that gc-beads-bd should preserve.
 	if err := initAndHookDir(cityPath, cityPath, beadsPrefix); err != nil {
 		return fmt.Errorf("init city beads: %w", err)
 	}
@@ -114,7 +118,9 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 	if rawBeadsProvider(cityPath) == "bd" {
 		if os.Getenv("GC_DOLT") == "skip" {
-			seedDeferredManagedBeads(dir, prefix)
+			// Defer to controller/startup without forcing a new dolt_database:
+			// preserve existing metadata identity when present.
+			seedDeferredManagedBeads(dir, prefix, "")
 			return true, nil
 		}
 		if err := ensureBeadsProvider(cityPath); err != nil {
@@ -128,7 +134,7 @@ func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 
 	provider := beadsProvider(cityPath)
 	if provider == "" {
-		seedDeferredManagedBeads(dir, prefix)
+		seedDeferredManagedBeads(dir, prefix, "")
 		return true, nil
 	}
 	// For exec: providers, probe to check if the backing service is available.
@@ -137,7 +143,7 @@ func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 		script := strings.TrimPrefix(provider, "exec:")
 		if !runProviderProbe(script, cityPath) {
 			if rawBeadsProvider(cityPath) == "bd" {
-				seedDeferredManagedBeads(dir, prefix)
+				seedDeferredManagedBeads(dir, prefix, "")
 			}
 			return true, nil // Not running — defer to gc start.
 		}
@@ -151,7 +157,7 @@ func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
 	return false, nil
 }
 
-func seedDeferredManagedBeads(dir, prefix string) {
+func seedDeferredManagedBeads(dir, prefix, doltDatabase string) {
 	if strings.TrimSpace(dir) == "" || strings.TrimSpace(prefix) == "" {
 		return
 	}
@@ -159,8 +165,30 @@ func seedDeferredManagedBeads(dir, prefix string) {
 	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		return
 	}
+	if strings.TrimSpace(doltDatabase) == "" {
+		// When the caller does not know the canonical DB name yet, preserve an
+		// existing metadata-backed identity and fall back to the bead prefix for
+		// first-time initialization.
+		doltDatabase = readDeferredManagedDoltDatabase(filepath.Join(beadsDir, "metadata.json"), prefix)
+	}
 	ensureDeferredManagedConfig(filepath.Join(beadsDir, "config.yaml"), prefix)
-	ensureDeferredManagedMetadata(filepath.Join(beadsDir, "metadata.json"), prefix)
+	ensureDeferredManagedMetadata(filepath.Join(beadsDir, "metadata.json"), doltDatabase)
+}
+
+func readDeferredManagedDoltDatabase(path, fallback string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fallback
+	}
+
+	var meta map[string]any
+	if json.Unmarshal(data, &meta) != nil {
+		return fallback
+	}
+	if db := strings.TrimSpace(fmt.Sprint(meta["dolt_database"])); db != "" && db != "<nil>" {
+		return db
+	}
+	return fallback
 }
 
 func ensureDeferredManagedConfig(path, prefix string) {
@@ -233,11 +261,11 @@ func ensureDeferredManagedConfig(path, prefix string) {
 	_ = os.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644)
 }
 
-func ensureDeferredManagedMetadata(path, prefix string) {
+func ensureDeferredManagedMetadata(path, doltDatabase string) {
 	defaults := map[string]any{
 		"backend":       "dolt",
 		"database":      "dolt",
-		"dolt_database": prefix,
+		"dolt_database": doltDatabase,
 		"dolt_mode":     "server",
 	}
 
@@ -256,7 +284,7 @@ func ensureDeferredManagedMetadata(path, prefix string) {
 
 	changed := false
 	for key, value := range defaults {
-		if existing, ok := meta[key]; !ok || strings.TrimSpace(fmt.Sprint(existing)) == "" {
+		if existing := strings.TrimSpace(fmt.Sprint(meta[key])); existing != strings.TrimSpace(fmt.Sprint(value)) {
 			meta[key] = value
 			changed = true
 		}
@@ -277,7 +305,7 @@ func ensureDeferredManagedMetadata(path, prefix string) {
 // init the directory, then install event hooks. The ordering matters
 // because init (bd init) may recreate .beads/ and wipe existing hooks.
 func initAndHookDir(cityPath, dir, prefix string) error {
-	if err := initBeadsForDir(cityPath, dir, prefix); err != nil {
+	if err := initBeadsForDir(cityPath, dir, prefix, ""); err != nil {
 		return err
 	}
 	// Non-fatal: hooks are convenience (event forwarding), not critical.
@@ -330,10 +358,14 @@ func shutdownBeadsProvider(cityPath string) error {
 // initBeadsForDir initializes bead store infrastructure in a directory.
 // Idempotent — skips if already initialized. Callers should use
 // initAndHookDir instead to ensure hooks are installed afterward.
-func initBeadsForDir(cityPath, dir, prefix string) error {
+func initBeadsForDir(cityPath, dir, prefix, doltDatabase string) error {
 	provider := beadsProvider(cityPath)
 	if strings.HasPrefix(provider, "exec:") {
-		return runProviderOp(strings.TrimPrefix(provider, "exec:"), cityPath, "init", dir, prefix)
+		args := []string{"init", dir, prefix}
+		if strings.TrimSpace(doltDatabase) != "" {
+			args = append(args, doltDatabase)
+		}
+		return runProviderOp(strings.TrimPrefix(provider, "exec:"), cityPath, args...)
 	}
 	return nil
 }
@@ -423,28 +455,39 @@ func readDoltPort(cityPath string) {
 	// Don't overwrite with local state files.
 	if isExternalDolt(cityPath) {
 		if host := doltHostForCity(cityPath); host != "" {
-			_ = os.Setenv("BEADS_DOLT_HOST", host)
+			_ = os.Setenv("BEADS_DOLT_SERVER_HOST", host)
 		} else {
-			_ = os.Unsetenv("BEADS_DOLT_HOST")
+			_ = os.Unsetenv("BEADS_DOLT_SERVER_HOST")
 		}
 		if port := doltPortForCity(cityPath); port != "" {
 			_ = os.Setenv("GC_DOLT_PORT", port)
-			_ = os.Setenv("BEADS_DOLT_PORT", port)
+			_ = os.Setenv("BEADS_DOLT_SERVER_PORT", port)
 		} else {
 			_ = os.Unsetenv("GC_DOLT_PORT")
-			_ = os.Unsetenv("BEADS_DOLT_PORT")
+			_ = os.Unsetenv("BEADS_DOLT_SERVER_PORT")
 		}
 		return
 	}
 	if port := currentDoltPort(cityPath); port != "" {
 		_ = os.Setenv("GC_DOLT_PORT", port)
-		_ = os.Setenv("BEADS_DOLT_PORT", port)
-		_ = os.Unsetenv("BEADS_DOLT_HOST")
+		_ = os.Setenv("BEADS_DOLT_SERVER_PORT", port)
+		_ = os.Unsetenv("BEADS_DOLT_SERVER_HOST")
 		return
 	}
+	// When auto-start is disabled, propagate the stale port so bd subprocess
+	// calls fail fast with "connection refused" rather than auto-starting an
+	// embedded dolt on a random port and overwriting the shared port file.
+	if doltAutoStartDisabled(cityPath) {
+		if stalePort := staleDoltPort(cityPath); stalePort != "" {
+			_ = os.Setenv("GC_DOLT_PORT", stalePort)
+			_ = os.Setenv("BEADS_DOLT_SERVER_PORT", stalePort)
+			_ = os.Unsetenv("BEADS_DOLT_SERVER_HOST")
+			return
+		}
+	}
 	_ = os.Unsetenv("GC_DOLT_PORT")
-	_ = os.Unsetenv("BEADS_DOLT_PORT")
-	_ = os.Unsetenv("BEADS_DOLT_HOST")
+	_ = os.Unsetenv("BEADS_DOLT_SERVER_PORT")
+	_ = os.Unsetenv("BEADS_DOLT_SERVER_HOST")
 }
 
 type doltRuntimeState struct {
@@ -455,17 +498,53 @@ type doltRuntimeState struct {
 	StartedAt string `json:"started_at"`
 }
 
+// doltAutoStartDisabled returns true when the .beads/config.yaml in the
+// given directory contains "dolt.auto-start: false". When true, the system
+// must never auto-start a dolt server or overwrite the port file.
+func doltAutoStartDisabled(dir string) bool {
+	data, err := os.ReadFile(filepath.Join(dir, ".beads", "config.yaml"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "dolt.auto-start:") {
+			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "dolt.auto-start:"))
+			return val == "false"
+		}
+	}
+	return false
+}
+
+// staleDoltPort reads the dolt-server.port file without checking
+// reachability. Returns the port string or "" if no file exists.
+func staleDoltPort(cityPath string) string {
+	portFile := filepath.Join(cityPath, ".beads", "dolt-server.port")
+	data, err := os.ReadFile(portFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 // currentDoltPort returns the controller-managed Dolt port for the city.
 // Prefer the runtime state file under .gc/runtime because .beads/dolt-server.port
 // may be stale or missing in rig directories after restarts. Falls back to the
 // legacy city root port file for compatibility.
+//
+// When dolt.auto-start is disabled, stale port files are preserved to prevent
+// bd from auto-starting an embedded server on a random port (which overwrites
+// the shared port file and corrupts the managed server setup).
 func currentDoltPort(cityPath string) string {
 	if port := currentManagedDoltPort(cityPath); port != "" {
 		writeDoltPortFile(cityPath, port)
 		return port
 	}
+	noAutoStart := doltAutoStartDisabled(cityPath)
 	if hasManagedDoltState(cityPath) {
-		removeDoltPortFile(cityPath)
+		if !noAutoStart {
+			removeDoltPortFile(cityPath)
+		}
 		return ""
 	}
 
@@ -475,7 +554,11 @@ func currentDoltPort(cityPath string) string {
 		if port != "" && doltPortReachable(port) {
 			return port
 		}
-		_ = os.Remove(portFile)
+		// When auto-start is disabled, preserve the port file so bd
+		// doesn't fall back to spawning an embedded dolt server.
+		if !noAutoStart {
+			_ = os.Remove(portFile)
+		}
 	}
 	return ""
 }

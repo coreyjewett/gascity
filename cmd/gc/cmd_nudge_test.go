@@ -100,6 +100,44 @@ func TestDeliverSessionNudgeWithProviderWaitIdleStartsCodexPollerWhenQueued(t *t
 	}
 }
 
+func TestDeliverSessionNudgeWithProviderImmediateUsesImmediateNudge(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	fake := runtime.NewFake()
+	if err := fake.Start(context.Background(), "sess-worker", runtime.Config{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		resolved:    &config.ResolvedProvider{Name: "codex"},
+		sessionName: "sess-worker",
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := deliverSessionNudgeWithProvider(target, fake, "check deploy status", nudgeDeliveryImmediate, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("deliverSessionNudgeWithProvider = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	immediateCalls := 0
+	for _, call := range fake.Calls {
+		if call.Method == "NudgeNow" {
+			immediateCalls++
+		}
+		if call.Method == "Nudge" {
+			t.Fatalf("unexpected regular nudge call: %+v", call)
+		}
+	}
+	if immediateCalls != 1 {
+		t.Fatalf("immediate nudge calls = %d, want 1", immediateCalls)
+	}
+	if !strings.Contains(stdout.String(), "Nudged worker") {
+		t.Fatalf("stdout = %q, want immediate nudge confirmation", stdout.String())
+	}
+}
+
 func TestSendMailNotifyWithProviderQueuesWhenSessionSleeping(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	dir := t.TempDir()
@@ -609,6 +647,37 @@ func TestSplitQueuedNudgesForDelivery_BlocksCanceledWaitNudge(t *testing.T) {
 	}
 	if got := blocked["wait-canceled"]; len(got) != 1 || got[0].ID != "n1" {
 		t.Fatalf("blocked = %#v, want n1 under wait-canceled", blocked)
+	}
+}
+
+func TestSplitQueuedNudgesForDelivery_AllowsReadyLegacyWaitNudge(t *testing.T) {
+	store := beads.NewMemStore()
+	wait, err := store.Create(beads.Bead{
+		Type:   session.LegacyWaitBeadType,
+		Labels: []string{waitBeadLabel},
+		Metadata: map[string]string{
+			"session_id": "gc-session",
+			"state":      waitStateReady,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create legacy wait bead: %v", err)
+	}
+
+	deliverable, blocked, err := splitQueuedNudgesForDelivery(store, []queuedNudge{{
+		ID:        "n1",
+		Agent:     "worker",
+		Source:    "wait",
+		Reference: &nudgeReference{Kind: "bead", ID: wait.ID},
+	}})
+	if err != nil {
+		t.Fatalf("splitQueuedNudgesForDelivery: %v", err)
+	}
+	if len(deliverable) != 1 || deliverable[0].ID != "n1" {
+		t.Fatalf("deliverable = %#v, want n1", deliverable)
+	}
+	if len(blocked) != 0 {
+		t.Fatalf("blocked = %#v, want empty", blocked)
 	}
 }
 

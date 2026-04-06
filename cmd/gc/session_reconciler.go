@@ -109,6 +109,8 @@ func allDependenciesAlive(
 // from "suspended" (still in config, not runnable) when closing beads.
 //
 // Returns the number of sessions woken this tick.
+//
+//nolint:unparam // compatibility wrapper retains the full production signature.
 func reconcileSessionBeads(
 	ctx context.Context,
 	sessions []beads.Bead,
@@ -122,6 +124,7 @@ func reconcileSessionBeads(
 	readyWaitSet map[string]bool,
 	dt *drainTracker,
 	poolDesired map[string]int,
+	storeQueryPartial bool,
 	workSet map[string]bool,
 	cityName string,
 	it idleTracker,
@@ -130,6 +133,67 @@ func reconcileSessionBeads(
 	startupTimeout time.Duration,
 	driftDrainTimeout time.Duration,
 	stdout, stderr io.Writer,
+) int {
+	return reconcileSessionBeadsAtPath(
+		ctx, "", sessions, desiredState, configuredNames, cfg, sp, store, dops, assignedWorkBeads, readyWaitSet, dt,
+		poolDesired, storeQueryPartial, workSet, cityName, it, clk, rec, startupTimeout, driftDrainTimeout, stdout, stderr,
+	)
+}
+
+func reconcileSessionBeadsAtPath(
+	ctx context.Context,
+	cityPath string,
+	sessions []beads.Bead,
+	desiredState map[string]TemplateParams,
+	configuredNames map[string]bool,
+	cfg *config.City,
+	sp runtime.Provider,
+	store beads.Store,
+	dops drainOps,
+	assignedWorkBeads []beads.Bead,
+	readyWaitSet map[string]bool,
+	dt *drainTracker,
+	poolDesired map[string]int,
+	storeQueryPartial bool,
+	workSet map[string]bool,
+	cityName string,
+	it idleTracker,
+	clk clock.Clock,
+	rec events.Recorder,
+	startupTimeout time.Duration,
+	driftDrainTimeout time.Duration,
+	stdout, stderr io.Writer,
+) int {
+	return reconcileSessionBeadsTraced(
+		ctx, cityPath, sessions, desiredState, configuredNames, cfg, sp, store, dops, assignedWorkBeads, readyWaitSet, dt,
+		poolDesired, storeQueryPartial, workSet, cityName, it, clk, rec, startupTimeout, driftDrainTimeout, stdout, stderr, nil,
+	)
+}
+
+func reconcileSessionBeadsTraced(
+	ctx context.Context,
+	cityPath string,
+	sessions []beads.Bead,
+	desiredState map[string]TemplateParams,
+	configuredNames map[string]bool,
+	cfg *config.City,
+	sp runtime.Provider,
+	store beads.Store,
+	dops drainOps,
+	assignedWorkBeads []beads.Bead,
+	readyWaitSet map[string]bool,
+	dt *drainTracker,
+	poolDesired map[string]int,
+	storeQueryPartial bool,
+	workSet map[string]bool,
+	cityName string,
+	it idleTracker,
+	clk clock.Clock,
+	rec events.Recorder,
+	startupTimeout time.Duration,
+	driftDrainTimeout time.Duration,
+	stdout, stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
 ) int {
 	deps := buildDepsMap(cfg)
 
@@ -162,6 +226,11 @@ func reconcileSessionBeads(
 		if !isKnownState(*session) {
 			fmt.Fprintf(stderr, "session reconciler: skipping %s with unknown state %q\n", //nolint:errcheck // best-effort stderr
 				session.Metadata["session_name"], session.Metadata["state"])
+			if trace != nil {
+				trace.recordDecision("reconciler.session.unknown_state", session.Metadata["template"], session.Metadata["session_name"], "unknown_state_skipped", "skipped", traceRecordPayload{
+					"state": session.Metadata["state"],
+				}, nil, "")
+			}
 			continue
 		}
 
@@ -175,22 +244,71 @@ func reconcileSessionBeads(
 			providerAlive := sp.IsRunning(name)
 			// Heal state using provider liveness, not agent membership.
 			healState(session, providerAlive, store, clk)
-			if providerAlive {
-				reason := "orphaned"
-				if configuredNames[name] {
-					reason = "suspended"
+			if preserveConfiguredNamedSessionBead(*session, cfg, cityName) {
+				template := normalizedSessionTemplate(*session, cfg)
+				if template == "" {
+					template = session.Metadata["template"]
 				}
-				beginSessionDrain(*session, sp, dt, reason, clk, defaultDrainTimeout)
-				fmt.Fprintf(stdout, "Draining session '%s': %s\n", name, reason) //nolint:errcheck
+				preservedTP, err := resolvePreservedConfiguredNamedSessionTemplate(cityPath, cityName, cfg, sp, store, ordered, *session, clk, stderr)
+				if err != nil {
+					fmt.Fprintf(stderr, "session reconciler: resolve preserved named session %s: %v\n", name, err) //nolint:errcheck
+				} else {
+					tp = preservedTP
+					desired = true
+				}
+				if trace != nil {
+					trace.recordDecision("reconciler.session.preserve_configured_named", template, name, "preserve", map[bool]string{
+						true:  "kept_open",
+						false: "resolution_failed",
+					}[desired], traceRecordPayload{
+						"provider_alive": providerAlive,
+						"degraded":       err != nil,
+					}, nil, "")
+				}
 			} else {
-				// Not running and not desired — close the bead.
-				reason := "orphaned"
-				if configuredNames[name] {
-					reason = "suspended"
+				if providerAlive {
+					// When a store query failed (partial results),
+					// skip drain — the session may have work that we
+					// couldn't see due to the transient failure.
+					// Draining would send Ctrl-C and interrupt the
+					// running agent mid-tool-call.
+					if storeQueryPartial {
+						fmt.Fprintf(stdout, "Skipping drain for '%s': store query partial (transient failure)\n", name) //nolint:errcheck
+						continue
+					}
+					reason := "orphaned"
+					if configuredNames[name] {
+						reason = "suspended"
+					}
+					template := normalizedSessionTemplate(*session, cfg)
+					if template == "" {
+						template = session.Metadata["template"]
+					}
+					if trace != nil {
+						trace.recordDecision("reconciler.session.orphan_or_suspended", template, name, reason, "drain", traceRecordPayload{
+							"store_query_partial": storeQueryPartial,
+							"provider_alive":      providerAlive,
+						}, nil, "")
+					}
+					beginSessionDrain(*session, sp, dt, reason, clk, defaultDrainTimeout)
+					fmt.Fprintf(stdout, "Draining session '%s': %s\n", name, reason) //nolint:errcheck
+				} else {
+					// Not running and not desired — close the bead.
+					reason := "orphaned"
+					if configuredNames[name] {
+						reason = "suspended"
+					}
+					template := normalizedSessionTemplate(*session, cfg)
+					if template == "" {
+						template = session.Metadata["template"]
+					}
+					if trace != nil {
+						trace.recordDecision("reconciler.session.close_orphan", template, name, reason, "closed", nil, nil, "")
+					}
+					closeBead(store, session.ID, reason, clk.Now().UTC(), stderr)
 				}
-				closeBead(store, session.ID, reason, clk.Now().UTC(), stderr)
+				continue
 			}
-			continue
 		}
 
 		// Liveness includes zombie detection: tmux session exists AND
@@ -212,8 +330,39 @@ func reconcileSessionBeads(
 		}
 		if alive && shouldRollbackPendingCreate(session) && !runningSessionMatchesPendingCreate(session, name, sp) {
 			fmt.Fprintf(stderr, "session reconciler: rolling back pending create %s: live runtime belongs to another session\n", name) //nolint:errcheck
+			if trace != nil {
+				trace.recordDecision("reconciler.session.pending_create", tp.TemplateName, name, "pending_create_rollback", "rollback", nil, nil, "")
+			}
 			rollbackPendingCreate(session, store, clk.Now().UTC(), stderr)
 			continue
+		}
+
+		// Drain-ack: agent signaled it's done (gc runtime drain-ack).
+		// Honor the ack even if the agent exited before this tick; otherwise
+		// the session falls through to orphan handling and can block the next
+		// worker wave until the stale awake bead ages out.
+		if dops != nil {
+			if acked, _ := dops.isDrainAcked(name); acked {
+				_ = dops.clearDrain(name)
+				if alive {
+					if err := sp.Stop(name); err != nil {
+						fmt.Fprintf(stderr, "session reconciler: stopping drain-acked %s: %v\n", name, err) //nolint:errcheck
+					} else {
+						fmt.Fprintf(stdout, "Stopped drain-acked session '%s'\n", name) //nolint:errcheck
+					}
+				}
+				rec.Record(events.Event{
+					Type:    events.SessionStopped,
+					Actor:   "gc",
+					Subject: tp.DisplayName(),
+					Message: "drain acknowledged by agent",
+				})
+				if store != nil && session.ID != "" {
+					_ = store.SetMetadata(session.ID, "state", "drained")
+					session.Metadata["state"] = "drained"
+				}
+				continue
+			}
 		}
 
 		policy := resolveSessionSleepPolicy(*session, cfg, sp)
@@ -230,39 +379,25 @@ func reconcileSessionBeads(
 			continue // crash recorded, skip further processing
 		}
 
+		// Churn check: detect context exhaustion death spiral.
+		// Fires for sessions that survived past stabilityThreshold but
+		// died before churnProductivityThreshold — alive long enough to
+		// not be a rapid crash, but too short to be productive.
+		if checkChurn(session, cfg, alive, dt, store, clk) {
+			continue // churn recorded, skip further processing
+		}
+
 		// Clear wake failures for sessions that have been stable long enough.
 		if alive && stableLongEnough(*session, clk) {
 			clearWakeFailures(session, store)
 		}
+		// Clear churn counter for sessions that have been productive.
+		if alive && productiveLongEnough(*session, clk) {
+			clearChurn(session, store)
+		}
 		if alive && shouldRollbackPendingCreate(session) {
 			if err := clearPendingCreateClaim(session, store); err != nil {
 				fmt.Fprintf(stderr, "session reconciler: clearing pending create claim for %s: %v\n", name, err) //nolint:errcheck
-			}
-		}
-
-		// Drain-ack: agent signaled it's done (gc runtime drain-ack).
-		// Stop the session and close its bead. The bead becomes a permanent
-		// historical record of this incarnation. The next work item gets a
-		// brand-new session bead with a fresh session key and clean context.
-		if alive && dops != nil {
-			if acked, _ := dops.isDrainAcked(name); acked {
-				_ = dops.clearDrain(name)
-				if err := sp.Stop(name); err != nil {
-					fmt.Fprintf(stderr, "session reconciler: stopping drain-acked %s: %v\n", name, err) //nolint:errcheck
-				} else {
-					fmt.Fprintf(stdout, "Stopped drain-acked session '%s'\n", name) //nolint:errcheck
-					rec.Record(events.Event{
-						Type:    events.SessionStopped,
-						Actor:   "gc",
-						Subject: tp.DisplayName(),
-						Message: "drain acknowledged by agent",
-					})
-				}
-				if store != nil && session.ID != "" {
-					_ = store.SetMetadata(session.ID, "state", "drained")
-					session.Metadata["state"] = "drained"
-				}
-				continue
 			}
 		}
 
@@ -287,10 +422,13 @@ func reconcileSessionBeads(
 				}
 				// Rotate session_key so the next start gets a fresh
 				// conversation. Clearing started_config_hash forces
-				// firstStart=true in resolveSessionCommand.
+				// firstStart=true in resolveSessionCommand. Clearing
+				// last_woke_at masks the intentional death from crash
+				// and churn trackers (both check last_woke_at first).
 				batch := map[string]string{
 					"restart_requested":   "",
 					"started_config_hash": "",
+					"last_woke_at":        "",
 				}
 				if newKey, err := sessionpkg.GenerateSessionKey(); err == nil {
 					batch["session_key"] = newKey
@@ -299,6 +437,7 @@ func reconcileSessionBeads(
 				_ = store.SetMetadataBatch(session.ID, batch)
 				session.Metadata["restart_requested"] = ""
 				session.Metadata["started_config_hash"] = ""
+				session.Metadata["last_woke_at"] = ""
 				if alive {
 					if err := sp.Stop(name); err != nil {
 						fmt.Fprintf(stderr, "session reconciler: stopping restart-requested %s: %v\n", name, err) //nolint:errcheck
@@ -355,6 +494,12 @@ func reconcileSessionBeads(
 						// Killing a session mid-conversation is disruptive;
 						// the drift will be applied when the user detaches.
 						if sp.IsAttached(name) {
+							if trace != nil {
+								trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", "deferred_attached", traceRecordPayload{
+									"stored_hash":  storedHash,
+									"current_hash": currentHash,
+								}, nil, "")
+							}
 							continue
 						}
 						ddt := driftDrainTimeout
@@ -363,6 +508,12 @@ func reconcileSessionBeads(
 						}
 						beginSessionDrain(*session, sp, dt, "config-drift", clk, ddt)
 						fmt.Fprintf(stdout, "Draining session '%s': config-drift\n", name) //nolint:errcheck
+						if trace != nil {
+							trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", "drain", traceRecordPayload{
+								"stored_hash":  storedHash,
+								"current_hash": currentHash,
+							}, nil, "")
+						}
 						rec.Record(events.Event{
 							Type:    events.SessionDraining,
 							Actor:   "gc",
@@ -404,6 +555,9 @@ func reconcileSessionBeads(
 		// Idle timeout: restart sessions idle longer than configured threshold.
 		if it != nil && alive && it.checkIdle(name, sp, clk.Now()) {
 			fmt.Fprintf(stderr, "session reconciler: idle timeout for %s\n", tp.DisplayName()) //nolint:errcheck // best-effort stderr
+			if trace != nil {
+				trace.recordDecision("reconciler.session.idle_timeout", tp.TemplateName, name, "idle_timeout", "stop", nil, nil, "")
+			}
 			if err := sp.Stop(name); err != nil {
 				fmt.Fprintf(stderr, "session reconciler: stopping idle %s: %v\n", name, err) //nolint:errcheck // best-effort stderr
 			} else {
@@ -489,6 +643,11 @@ func reconcileSessionBeads(
 			if sessionIsQuarantined(*target.session, clk) {
 				continue // crash-loop protection
 			}
+			if trace != nil {
+				trace.recordDecision("reconciler.session.wake", target.tp.TemplateName, name, "wake", "start_candidate", traceRecordPayload{
+					"should_wake": shouldWake,
+				}, nil, "")
+			}
 			startCandidates = append(startCandidates, startCandidate{
 				session: target.session,
 				tp:      target.tp,
@@ -499,7 +658,7 @@ func reconcileSessionBeads(
 		if shouldWake && target.alive {
 			// Session is correctly awake. Cancel any non-drift drain
 			// (handles scale-back-up: agent returns to desired set while draining).
-			cancelSessionDrain(*target.session, dt)
+			cancelSessionDrain(*target.session, sp, dt)
 			clearCompletedIdleProbe(target.session.ID, dt)
 			if target.session.Metadata["sleep_intent"] == "idle-stop-pending" {
 				_ = store.SetMetadata(target.session.ID, "sleep_intent", "")
@@ -536,22 +695,69 @@ func reconcileSessionBeads(
 			}
 			beginSessionDrain(*target.session, sp, dt, reason, clk, defaultDrainTimeout)
 			fmt.Fprintf(stdout, "Draining session '%s': %s\n", target.session.Metadata["session_name"], reason) //nolint:errcheck
+			if trace != nil {
+				trace.recordDecision("reconciler.session.drain", target.tp.TemplateName, target.session.Metadata["session_name"], reason, "drain", traceRecordPayload{
+					"sleep_intent": intent,
+				}, nil, "")
+			}
+		}
+
+		if !shouldWake && !target.alive && isDrainedSessionBead(*target.session) {
+			// Drained pool session: process exited and no wake reason.
+			// Close the bead so syncSessionBeads creates a fresh one
+			// when new work arrives.
+			closeBead(store, target.session.ID, "drained", clk.Now().UTC(), stderr)
 		}
 	}
 
-	plannedWakes := executePlannedStarts(
+	plannedWakes := executePlannedStartsTraced(
 		ctx, startCandidates, cfg, desiredState, sp, store, cityName,
-		clk, rec, startupTimeout, stdout, stderr,
+		clk, rec, startupTimeout, stdout, stderr, trace,
 	)
 
 	// Phase 2: Advance all in-flight drains.
 	sessionLookup := func(id string) *beads.Bead {
 		return beadByID[id]
 	}
-	advanceSessionDrainsWithSessions(dt, sp, store, sessionLookup, ordered, wakeEvals, cfg, poolDesired, nil, readyWaitSet, clk)
+	advanceSessionDrainsWithSessionsTraced(dt, sp, store, sessionLookup, ordered, wakeEvals, cfg, poolDesired, nil, readyWaitSet, clk, trace)
 	clearMissingIdleProbes(dt, beadByID)
 
 	return plannedWakes
+}
+
+func resolvePreservedConfiguredNamedSessionTemplate(
+	cityPath, cityName string,
+	cfg *config.City,
+	sp runtime.Provider,
+	store beads.Store,
+	openSessions []beads.Bead,
+	session beads.Bead,
+	clk clock.Clock,
+	stderr io.Writer,
+) (TemplateParams, error) {
+	if cityPath == "" {
+		cityPath = "."
+	}
+	if cityName == "" && cfg != nil {
+		cityName = cfg.EffectiveCityName()
+	}
+	identity := namedSessionIdentity(session)
+	spec, ok := findNamedSessionSpec(cfg, cityName, identity)
+	if !ok || spec.Agent == nil {
+		return TemplateParams{}, fmt.Errorf("configured named session %q not found", identity)
+	}
+	bp := newAgentBuildParams(cityName, cityPath, cfg, sp, clk.Now().UTC(), store, stderr)
+	bp.sessionBeads = newSessionBeadSnapshot(openSessions)
+	fpExtra := buildFingerprintExtra(spec.Agent)
+	tp, err := resolveTemplateForSessionBead(bp, spec.Agent, identity, fpExtra, session)
+	if err != nil {
+		return TemplateParams{}, err
+	}
+	tp.Alias = identity
+	tp.ConfiguredNamedIdentity = identity
+	tp.ConfiguredNamedMode = spec.Mode
+	installAgentSideEffects(bp, spec.Agent, tp, stderr)
+	return tp, nil
 }
 
 func shouldBeginIdleDrain(
@@ -713,7 +919,11 @@ func clearMissingIdleProbes(dt *drainTracker, beadByID map[string]*beads.Bead) {
 // in the worktree that the previous session (or this session's prior run)
 // created, without any prompt-side logic.
 func resolveTaskWorkDir(store beads.Store, agentName string) string {
-	assigned, err := store.ListByAssignee(agentName, "in_progress", 0)
+	assigned, err := store.List(beads.ListQuery{
+		Assignee: agentName,
+		Status:   "in_progress",
+		Sort:     beads.SortCreatedDesc,
+	})
 	if err != nil {
 		return ""
 	}
@@ -729,11 +939,11 @@ func resolveTaskWorkDir(store beads.Store, agentName string) string {
 }
 
 // resolveSessionCommand returns the command to use when starting a session.
-// On first start (no prior session exists), it uses SessionIDFlag to create a
-// session with the given key as its ID. On subsequent wakes, it uses
-// resolveResumeCommand to resume the existing session.
-func resolveSessionCommand(command, sessionKey string, rp *config.ResolvedProvider, firstStart bool) string {
-	if firstStart && rp.SessionIDFlag != "" {
+// On a fresh provider start (first boot or wake_mode=fresh), it uses
+// SessionIDFlag to create a new provider conversation with the given key as
+// its ID. Otherwise it resumes the existing conversation.
+func resolveSessionCommand(command, sessionKey string, rp *config.ResolvedProvider, firstStart, forceFresh bool) string {
+	if (firstStart || forceFresh) && rp.SessionIDFlag != "" {
 		return command + " " + rp.SessionIDFlag + " " + sessionKey
 	}
 	return resolveResumeCommand(command, sessionKey, rp)

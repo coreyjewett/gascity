@@ -37,15 +37,16 @@ func standaloneBuildAgentsFnWithSessionBeads(
 	cityName, cityPath string,
 	beaconTime time.Time,
 	stderr io.Writer,
-) func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot) DesiredStateResult {
+) func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 	return func(
 		c *config.City,
 		currentSP runtime.Provider,
 		store beads.Store,
 		rigStores map[string]beads.Store,
 		sessionBeads *sessionBeadSnapshot,
+		trace *sessionReconcilerTraceCycle,
 	) DesiredStateResult {
-		return buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, c, currentSP, store, rigStores, sessionBeads, stderr)
+		return buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, c, currentSP, store, rigStores, sessionBeads, trace, stderr)
 	}
 }
 
@@ -592,7 +593,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "gc start: loading session beads: %v\n", err) //nolint:errcheck
 		sessionBeads = nil
 	}
-	dsResult := buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, nil, sessionBeads, stderr)
+	dsResult := buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, nil, sessionBeads, nil, stderr)
 	ds := dsResult.State
 	cfgNames := configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
 	_, sessionBeads = syncSessionBeadsWithSnapshot(
@@ -603,9 +604,15 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 	dt := newDrainTracker()
 	poolDesired := PoolDesiredCounts(ComputePoolDesiredStates(
 		cfg, nil, sessionBeads.Open(), dsResult.ScaleCheckCounts))
-	reconcileSessionBeads(
-		sigCtx, open, ds, cfgNames, cfg, sp, oneShotStore,
-		nil, nil, nil, dt, poolDesired, nil, cityName,
+	if poolDesired == nil {
+		poolDesired = make(map[string]int)
+	}
+	mergeNamedSessionDemand(poolDesired, dsResult.NamedSessionDemand, cfg)
+	reconcileSessionBeadsAtPath(
+		sigCtx, cityPath, open, ds, cfgNames, cfg, sp, oneShotStore,
+		nil, nil, nil, dt, poolDesired,
+		dsResult.StoreQueryPartial,
+		nil, cityName,
 		nil, clock.Real{}, recorder, cfg.Session.StartupTimeoutDuration(), 0,
 		stdout, stderr,
 	)
@@ -616,7 +623,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "gc start: loading session beads: %v\n", err) //nolint:errcheck
 		sessionBeads = nil
 	}
-	dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, nil, sessionBeads, stderr)
+	dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, nil, sessionBeads, nil, stderr)
 	ds = dsResult.State
 	cfgNames = configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
 	syncSessionBeadsWithSnapshot(cityPath, oneShotStore, ds, sp, cfgNames, cfg, clock.Real{}, stderr, false, sessionBeads)
@@ -831,17 +838,52 @@ func agentCommandDir(cityPath string, a *config.Agent, rigs []config.Rig) string
 
 // passthroughEnv returns environment variables from the parent process that
 // agent sessions should inherit. Agents need PATH to find tools (including gc),
-// GC_BEADS/GC_DOLT so they use the same bead store as the parent, and
-// GC_DOLT_HOST/PORT/USER/PASSWORD so agents can connect to remote Dolt servers.
+// GC_BEADS/GC_DOLT so they use the same bead store as the parent,
+// GC_DOLT_HOST/PORT/USER/PASSWORD so agents can connect to remote Dolt servers,
+// and Claude auth/home context so managed sessions can launch reliably under
+// shell and supervisor-driven flows.
 func passthroughEnv() map[string]string {
 	m := make(map[string]string)
-	// Pass through PATH and all GC_* environment variables so provider
-	// configs (Docker, K8s, beads, dolt, etc.) propagate to agents.
+	// Pass through PATH so managed sessions can find tools, and preserve the
+	// minimum user/home context Claude Code needs to resolve stored credentials.
 	if v := os.Getenv("PATH"); v != "" {
 		m["PATH"] = v
 	}
+	if v := os.Getenv("HOME"); v != "" {
+		m["HOME"] = v
+	}
+	// USER/LOGNAME are required on macOS for Keychain access — without them
+	// providers like Claude Code cannot read stored OAuth credentials.
+	// CLAUDE_CONFIG_DIR and CLAUDE_CODE_OAUTH_TOKEN let managed Claude
+	// sessions find stored credentials and token-based auth.
+	for _, key := range []string{"USER", "LOGNAME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"} {
+		if v := os.Getenv(key); v != "" {
+			m[key] = v
+		}
+	}
+	// XDG directories are needed for providers to locate config files
+	// (e.g. ~/.config/opencode/opencode.jsonc). When not set, compute
+	// defaults from HOME so spawned sessions always find user config.
+	if v := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); v != "" {
+		m["XDG_CONFIG_HOME"] = v
+	} else if home := os.Getenv("HOME"); home != "" {
+		m["XDG_CONFIG_HOME"] = filepath.Join(home, ".config")
+	}
+	if v := strings.TrimSpace(os.Getenv("XDG_STATE_HOME")); v != "" {
+		m["XDG_STATE_HOME"] = v
+	} else if home := os.Getenv("HOME"); home != "" {
+		m["XDG_STATE_HOME"] = filepath.Join(home, ".local", "state")
+	}
+	// Pass through all GC_* and ANTHROPIC_* vars. Agent credentials are
+	// included in the global baseline because the SDK cannot know which
+	// agent uses which provider (zero hardcoded roles); the trust boundary
+	// is the managed session itself.
 	for _, entry := range os.Environ() {
-		if key, val, ok := strings.Cut(entry, "="); ok && strings.HasPrefix(key, "GC_") && val != "" {
+		key, val, ok := strings.Cut(entry, "=")
+		if !ok || val == "" {
+			continue
+		}
+		if strings.HasPrefix(key, "GC_") || strings.HasPrefix(key, "ANTHROPIC_") {
 			m[key] = val
 		}
 	}

@@ -369,7 +369,7 @@ func TestReconcileSessionBeads_StartsIndependentWaveInParallelBeforeDependentWav
 	go func() {
 		done <- reconcileSessionBeads(
 			context.Background(), sessions, desired, configuredSessionNames(cfg, "", store),
-			cfg, sp, store, nil, nil, nil, newDrainTracker(), map[string]int{"db": 1, "cache": 1, "worker": 1}, nil, "",
+			cfg, sp, store, nil, nil, nil, newDrainTracker(), map[string]int{"db": 1, "cache": 1, "worker": 1}, false, nil, "",
 			nil, clk, rec, 5*time.Second, 0, ioDiscard{}, ioDiscard{},
 		)
 	}()
@@ -600,7 +600,7 @@ func TestExecutePlannedStarts_RevalidatesDependenciesBetweenWaveBatches(t *testi
 	poolDesired := map[string]int{"app-1": 1, "app-2": 1, "app-3": 1, "app-4": 1}
 	woken := reconcileSessionBeads(
 		context.Background(), sessions, desired, configuredSessionNames(cfg, "", store),
-		cfg, sp, store, nil, nil, nil, newDrainTracker(), poolDesired, nil, "",
+		cfg, sp, store, nil, nil, nil, newDrainTracker(), poolDesired, false, nil, "",
 		nil, clk, events.Discard, 5*time.Second, 0, ioDiscard{}, ioDiscard{},
 	)
 
@@ -1348,6 +1348,36 @@ func TestInterruptTargetsBounded_RespectsInterruptCap(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("interruptTargetsBounded did not finish")
+	}
+}
+
+func TestInterruptTargetsBounded_StopsPoolManagedSessions(t *testing.T) {
+	sp := runtime.NewFake()
+	// Start both sessions.
+	for _, name := range []string{"human-worker", "pool-worker"} {
+		if err := sp.Start(context.Background(), name, runtime.Config{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targets := []stopTarget{
+		{name: "human-worker", template: "worker", resolved: true, poolManaged: false},
+		{name: "pool-worker", template: "pool", resolved: true, poolManaged: true},
+	}
+	var stderr bytes.Buffer
+	sent := interruptTargetsBounded(targets, sp, &stderr)
+	if sent != 1 {
+		t.Fatalf("sent = %d, want 1 (only human-worker)", sent)
+	}
+	if !strings.Contains(stderr.String(), "stopped_pool_managed") {
+		t.Fatalf("stderr = %q, want stopped_pool_managed log entry", stderr.String())
+	}
+	// Pool-managed session should have been stopped, not interrupted.
+	if sp.IsRunning("pool-worker") {
+		t.Fatal("pool-worker should have been stopped")
+	}
+	// Human worker should still be running (only interrupted, not stopped).
+	if !sp.IsRunning("human-worker") {
+		t.Fatal("human-worker should still be running (only interrupted)")
 	}
 }
 

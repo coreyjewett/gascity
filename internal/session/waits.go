@@ -8,7 +8,10 @@ import (
 
 const (
 	// WaitBeadType identifies durable wait beads associated with sessions.
-	WaitBeadType = "wait"
+	WaitBeadType = "gate"
+	// LegacyWaitBeadType is the historical durable wait bead type kept for
+	// backward-compatible reads against older stores.
+	LegacyWaitBeadType = "wait"
 	// WaitBeadLabel is the common label used to locate session wait beads.
 	WaitBeadLabel = "gc:wait"
 
@@ -28,12 +31,38 @@ func IsWaitTerminalState(state string) bool {
 	}
 }
 
+// IsWaitBeadType reports whether the bead type is recognized as a durable
+// session wait.
+func IsWaitBeadType(typ string) bool {
+	switch typ {
+	case WaitBeadType, LegacyWaitBeadType:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsWaitBead reports whether a bead is a durable session wait. New waits are
+// stored as gate beads, while legacy stores may still contain type "wait".
+func IsWaitBead(b beads.Bead) bool {
+	if !IsWaitBeadType(b.Type) {
+		return false
+	}
+	if beadHasLabel(b, WaitBeadLabel) {
+		return true
+	}
+	sessionID := b.Metadata["session_id"]
+	return sessionID != "" && beadHasLabel(b, "session:"+sessionID)
+}
+
 // WaitNudgeIDs returns queued nudge IDs for the session's currently open waits.
 func WaitNudgeIDs(store beads.Store, sessionID string) ([]string, error) {
 	if store == nil || sessionID == "" {
 		return nil, nil
 	}
-	waits, err := store.ListByLabel("session:"+sessionID, 0)
+	waits, err := store.List(beads.ListQuery{
+		Label: "session:" + sessionID,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +72,7 @@ func WaitNudgeIDs(store beads.Store, sessionID string) ([]string, error) {
 		if wait.Status == "closed" {
 			continue
 		}
-		if wait.Type != WaitBeadType {
+		if !IsWaitBead(wait) {
 			continue
 		}
 		if wait.Metadata["session_id"] != sessionID {
@@ -78,9 +107,10 @@ func WakeSession(store beads.Store, sessionBead beads.Bead, now time.Time) ([]st
 		"wait_hold":         "",
 		"sleep_intent":      "",
 		"wake_attempts":     "0",
+		"churn_count":       "0",
 	}
 	sr := sessionBead.Metadata["sleep_reason"]
-	if sr == "user-hold" || sr == "wait-hold" || sr == "quarantine" {
+	if sr == "user-hold" || sr == "wait-hold" || sr == "quarantine" || sr == "context-churn" {
 		batch["sleep_reason"] = ""
 	}
 	if err := store.SetMetadataBatch(sessionBead.ID, batch); err != nil {
@@ -94,7 +124,9 @@ func CancelWaits(store beads.Store, sessionID string, now time.Time) error {
 	if store == nil || sessionID == "" {
 		return nil
 	}
-	waits, err := store.ListByLabel("session:"+sessionID, 0)
+	waits, err := store.List(beads.ListQuery{
+		Label: "session:" + sessionID,
+	})
 	if err != nil {
 		return err
 	}
@@ -103,7 +135,7 @@ func CancelWaits(store beads.Store, sessionID string, now time.Time) error {
 		if wait.Status == "closed" {
 			continue
 		}
-		if wait.Type != WaitBeadType {
+		if !IsWaitBead(wait) {
 			continue
 		}
 		if wait.Metadata["session_id"] != sessionID {
@@ -123,4 +155,13 @@ func CancelWaits(store beads.Store, sessionID string, now time.Time) error {
 		}
 	}
 	return nil
+}
+
+func beadHasLabel(b beads.Bead, want string) bool {
+	for _, label := range b.Labels {
+		if label == want {
+			return true
+		}
+	}
+	return false
 }

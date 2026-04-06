@@ -265,7 +265,7 @@ type Rig struct {
 	DoltHost string `toml:"dolt_host,omitempty"`
 	// DoltPort overrides the city-level Dolt port for this rig's beads.
 	// When set, controller commands (scale_check, work_query) prefix their
-	// shell invocations with BEADS_DOLT_PORT=<port> so bd connects to the
+	// shell invocations with BEADS_DOLT_SERVER_PORT=<port> so bd connects to the
 	// correct server instead of the city-level default.
 	DoltPort string `toml:"dolt_port,omitempty"`
 }
@@ -1195,8 +1195,7 @@ type Agent struct {
 	// SlingQuery is the command template to route a bead to this agent/pool.
 	// Used by gc sling to make a bead visible to the target's work_query.
 	// The placeholder {} is replaced with the bead ID at runtime.
-	// Default for fixed agents: "bd update {} --assignee=<qualified-name>".
-	// Default for pool agents: "bd update {} --add-label=pool:<qualified-name>".
+	// Default for all agents: "bd update {} --set-metadata gc.routed_to=<qualified-name>".
 	// Pool agents must set both sling_query and work_query, or neither.
 	SlingQuery string `toml:"sling_query,omitempty"`
 	// IdleTimeout is the maximum time an agent session can be inactive before
@@ -1279,8 +1278,8 @@ type Agent struct {
 	// Runtime-only — not persisted to TOML or JSON.
 	SleepAfterIdleSource string `toml:"-" json:"-"`
 	// PoolName is the template agent's qualified name, set during pool
-	// expansion. Pool instances use this for label-based work discovery
-	// (e.g., pool:dog) rather than their instance name (e.g., pool:dog-1).
+	// expansion. Pool instances use this for gc.routed_to-based work discovery
+	// (e.g., dog) rather than their concrete instance name (e.g., dog-1).
 	PoolName string `toml:"-"`
 }
 
@@ -1311,12 +1310,20 @@ func (a *Agent) AttachEnabled() bool {
 }
 
 // EffectiveWorkQuery returns the work query command for this agent.
-// If WorkQuery is set, returns it as-is. Otherwise returns the default:
-// "bd ready --metadata-field gc.routed_to=<template> --unassigned --json --limit=1"
+// If WorkQuery is set, returns it as-is. Otherwise returns the default
+// three-tier query with multi-identifier assignee resolution.
 //
-// All agents use metadata-based routing via gc.routed_to. The template
-// name (QualifiedName or PoolName for rig-scoped instances) determines
-// which beads are visible to this agent's sessions.
+// Assignee resolution order: $GC_SESSION_ID (bead ID) > $GC_SESSION_NAME
+// (tmux session name) > $GC_ALIAS (named identity / qualified name).
+// All three are checked so work is found regardless of which identifier
+// was used when assigning.
+//
+// State priority: in_progress+assigned (crash recovery) >
+// ready+assigned (pre-assigned) > ready+unassigned+routed_to (pool).
+//
+// When the reconciler runs the query for demand detection (no session
+// context), all identity vars are empty → assignee tiers skip → only
+// the routed_to tier fires to detect new demand.
 func (a *Agent) EffectiveWorkQuery() string {
 	if a.WorkQuery != "" {
 		return a.WorkQuery
@@ -1325,7 +1332,22 @@ func (a *Agent) EffectiveWorkQuery() string {
 	if a.PoolName != "" {
 		target = a.PoolName
 	}
-	return "bd ready --metadata-field gc.routed_to=" + target + " --unassigned --json --limit=1 2>/dev/null"
+	return `sh -c '` +
+		// Tier 1: in_progress assigned to any of my identifiers (crash recovery)
+		`for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+		`[ -z "$id" ] && continue; ` +
+		`r=$(bd list --status in_progress --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+		`done; ` +
+		// Tier 2: ready assigned to any of my identifiers (pre-assigned)
+		`for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+		`[ -z "$id" ] && continue; ` +
+		`r=$(bd ready --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
+		`done; ` +
+		// Tier 3: ready unassigned routed to this agent (pool queue)
+		`bd ready --metadata-field gc.routed_to=` + target +
+		` --unassigned --json --limit=1 2>/dev/null'`
 }
 
 // EffectiveSlingQuery returns the sling query command template for this agent.
@@ -1366,7 +1388,7 @@ func (a *Agent) EffectiveScaleCheck() string {
 	return `ready=$(bd ready --metadata-field gc.routed_to=` + template +
 		` --unassigned --json 2>/dev/null | jq 'length' 2>/dev/null); ` +
 		`active=$(bd list --metadata-field gc.routed_to=` + template +
-		` --status=in_progress --unassigned --json 2>/dev/null | jq 'length' 2>/dev/null); ` +
+		` --status=in_progress --no-assignee --json 2>/dev/null | jq 'length' 2>/dev/null); ` +
 		`echo "$(( ${ready:-0} + ${active:-0} ))" || echo 0`
 }
 
@@ -1825,10 +1847,11 @@ func validateDependsOn(agents []Agent) error {
 // prefixes. The hqPrefix is the city's HQ prefix for collision checks.
 func ValidateRigs(rigs []Rig, hqPrefix string) error {
 	seenNames := make(map[string]bool, len(rigs))
-	seenPrefixes := make(map[string]string) // prefix → rig name (for error messages)
+	seenPrefixes := make(map[string]string) // lowercase prefix → rig name (for error messages)
 
 	// HQ prefix participates in collision detection.
-	seenPrefixes[hqPrefix] = "HQ"
+	// Lowercase to match runtime lookup (findRigByPrefix is case-insensitive).
+	seenPrefixes[strings.ToLower(hqPrefix)] = "HQ"
 
 	for i, r := range rigs {
 		if r.Name == "" {
@@ -1842,7 +1865,7 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 		}
 		seenNames[r.Name] = true
 
-		prefix := r.EffectivePrefix()
+		prefix := strings.ToLower(r.EffectivePrefix())
 		if other, ok := seenPrefixes[prefix]; ok {
 			return fmt.Errorf("rig %q: prefix %q collides with %s", r.Name, prefix, other)
 		}
@@ -1861,6 +1884,15 @@ func DefaultCity(name string) City {
 	}
 }
 
+func defaultInstallAgentHooksForProvider(provider string) []string {
+	switch strings.TrimSpace(provider) {
+	case "opencode":
+		return []string{"opencode"}
+	default:
+		return nil
+	}
+}
+
 // WizardCity returns a City with the given name, a workspace-level provider
 // or start command, and one agent (mayor). This is the config written by
 // "gc init" when the interactive wizard runs. If startCommand is set, it
@@ -1871,6 +1903,7 @@ func WizardCity(name, provider, startCommand string) City {
 		ws.StartCommand = startCommand
 	} else {
 		ws.Provider = provider
+		ws.InstallAgentHooks = defaultInstallAgentHooksForProvider(provider)
 	}
 	return City{
 		Workspace: ws,
@@ -1896,6 +1929,7 @@ func GastownCity(name, provider, startCommand string) City {
 		ws.StartCommand = startCommand
 	} else if provider != "" {
 		ws.Provider = provider
+		ws.InstallAgentHooks = defaultInstallAgentHooksForProvider(provider)
 	}
 	maxRestarts := 5
 	return City{

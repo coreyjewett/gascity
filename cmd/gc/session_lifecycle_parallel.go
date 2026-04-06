@@ -66,11 +66,12 @@ type startResult struct {
 }
 
 type stopTarget struct {
-	name     string
-	template string
-	subject  string
-	order    int
-	resolved bool
+	name        string
+	template    string
+	subject     string
+	order       int
+	resolved    bool
+	poolManaged bool
 }
 
 type stopResult struct {
@@ -314,7 +315,8 @@ func prepareStartCandidate(
 	}
 	if sk := session.Metadata["session_key"]; sk != "" && tp.ResolvedProvider != nil {
 		firstStart := session.Metadata["started_config_hash"] == ""
-		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, tp.ResolvedProvider, firstStart)
+		forceFresh := session.Metadata["wake_mode"] == "fresh"
+		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, tp.ResolvedProvider, firstStart, forceFresh)
 	}
 	// Initial message: append to prompt on first start only.
 	// Schema overrides were already applied in the block above (before coreHash).
@@ -324,7 +326,8 @@ func prepareStartCandidate(
 		var overrides map[string]string
 		if err := json.Unmarshal([]byte(raw), &overrides); err == nil {
 			firstStart := session.Metadata["started_config_hash"] == ""
-			if msg, ok := overrides["initial_message"]; ok && msg != "" && firstStart {
+			forceFresh := session.Metadata["wake_mode"] == "fresh"
+			if msg, ok := overrides["initial_message"]; ok && msg != "" && (firstStart || forceFresh) {
 				existing := ""
 				if agentCfg.PromptSuffix != "" {
 					parts := shellquote.Split(agentCfg.PromptSuffix)
@@ -447,6 +450,9 @@ func executePreparedStartWave(
 				outcome = "deadline_exceeded"
 			case startCtx.Err() == context.Canceled:
 				outcome = "canceled"
+			case errors.Is(err, runtime.ErrSessionInitializing):
+				outcome = "session_initializing"
+				err = nil
 			case errors.Is(err, runtime.ErrSessionExists) && sp.IsRunning(item.candidate.name()):
 				if rollbackPending && runningSessionMatchesPendingCreate(item.candidate.session, item.candidate.name(), sp) {
 					outcome = "session_exists_converged"
@@ -482,12 +488,35 @@ func commitStartResult(
 	wave int,
 	stdout, stderr io.Writer,
 ) bool {
+	return commitStartResultTraced(result, store, clk, rec, wave, stdout, stderr, nil)
+}
+
+func commitStartResultTraced(
+	result startResult,
+	store beads.Store,
+	clk clock.Clock,
+	rec events.Recorder,
+	wave int,
+	stdout, stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+) bool {
 	session := result.prepared.candidate.session
 	name := result.prepared.candidate.name()
 	tp := result.prepared.candidate.tp
+	// Session still starting up — back off silently without recording failure.
+	// The reconciler will retry on the next patrol tick.
+	if result.outcome == "session_initializing" {
+		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, result.outcome, result.started, result.finished, nil)
+		return false
+	}
 	if result.err != nil {
 		if result.rollbackPending {
 			fmt.Fprintf(stderr, "session reconciler: starting %s: %s\n", name, formatLifecycleError(result.err)) //nolint:errcheck
+			if trace != nil {
+				trace.recordOperation("reconciler.start.rollback_pending", tp.TemplateName, name, "", "start", result.outcome, traceRecordPayload{
+					"error": formatLifecycleError(result.err),
+				}, "")
+			}
 			rollbackPendingCreate(session, store, clk.Now().UTC(), stderr)
 			logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, result.outcome, result.started, result.finished, result.err)
 			return false
@@ -496,6 +525,11 @@ func commitStartResult(
 		_ = store.SetMetadata(session.ID, "last_woke_at", "")
 		session.Metadata["last_woke_at"] = ""
 		recordWakeFailure(session, store, clk)
+		if trace != nil {
+			trace.recordOperation("reconciler.start.failed", tp.TemplateName, name, "", "start", result.outcome, traceRecordPayload{
+				"error": formatLifecycleError(result.err),
+			}, "")
+		}
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, result.outcome, result.started, result.finished, result.err)
 		return false
 	}
@@ -519,12 +553,23 @@ func commitStartResult(
 	}
 	if err := store.SetMetadataBatch(session.ID, metadata); err != nil {
 		fmt.Fprintf(stderr, "session reconciler: storing hashes for %s: %v\n", name, err) //nolint:errcheck
+		if trace != nil {
+			trace.recordMutation("bead_metadata", tp.TemplateName, name, "metadata_batch", session.ID, "config_hash", "", result.prepared.coreHash, "failed", traceRecordPayload{
+				"wave":  wave,
+				"error": err.Error(),
+			}, "")
+		}
 	} else {
 		if session.Metadata == nil {
 			session.Metadata = make(map[string]string)
 		}
 		for key, value := range metadata {
 			session.Metadata[key] = value
+		}
+		if trace != nil {
+			trace.recordMutation("bead_metadata", tp.TemplateName, name, "metadata_batch", session.ID, "config_hash", "", result.prepared.coreHash, "success", traceRecordPayload{
+				"wave": wave,
+			}, "")
 		}
 	}
 	logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, result.outcome, result.started, result.finished, nil)
@@ -601,6 +646,23 @@ func executePlannedStarts(
 	startupTimeout time.Duration,
 	stdout, stderr io.Writer,
 ) int {
+	return executePlannedStartsTraced(ctx, candidates, cfg, desiredState, sp, store, cityName, clk, rec, startupTimeout, stdout, stderr, nil)
+}
+
+func executePlannedStartsTraced(
+	ctx context.Context,
+	candidates []startCandidate,
+	cfg *config.City,
+	desiredState map[string]TemplateParams,
+	sp runtime.Provider,
+	store beads.Store,
+	cityName string,
+	clk clock.Clock,
+	rec events.Recorder,
+	startupTimeout time.Duration,
+	stdout, stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+) int {
 	if len(candidates) == 0 {
 		return 0
 	}
@@ -666,7 +728,13 @@ func executePlannedStarts(
 			offset = end
 			results := executePreparedStartWave(ctx, prepared, sp, startupTimeout, defaultMaxParallelStartsPerWave)
 			for _, result := range results {
-				if commitStartResult(result, store, clk, rec, wave, stdout, stderr) {
+				if trace != nil {
+					trace.recordOperation("reconciler.start.execute", result.prepared.candidate.tp.TemplateName, result.prepared.candidate.name(), "", "start", result.outcome, traceRecordPayload{
+						"rollback_pending": result.rollbackPending,
+						"duration_ms":      result.finished.Sub(result.started).Milliseconds(),
+					}, "")
+				}
+				if commitStartResultTraced(result, store, clk, rec, wave, stdout, stderr, trace) {
 					wakeCount++
 				}
 			}
@@ -798,6 +866,7 @@ func executeTargetWave(
 func stopTargetsForNames(names []string, cfg *config.City, store beads.Store, stderr io.Writer) []stopTarget {
 	sessionTemplates := make(map[string]string)
 	sessionSubjects := make(map[string]string)
+	sessionPoolManaged := make(map[string]bool)
 	if store != nil {
 		if sessionBeads, err := loadSessionBeads(store); err == nil {
 			for _, bead := range sessionBeads {
@@ -818,6 +887,9 @@ func stopTargetsForNames(names []string, cfg *config.City, store beads.Store, st
 						subject = name
 					}
 					sessionSubjects[name] = subject
+					if isPoolManagedSessionBead(bead) {
+						sessionPoolManaged[name] = true
+					}
 				}
 			}
 		} else if stderr != nil {
@@ -846,11 +918,12 @@ func stopTargetsForNames(names []string, cfg *config.City, store beads.Store, st
 			}
 		}
 		targets = append(targets, stopTarget{
-			name:     name,
-			template: template,
-			subject:  subject,
-			order:    idx,
-			resolved: resolved,
+			name:        name,
+			template:    template,
+			subject:     subject,
+			order:       idx,
+			resolved:    resolved,
+			poolManaged: sessionPoolManaged[name],
 		})
 	}
 	return targets
@@ -881,9 +954,28 @@ func filterStopTargets(targets []stopTarget, names []string) []stopTarget {
 }
 
 func interruptTargetsBounded(targets []stopTarget, sp runtime.Provider, stderr io.Writer) int {
+	// Pool-managed sessions have no human user, so Claude Code's
+	// interactive "What should Claude do instead?" prompt would hang
+	// them forever. Stop them immediately instead of interrupting —
+	// no metadata to go stale if shutdown is aborted.
+	interruptable := make([]stopTarget, 0, len(targets))
+	for _, t := range targets {
+		if t.poolManaged {
+			started := time.Now()
+			err := sp.Stop(t.name)
+			outcome := "stopped_pool_managed"
+			if err != nil {
+				outcome = "stop_failed"
+			}
+			logLifecycleOutcome(stderr, "interrupt", 0, t.name, t.template, outcome, started, time.Now(), err)
+			continue
+		}
+		interruptable = append(interruptable, t)
+	}
+
 	sent := 0
 	waveStarted := time.Now()
-	results := executeTargetWave(targets, min(len(targets), defaultMaxParallelInterrupts), func(target stopTarget) error {
+	results := executeTargetWave(interruptable, min(len(interruptable), defaultMaxParallelInterrupts), func(target stopTarget) error {
 		return sp.Interrupt(target.name)
 	})
 	for _, result := range results {
@@ -892,7 +984,7 @@ func interruptTargetsBounded(targets []stopTarget, sp runtime.Provider, stderr i
 			sent++
 		}
 	}
-	logLifecycleWave(stderr, "interrupt", 0, waveStarted, len(targets))
+	logLifecycleWave(stderr, "interrupt", 0, waveStarted, len(interruptable))
 	return sent
 }
 

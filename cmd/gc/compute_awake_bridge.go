@@ -39,7 +39,7 @@ func buildAwakeInputFromReconciler(
 		a := &cfg.Agents[i]
 		agent := AwakeAgent{
 			QualifiedName:  a.QualifiedName(),
-			Suspended:      a.Suspended,
+			Suspended:      isAgentEffectivelySuspended(cfg, a),
 			SleepAfterIdle: parseSleepDuration(a.SleepAfterIdle),
 		}
 		if len(a.DependsOn) > 0 {
@@ -53,7 +53,7 @@ func buildAwakeInputFromReconciler(
 		ns := &cfg.NamedSessions[i]
 		input.NamedSessions = append(input.NamedSessions, AwakeNamedSession{
 			Identity: ns.QualifiedName(),
-			Template: ns.Template,
+			Template: ns.QualifiedName(),
 			Mode:     ns.Mode,
 		})
 	}
@@ -84,6 +84,7 @@ func buildAwakeInputFromReconciler(
 			Template:       b.Metadata["template"],
 			State:          normalizeBeadState(b.Metadata["state"]),
 			ManualSession:  b.Metadata["manual_session"] == "true",
+			PendingCreate:  b.Metadata["pending_create_claim"] == "true",
 			DependencyOnly: b.Metadata["dependency_only"] == "true",
 			NamedIdentity:  namedSessionIdentity(*b),
 			Drained:        isDrainedSessionMetadata(b.Metadata),
@@ -127,6 +128,8 @@ func awakeSetToWakeEvals(decisions map[string]AwakeDecision, sessionBeads []Awak
 		var reasons []WakeReason
 		if d.ShouldWake {
 			switch d.Reason {
+			case "pending-create":
+				reasons = []WakeReason{WakeCreate}
 			case "attached":
 				reasons = []WakeReason{WakeAttached}
 			case "pending":

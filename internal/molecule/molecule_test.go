@@ -40,7 +40,7 @@ func TestInstantiateSimple(t *testing.T) {
 		Name:        "test-formula",
 		Description: "A test formula",
 		Steps: []formula.RecipeStep{
-			{ID: "test-formula", Title: "{{title}}", Type: "epic", IsRoot: true},
+			{ID: "test-formula", Title: "{{title}}", Type: "molecule", IsRoot: true},
 			{ID: "test-formula.step-a", Title: "Step A", Type: "task"},
 			{ID: "test-formula.step-b", Title: "Step B: {{feature}}", Type: "task"},
 		},
@@ -142,6 +142,59 @@ func TestInstantiateUsesGraphApplyStoreWhenAvailable(t *testing.T) {
 	}
 	if !hasParentChild {
 		t.Fatalf("edges = %+v, want at least one parent-child edge", store.plan.Edges)
+	}
+}
+
+func TestBuildRecipeApplyPlan_GraphWorkflowOwnershipUsesTracks(t *testing.T) {
+	recipe := &formula.Recipe{
+		Name: "wf",
+		Steps: []formula.RecipeStep{
+			{ID: "wf", Title: "Workflow", Type: "task", IsRoot: true, Metadata: map[string]string{"gc.kind": "workflow"}},
+			{ID: "wf.body", Title: "Body", Type: "task", Metadata: map[string]string{"gc.kind": "scope"}},
+			{ID: "wf.workflow-finalize", Title: "Finalize", Type: "task", Metadata: map[string]string{"gc.kind": "workflow-finalize"}},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "wf", DependsOnID: "wf.workflow-finalize", Type: "blocks"},
+			{StepID: "wf.workflow-finalize", DependsOnID: "wf.body", Type: "blocks"},
+		},
+	}
+
+	plan, graphWorkflow, rootKey, err := buildRecipeApplyPlan(recipe, Options{})
+	if err != nil {
+		t.Fatalf("buildRecipeApplyPlan: %v", err)
+	}
+	if !graphWorkflow {
+		t.Fatal("graphWorkflow = false, want true")
+	}
+	if rootKey != "wf" {
+		t.Fatalf("rootKey = %q, want wf", rootKey)
+	}
+
+	var rootBlocksFinalize bool
+	var bodyTracksRoot bool
+	var finalizeTracksRoot bool
+	for _, edge := range plan.Edges {
+		if edge.Type == "belongs-to" {
+			t.Fatalf("unexpected belongs-to edge in plan: %+v", edge)
+		}
+		if edge.FromKey == "wf" && edge.ToKey == "wf.workflow-finalize" && edge.Type == "blocks" {
+			rootBlocksFinalize = true
+		}
+		if edge.FromKey == "wf.body" && edge.ToKey == "wf" && edge.Type == "tracks" {
+			bodyTracksRoot = true
+		}
+		if edge.FromKey == "wf.workflow-finalize" && edge.ToKey == "wf" && edge.Type == "tracks" {
+			finalizeTracksRoot = true
+		}
+	}
+	if !rootBlocksFinalize {
+		t.Fatal("missing root -> workflow-finalize blocks edge")
+	}
+	if !bodyTracksRoot {
+		t.Fatal("missing body -> root tracks ownership edge")
+	}
+	if !finalizeTracksRoot {
+		t.Fatal("missing workflow-finalize -> root tracks ownership edge")
 	}
 }
 
@@ -270,7 +323,7 @@ func TestInstantiatePriorityOverrideCopiesToAllBeads(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "priority-copy",
 		Steps: []formula.RecipeStep{
-			{ID: "priority-copy", Title: "Root", Type: "epic", IsRoot: true, Priority: priorityPtr(4)},
+			{ID: "priority-copy", Title: "Root", Type: "molecule", IsRoot: true, Priority: priorityPtr(4)},
 			{ID: "priority-copy.step-a", Title: "Step A", Type: "task"},
 			{ID: "priority-copy.step-b", Title: "Step B", Type: "task", Priority: priorityPtr(0)},
 		},
@@ -285,7 +338,7 @@ func TestInstantiatePriorityOverrideCopiesToAllBeads(t *testing.T) {
 		t.Fatalf("Instantiate: %v", err)
 	}
 
-	all, err := store.List()
+	all, err := store.ListOpen()
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -436,7 +489,7 @@ func TestInstantiateWithParentID(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "child-formula",
 		Steps: []formula.RecipeStep{
-			{ID: "child-formula", Title: "Child", Type: "epic", IsRoot: true},
+			{ID: "child-formula", Title: "Child", Type: "molecule", IsRoot: true},
 		},
 	}
 
@@ -596,7 +649,7 @@ func TestInstantiateWithIdempotencyKey(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "idem-formula",
 		Steps: []formula.RecipeStep{
-			{ID: "idem-formula", Title: "Root", Type: "epic", IsRoot: true},
+			{ID: "idem-formula", Title: "Root", Type: "molecule", IsRoot: true},
 		},
 	}
 
@@ -653,13 +706,53 @@ func TestInstantiateFragmentInheritsRootPriority(t *testing.T) {
 	}
 }
 
+func TestBuildFragmentApplyPlan_UsesTracksOwnershipEdges(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:    "Workflow root",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+
+	recipe := &formula.FragmentRecipe{
+		Steps: []formula.RecipeStep{
+			{ID: "frag.scope", Title: "Scope", Type: "task"},
+			{ID: "frag.work", Title: "Work", Type: "task"},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "frag.work", DependsOnID: "frag.scope", Type: "blocks"},
+		},
+	}
+
+	plan, err := buildFragmentApplyPlan(store, recipe, FragmentOptions{RootID: root.ID})
+	if err != nil {
+		t.Fatalf("buildFragmentApplyPlan: %v", err)
+	}
+
+	tracksToRoot := 0
+	for _, edge := range plan.Edges {
+		if edge.Type == "belongs-to" {
+			t.Fatalf("unexpected belongs-to edge in fragment plan: %+v", edge)
+		}
+		if edge.Type == "tracks" && edge.ToID == root.ID {
+			tracksToRoot++
+		}
+	}
+	if tracksToRoot != len(recipe.Steps) {
+		t.Fatalf("tracks ownership edges = %d, want %d", tracksToRoot, len(recipe.Steps))
+	}
+}
+
 func TestInstantiateRootOnly(t *testing.T) {
 	store := beads.NewMemStore()
 	recipe := &formula.Recipe{
 		Name:     "patrol",
 		RootOnly: true,
 		Steps: []formula.RecipeStep{
-			{ID: "patrol", Title: "Patrol", Type: "epic", IsRoot: true},
+			{ID: "patrol", Title: "Patrol", Type: "molecule", IsRoot: true},
 			{ID: "patrol.scan", Title: "Scan", Type: "task"},
 		},
 		Deps: []formula.RecipeDep{
@@ -676,7 +769,7 @@ func TestInstantiateRootOnly(t *testing.T) {
 		t.Errorf("Created = %d, want 1 (root only)", result.Created)
 	}
 
-	all, _ := store.List()
+	all, _ := store.ListOpen()
 	if len(all) != 1 {
 		t.Errorf("store has %d beads, want 1", len(all))
 	}
@@ -688,7 +781,7 @@ func TestInstantiateVarDefaults(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "var-test",
 		Steps: []formula.RecipeStep{
-			{ID: "var-test", Title: "{{title}}", Type: "epic", IsRoot: true},
+			{ID: "var-test", Title: "{{title}}", Type: "molecule", IsRoot: true},
 			{ID: "var-test.step", Title: "Branch: {{branch}}", Type: "task"},
 		},
 		Deps: []formula.RecipeDep{
@@ -721,7 +814,7 @@ func TestInstantiateSubstitutesAssigneeVars(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "assignee-vars",
 		Steps: []formula.RecipeStep{
-			{ID: "assignee-vars", Title: "Root", Type: "epic", IsRoot: true},
+			{ID: "assignee-vars", Title: "Root", Type: "molecule", IsRoot: true},
 			{ID: "assignee-vars.step", Title: "Assigned", Type: "task", Assignee: "{{target}}"},
 		},
 		Deps: []formula.RecipeDep{
@@ -784,7 +877,7 @@ func TestInstantiateCreateFailure(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "fail-test",
 		Steps: []formula.RecipeStep{
-			{ID: "fail-test", Title: "Root", Type: "epic", IsRoot: true},
+			{ID: "fail-test", Title: "Root", Type: "molecule", IsRoot: true},
 			{ID: "fail-test.step", Title: "Step", Type: "task"},
 		},
 		Deps: []formula.RecipeDep{
@@ -798,7 +891,7 @@ func TestInstantiateCreateFailure(t *testing.T) {
 	}
 
 	// Root bead should exist but be marked as failed
-	all, _ := base.List()
+	all, _ := base.ListOpen()
 	if len(all) != 1 {
 		t.Fatalf("expected 1 bead (root), got %d", len(all))
 	}
@@ -824,7 +917,7 @@ func TestInstantiateDepFailure(t *testing.T) {
 	recipe := &formula.Recipe{
 		Name: "dep-fail",
 		Steps: []formula.RecipeStep{
-			{ID: "dep-fail", Title: "Root", Type: "epic", IsRoot: true},
+			{ID: "dep-fail", Title: "Root", Type: "molecule", IsRoot: true},
 			{ID: "dep-fail.b", Title: "B", Type: "task"},
 			{ID: "dep-fail.a", Title: "A", Type: "task"},
 		},
@@ -841,7 +934,7 @@ func TestInstantiateDepFailure(t *testing.T) {
 	}
 
 	// All beads should be marked as failed
-	all, _ := base.List()
+	all, _ := base.ListOpen()
 	for _, b := range all {
 		full, _ := base.Get(b.ID)
 		if full.Metadata["molecule_failed"] != "true" {

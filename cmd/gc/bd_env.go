@@ -48,9 +48,12 @@ func bdStoreForRig(rigDir, cityPath string, cfg *config.City) *beads.BdStore {
 // city-level Dolt config. Otherwise falls back to bdRuntimeEnv(cityPath).
 func bdRuntimeEnvForRig(cityPath string, cfg *config.City, rigPath string) map[string]string {
 	env := bdRuntimeEnv(cityPath)
-	// Clear BEADS_DIR so bd discovers .beads/ from cwd
-	// (the rig directory) instead of the city root.
-	delete(env, "BEADS_DIR")
+	rigPath = filepath.Clean(rigPath)
+	// Pin the rig store explicitly. The gc-beads-bd provider derives its Dolt
+	// data root from GC_CITY_PATH unless BEADS_DIR is set, so cwd-based
+	// discovery is not sufficient for rig-scoped operations.
+	env["BEADS_DIR"] = filepath.Join(rigPath, ".beads")
+	env["GC_RIG_ROOT"] = rigPath
 	if cfg != nil {
 		for _, r := range cfg.Rigs {
 			rp := r.Path
@@ -58,6 +61,7 @@ func bdRuntimeEnvForRig(cityPath string, cfg *config.City, rigPath string) map[s
 				rp = filepath.Join(cityPath, rp)
 			}
 			if filepath.Clean(rp) == filepath.Clean(rigPath) {
+				env["GC_RIG"] = r.Name
 				if r.DoltHost != "" || r.DoltPort != "" {
 					if r.DoltHost != "" {
 						env["GC_DOLT_HOST"] = r.DoltHost
@@ -92,6 +96,14 @@ func bdRuntimeEnv(cityPath string) map[string]string {
 	// Propagate Dolt host/port from per-city config (registered by
 	// startBeadsLifecycle) or user env vars. Per-city config avoids
 	// process-global env pollution that breaks supervisor multi-tenancy.
+	// User/password have no per-city config; propagate from process env
+	// so mirrorBeadsDoltEnv can translate them to beads v1.0.0 names.
+	if user := os.Getenv("GC_DOLT_USER"); user != "" {
+		env["GC_DOLT_USER"] = user
+	}
+	if pass := os.Getenv("GC_DOLT_PASSWORD"); pass != "" {
+		env["GC_DOLT_PASSWORD"] = pass
+	}
 	if host := doltHostForCity(cityPath); host != "" {
 		env["GC_DOLT_HOST"] = host
 	}
@@ -115,6 +127,15 @@ func bdRuntimeEnv(cityPath string) map[string]string {
 			env["GC_DOLT_PORT"] = port
 		}
 	}
+	// When dolt.auto-start is disabled and no live port was found, propagate
+	// the stale port from the port file so bd will attempt to connect to it
+	// (and fail with a connection error) rather than auto-starting an embedded
+	// dolt server on a random port and overwriting the shared port file.
+	if env["GC_DOLT_PORT"] == "" && doltAutoStartDisabled(cityPath) {
+		if stalePort := staleDoltPort(cityPath); stalePort != "" {
+			env["GC_DOLT_PORT"] = stalePort
+		}
+	}
 	mirrorBeadsDoltEnv(env)
 	return env
 }
@@ -124,16 +145,24 @@ func cityRuntimeProcessEnv(cityPath string) []string {
 	if rawBeadsProvider(cityPath) == "bd" {
 		if host := doltHostForCity(cityPath); host != "" {
 			overrides["GC_DOLT_HOST"] = host
-			overrides["BEADS_DOLT_HOST"] = host
+			overrides["BEADS_DOLT_SERVER_HOST"] = host
 		}
 		if isExternalDolt(cityPath) {
 			if port := doltPortForCity(cityPath); port != "" {
 				overrides["GC_DOLT_PORT"] = port
-				overrides["BEADS_DOLT_PORT"] = port
+				overrides["BEADS_DOLT_SERVER_PORT"] = port
 			}
 		} else if port := currentDoltPort(cityPath); port != "" {
 			overrides["GC_DOLT_PORT"] = port
-			overrides["BEADS_DOLT_PORT"] = port
+			overrides["BEADS_DOLT_SERVER_PORT"] = port
+		}
+		if user := os.Getenv("GC_DOLT_USER"); user != "" {
+			overrides["GC_DOLT_USER"] = user
+			overrides["BEADS_DOLT_SERVER_USER"] = user
+		}
+		if pass := os.Getenv("GC_DOLT_PASSWORD"); pass != "" {
+			overrides["GC_DOLT_PASSWORD"] = pass
+			overrides["BEADS_DOLT_PASSWORD"] = pass
 		}
 	}
 	return mergeRuntimeEnv(os.Environ(), overrides)
@@ -144,14 +173,27 @@ func mirrorBeadsDoltEnv(env map[string]string) {
 		return
 	}
 	if host := strings.TrimSpace(env["GC_DOLT_HOST"]); host != "" {
-		env["BEADS_DOLT_HOST"] = host
+		env["BEADS_DOLT_SERVER_HOST"] = host
 	} else {
-		delete(env, "BEADS_DOLT_HOST")
+		delete(env, "BEADS_DOLT_SERVER_HOST")
 	}
 	if port := strings.TrimSpace(env["GC_DOLT_PORT"]); port != "" {
-		env["BEADS_DOLT_PORT"] = port
+		env["BEADS_DOLT_SERVER_PORT"] = port
 	} else {
-		delete(env, "BEADS_DOLT_PORT")
+		delete(env, "BEADS_DOLT_SERVER_PORT")
+	}
+	if user := strings.TrimSpace(env["GC_DOLT_USER"]); user != "" {
+		env["BEADS_DOLT_SERVER_USER"] = user
+	} else {
+		delete(env, "BEADS_DOLT_SERVER_USER")
+	}
+	// Note: beads v1.0.0 reads BEADS_DOLT_PASSWORD (no _SERVER_ infix).
+	// The asymmetry with BEADS_DOLT_SERVER_USER is intentional per beads
+	// upstream convention.
+	if pass := env["GC_DOLT_PASSWORD"]; pass != "" {
+		env["BEADS_DOLT_PASSWORD"] = pass
+	} else {
+		delete(env, "BEADS_DOLT_PASSWORD")
 	}
 }
 
@@ -170,14 +212,18 @@ func cityForStoreDir(dir string) string {
 func mergeRuntimeEnv(environ []string, overrides map[string]string) []string {
 	keys := []string{
 		"BEADS_DIR",
-		"BEADS_DOLT_HOST",
-		"BEADS_DOLT_PORT",
+		"BEADS_DOLT_PASSWORD",
+		"BEADS_DOLT_SERVER_HOST",
+		"BEADS_DOLT_SERVER_PORT",
+		"BEADS_DOLT_SERVER_USER",
 		"GC_CITY",
 		"GC_CITY_ROOT",
 		"GC_CITY_PATH",
 		"GC_CITY_RUNTIME_DIR",
 		"GC_DOLT_HOST",
+		"GC_DOLT_PASSWORD",
 		"GC_DOLT_PORT",
+		"GC_DOLT_USER",
 		"GC_PACK_STATE_DIR",
 		"GC_RIG",
 		"GC_RIG_ROOT",

@@ -139,6 +139,84 @@ func TestWorkflowFormulaSearchPathsUsesRoutedRigLayers(t *testing.T) {
 	}
 }
 
+func TestFindWorkflowBeadsIncludesClosedDescendants(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:  "Workflow",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.kind":        "workflow",
+			"gc.workflow_id": "wf-delete",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	child, err := store.Create(beads.Bead{
+		Title:  "Closed child",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(child): %v", err)
+	}
+
+	found := findWorkflowBeads(store, root.ID)
+	ids := make([]string, 0, len(found))
+	for _, bead := range found {
+		ids = append(ids, bead.ID)
+	}
+	if !slices.Contains(ids, root.ID) {
+		t.Fatalf("findWorkflowBeads(...) missing root %q: %#v", root.ID, ids)
+	}
+	if !slices.Contains(ids, child.ID) {
+		t.Fatalf("findWorkflowBeads(...) missing closed child %q: %#v", child.ID, ids)
+	}
+}
+
+func TestFindWorkflowBeadsResolvesLogicalWorkflowID(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:  "Workflow",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.kind":        "workflow",
+			"gc.workflow_id": "wf-delete-logical",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	child, err := store.Create(beads.Bead{
+		Title:  "Closed child",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(child): %v", err)
+	}
+
+	found := findWorkflowBeads(store, "wf-delete-logical")
+	ids := make([]string, 0, len(found))
+	for _, bead := range found {
+		ids = append(ids, bead.ID)
+	}
+	if !slices.Contains(ids, root.ID) {
+		t.Fatalf("findWorkflowBeads(logical) missing root %q: %#v", root.ID, ids)
+	}
+	if !slices.Contains(ids, child.ID) {
+		t.Fatalf("findWorkflowBeads(logical) missing child %q: %#v", child.ID, ids)
+	}
+}
+
 func TestDecorateDynamicFragmentRecipePreservesPoolFallbackAndScopeMetadata(t *testing.T) {
 	store := beads.NewMemStore()
 	cfg := &config.City{
@@ -196,14 +274,10 @@ func TestDecorateDynamicFragmentRecipePreservesPoolFallbackAndScopeMetadata(t *t
 	if review.Metadata["gc.routed_to"] != "frontend/reviewer" {
 		t.Fatalf("review gc.routed_to = %q, want frontend/reviewer", review.Metadata["gc.routed_to"])
 	}
-	foundPoolLabel := false
 	for _, label := range review.Labels {
 		if label == "pool:frontend/reviewer" {
-			foundPoolLabel = true
+			t.Fatalf("review labels = %#v, should not contain legacy pool label", review.Labels)
 		}
-	}
-	if !foundPoolLabel {
-		t.Fatalf("review labels = %#v, want pool label", review.Labels)
 	}
 	if review.Metadata["gc.scope_ref"] != "body" {
 		t.Fatalf("review gc.scope_ref = %q, want body", review.Metadata["gc.scope_ref"])
@@ -359,7 +433,10 @@ func TestRunWorkflowServeProcessesReadyControlBeadsThenExits(t *testing.T) {
 		workflowServeIdlePollAttempts = prevAttempts
 	})
 
-	wantQuery := `bd ready --metadata-field gc.routed_to=` + config.ControlDispatcherAgentName + ` --unassigned --json --limit=20 2>/dev/null`
+	// The tiered query has sh -c wrapper; workflowServeQuery replaces the
+	// first --limit=1 with --limit=20 for scan width.
+	cdAgent := config.Agent{Name: config.ControlDispatcherAgentName}
+	wantQuery := workflowServeQuery(cdAgent.EffectiveWorkQuery())
 	var gotQueries []string
 	var gotDirs []string
 	var controlled []string

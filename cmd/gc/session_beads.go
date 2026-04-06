@@ -27,12 +27,17 @@ func loadSessionBeads(store beads.Store) ([]beads.Bead, error) {
 	if store == nil {
 		return nil, nil
 	}
-	all, err := store.ListByLabel(sessionBeadLabel, 0)
+	all, err := store.List(beads.ListQuery{
+		Label: sessionBeadLabel,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("listing session beads: %w", err)
 	}
 	var result []beads.Bead
 	for _, b := range all {
+		if !session.IsSessionBeadOrRepairable(b) {
+			continue
+		}
 		if b.Status == "closed" {
 			continue
 		}
@@ -48,7 +53,7 @@ func snapshotOrLoadSessionBeads(store beads.Store, sessionBeads *sessionBeadSnap
 	return loadSessionBeads(store)
 }
 
-func canRebindConfiguredNamedSession(b beads.Bead, identity string) bool {
+func canRebindConfiguredNamedSession(b beads.Bead, identity, sessionName string) bool {
 	if identity == "" || isNamedSessionBead(b) {
 		return false
 	}
@@ -56,13 +61,104 @@ func canRebindConfiguredNamedSession(b beads.Bead, identity string) bool {
 	if strings.TrimSpace(b.Metadata[namedSessionIdentityMetadata]) == identity {
 		return true
 	}
-	// Also allow rebind for pre-existing beads whose session_name, alias,
-	// or alias_history matches the named session identity (adoption of beads
-	// created before the named session config was added). Rig-scoped names
-	// use "--" instead of "/" for tmux, so alias_history is needed.
+	spec := namedSessionSpec{Identity: identity, SessionName: sessionName}
+	if !namedSessionBeadMatchesSpec(b, spec) {
+		return false
+	}
+	// Also allow rebind for pre-existing beads whose session_name matches
+	// the canonical runtime name (or an older identity-based runtime name).
 	sn := strings.TrimSpace(b.Metadata["session_name"])
-	alias := strings.TrimSpace(b.Metadata["alias"])
-	return sn == identity || alias == identity || sessionAliasHistoryContains(b.Metadata, identity)
+	return sn == sessionName || sn == identity
+}
+
+func preserveConfiguredNamedSessionBead(b beads.Bead, cfg *config.City, cityName string) bool {
+	if cfg == nil || !isNamedSessionBead(b) {
+		return false
+	}
+	identity := namedSessionIdentity(b)
+	if identity == "" {
+		return false
+	}
+	spec, ok := findNamedSessionSpec(cfg, cityName, identity)
+	if !ok {
+		return false
+	}
+	return strings.TrimSpace(b.Metadata["session_name"]) == spec.SessionName
+}
+
+func reopenClosedConfiguredNamedSessionBead(
+	cityPath string,
+	store beads.Store,
+	cfg *config.City,
+	cityName string,
+	identity string,
+	sessionName string,
+	state string,
+	now time.Time,
+	stderr io.Writer,
+) (beads.Bead, bool) {
+	if store == nil || cfg == nil {
+		return beads.Bead{}, false
+	}
+	bead, ok := findClosedNamedSessionBeadForSessionName(store, identity, sessionName)
+	if !ok {
+		return beads.Bead{}, false
+	}
+	// Explicit gc session close retires the canonical identifiers before
+	// closing. In that case, mint a fresh canonical bead instead of reviving
+	// a deliberately retired runtime identity.
+	if strings.TrimSpace(bead.Metadata["session_name"]) == "" {
+		return beads.Bead{}, false
+	}
+	if strings.TrimSpace(bead.Metadata["session_name"]) != strings.TrimSpace(sessionName) {
+		return beads.Bead{}, false
+	}
+	spec, ok := findNamedSessionSpec(cfg, cityName, identity)
+	if !ok || strings.TrimSpace(spec.SessionName) != strings.TrimSpace(sessionName) {
+		return beads.Bead{}, false
+	}
+	var reopened beads.Bead
+	err := session.WithCitySessionIdentifierLocks(cityPath, []string{identity, sessionName}, func() error {
+		if err := session.EnsureAliasAvailableWithConfigForOwner(store, cfg, identity, bead.ID, identity); err != nil {
+			fmt.Fprintf(stderr, "session beads: alias %q for %s unavailable during reopen: %v\n", identity, identity, err) //nolint:errcheck
+			return nil
+		}
+		if err := session.EnsureSessionNameAvailableWithConfigForOwner(store, cfg, sessionName, bead.ID, identity); err != nil {
+			fmt.Fprintf(stderr, "session beads: session_name %q for %s unavailable during reopen: %v\n", sessionName, identity, err) //nolint:errcheck
+			return nil
+		}
+		open := "open"
+		if err := store.Update(bead.ID, beads.UpdateOpts{Status: &open}); err != nil {
+			fmt.Fprintf(stderr, "session beads: reopening configured named session %q: %v\n", identity, err) //nolint:errcheck
+			return nil
+		}
+		bead.Status = "open"
+		pendingCreateClaim := ""
+		if state != "active" {
+			pendingCreateClaim = "true"
+		}
+		batch := map[string]string{
+			"state":                state,
+			"close_reason":         "",
+			"closed_at":            "",
+			"pending_create_claim": pendingCreateClaim,
+			"synced_at":            now.Format("2006-01-02T15:04:05Z07:00"),
+		}
+		if setMetaBatch(store, bead.ID, batch, stderr) == nil {
+			for k, v := range batch {
+				bead.Metadata[k] = v
+			}
+		}
+		reopened = bead
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "session beads: locking identifiers for %q reopen: %v\n", identity, err) //nolint:errcheck
+	}
+	if reopened.ID == "" {
+		return beads.Bead{}, false
+	}
+	return reopened, true
 }
 
 // syncSessionBeads ensures every desired session has a corresponding session
@@ -121,6 +217,22 @@ func syncSessionBeadsWithSnapshot(
 		return nil, sessionBeads
 	}
 
+	// Repair session beads with empty types. The gc:session label (used by
+	// ListByLabel) is authoritative — if a bead has the label, it's a
+	// session bead. Empty types can occur after bd schema migrations or
+	// crashes that leave partially-written records.
+	for i, b := range existing {
+		if b.Type != "" || b.Status == "closed" {
+			continue
+		}
+		t := sessionBeadType
+		if err := store.Update(b.ID, beads.UpdateOpts{Type: &t}); err != nil {
+			fmt.Fprintf(stderr, "session beads: repairing type for %s: %v\n", b.ID, err) //nolint:errcheck
+		} else {
+			existing[i].Type = sessionBeadType
+		}
+	}
+
 	// Index by session_name for O(1) lookup. Skip closed beads — a closed
 	// bead is a completed lifecycle record, not a live session. If an agent
 	// restarts after its bead was closed, we create a fresh bead.
@@ -170,9 +282,9 @@ func syncSessionBeadsWithSnapshot(
 	downgraded := make(map[string]bool)
 
 	now := clk.Now().UTC()
+	cityName := config.EffectiveCityName(cfg, filepath.Base(cityPath))
 
 	if cfg != nil {
-		cityName := config.EffectiveCityName(cfg, filepath.Base(cityPath))
 		for i, b := range openBeads {
 			if b.Status == "closed" || !isNamedSessionBead(b) {
 				continue
@@ -219,6 +331,15 @@ func syncSessionBeadsWithSnapshot(
 		isManagedPool := cfgAgent != nil && isMultiSessionCfgAgent(cfgAgent) && !tp.ManualSession
 
 		b, exists := bySessionName[sn]
+		if !exists && isConfiguredNamed {
+			if reopened, ok := reopenClosedConfiguredNamedSessionBead(cityPath, store, cfg, cityName, tp.ConfiguredNamedIdentity, sn, state, now, stderr); ok {
+				b = reopened
+				exists = true
+				bySessionName[sn] = reopened
+				openBeads = append(openBeads, reopened)
+				indexBySessionName[sn] = len(openBeads) - 1
+			}
+		}
 		if !exists {
 			// Create a new session bead.
 			meta := map[string]string{
@@ -231,6 +352,9 @@ func syncSessionBeadsWithSnapshot(
 				"instance_token":     session.NewInstanceToken(),
 				"state":              state,
 				"synced_at":          now.Format("2006-01-02T15:04:05Z07:00"),
+			}
+			if state != "active" {
+				meta["pending_create_claim"] = "true"
 			}
 			if tp.DependencyOnly {
 				meta["dependency_only"] = boolMetadata(true)
@@ -354,7 +478,7 @@ func syncSessionBeadsWithSnapshot(
 			continue
 		}
 
-		if isConfiguredNamed && (!isNamedSessionBead(b) || namedSessionIdentity(b) != tp.ConfiguredNamedIdentity) && !canRebindConfiguredNamedSession(b, tp.ConfiguredNamedIdentity) {
+		if isConfiguredNamed && (!isNamedSessionBead(b) || namedSessionIdentity(b) != tp.ConfiguredNamedIdentity) && !canRebindConfiguredNamedSession(b, tp.ConfiguredNamedIdentity, sn) {
 			fmt.Fprintf(stderr, "session beads: configured named session %q conflicts with live bead %s\n", tp.ConfiguredNamedIdentity, b.ID) //nolint:errcheck
 			continue
 		}
@@ -498,7 +622,13 @@ func syncSessionBeadsWithSnapshot(
 			}
 			appliedWithLock := false
 			lockErr := session.WithCitySessionAliasLock(cityPath, lockAlias, func() error {
-				if err := session.EnsureAliasAvailableWithConfig(store, cfg, managedAlias, b.ID); err != nil {
+				var err error
+				if isConfiguredNamed {
+					err = session.EnsureAliasAvailableWithConfigForOwner(store, cfg, managedAlias, b.ID, tp.ConfiguredNamedIdentity)
+				} else {
+					err = session.EnsureAliasAvailableWithConfig(store, cfg, managedAlias, b.ID)
+				}
+				if err != nil {
 					fmt.Fprintf(stderr, "session beads: alias %q for %s unavailable: %v\n", managedAlias, agentName, err) //nolint:errcheck
 				} else {
 					for key, value := range session.UpdatedAliasMetadata(b.Metadata, managedAlias) {
@@ -564,7 +694,9 @@ func syncSessionBeadsWithSnapshot(
 			if b.Status == "closed" {
 				continue
 			}
-			cityName := config.EffectiveCityName(cfg, "")
+			if preserveConfiguredNamedSessionBead(b, cfg, cityName) {
+				continue
+			}
 			if spec, conflict, err := findConflictingNamedSessionSpecForBead(cfg, cityName, b); err != nil {
 				fmt.Fprintf(stderr, "session beads: checking named-session conflict for %s: %v\n", b.ID, err) //nolint:errcheck
 			} else if conflict {
@@ -712,14 +844,17 @@ func configuredSessionNamesWithSnapshot(cfg *config.City, cityName string, sessi
 		if identity == "" {
 			continue
 		}
+		runtimeName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, identity)
 		if sessionBeads != nil {
-			if b, ok := findCanonicalNamedSessionBead(sessionBeads, identity); ok {
-				if sn := strings.TrimSpace(b.Metadata["session_name"]); sn != "" {
-					names[sn] = true
+			if spec, ok := findNamedSessionSpec(cfg, cityName, identity); ok {
+				if b, ok := findCanonicalNamedSessionBead(sessionBeads, spec); ok {
+					if sn := strings.TrimSpace(b.Metadata["session_name"]); sn != "" {
+						names[sn] = true
+					}
 				}
 			}
 		}
-		names[config.NamedSessionRuntimeName(cityName, cfg.Workspace, identity)] = true
+		names[runtimeName] = true
 	}
 
 	return names
@@ -804,11 +939,16 @@ func setBeadRestartRequested(store beads.Store, sessionName string) error {
 	if store == nil {
 		return fmt.Errorf("no store available")
 	}
-	all, err := store.ListByLabel(sessionBeadLabel, 0)
+	all, err := store.List(beads.ListQuery{
+		Label: sessionBeadLabel,
+	})
 	if err != nil {
 		return fmt.Errorf("listing session beads: %w", err)
 	}
 	for _, b := range all {
+		if !session.IsSessionBeadOrRepairable(b) {
+			continue
+		}
 		if b.Status == "closed" {
 			continue
 		}

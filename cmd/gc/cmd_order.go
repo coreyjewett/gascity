@@ -51,7 +51,7 @@ func newOrderListCmd(stdout, stderr io.Writer) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List available orders",
-		Long: `List all available orders with their gate type, schedule, and target pool.
+		Long: `List all available orders with their gate type, schedule, and target.
 
 Scans formula layers for formulas that have order metadata
 (gate, interval, schedule, check, pool).`,
@@ -73,7 +73,7 @@ func newOrderShowCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Display detailed information about a named order.
 
 Shows the order name, description, formula reference, gate type,
-scheduling parameters, check command, target pool, and source file.
+scheduling parameters, check command, target, and source file.
 Use --rig to disambiguate same-name orders in different rigs.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -95,7 +95,7 @@ func newOrderRunCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Execute an order manually, bypassing its gate conditions.
 
 Instantiates a wisp from the order's formula and routes it to the
-target pool (if configured). Useful for testing orders or triggering
+configured target (if any). Useful for testing orders or triggering
 them outside their normal schedule.
 Use --rig to disambiguate same-name orders in different rigs.`,
 		Args: cobra.ExactArgs(1),
@@ -303,9 +303,9 @@ func doOrderList(aa []orders.Order, stdout io.Writer) int {
 
 	hasRig := anyOrderHasRig(aa)
 	if hasRig {
-		fmt.Fprintf(stdout, "%-20s %-8s %-12s %-15s %-15s %s\n", "NAME", "TYPE", "GATE", "INTERVAL/SCHED", "RIG", "POOL") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-8s %-12s %-15s %-15s %s\n", "NAME", "TYPE", "GATE", "INTERVAL/SCHED", "RIG", "TARGET") //nolint:errcheck
 	} else {
-		fmt.Fprintf(stdout, "%-20s %-8s %-12s %-15s %s\n", "NAME", "TYPE", "GATE", "INTERVAL/SCHED", "POOL") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-8s %-12s %-15s %s\n", "NAME", "TYPE", "GATE", "INTERVAL/SCHED", "TARGET") //nolint:errcheck
 	}
 	for _, a := range aa {
 		typ := "formula"
@@ -394,7 +394,7 @@ func doOrderShow(aa []orders.Order, name, rig string, stdout, stderr io.Writer) 
 		w(fmt.Sprintf("On:          %s", a.On))
 	}
 	if a.Pool != "" {
-		w(fmt.Sprintf("Pool:        %s", a.Pool))
+		w(fmt.Sprintf("Target:      %s", a.Pool))
 	}
 	w(fmt.Sprintf("Source:      %s", a.Source))
 	return 0
@@ -424,7 +424,7 @@ func cmdOrderRun(name, rig string, stdout, stderr io.Writer) int {
 
 // doOrderRun executes an order manually: instantiates a wisp from the
 // order's formula (or runs exec script directly) and routes it to the
-// target pool.
+// configured target.
 func doOrderRun(aa []orders.Order, name, rig, cityPath string, runner SlingRunner, store beads.Store, ep events.Provider, stdout, stderr io.Writer) int {
 	a, ok := findOrder(aa, name, rig)
 	if !ok {
@@ -482,15 +482,16 @@ func doOrderRun(aa []orders.Order, name, rig, cityPath string, runner SlingRunne
 	}
 	rootID := cookResult.RootID
 
-	// Label with order-run:<scopedName> for tracking, plus pool routing if specified.
-	// For event gates, also add order:<scopedName> and seq:<headSeq> for cursor tracking.
+	// Label with order-run:<scopedName> for tracking, plus root routing metadata
+	// when a target is configured. For event gates, also add order:<scopedName>
+	// and seq:<headSeq> for cursor tracking.
 	routeCmd := fmt.Sprintf("bd update %s --add-label=order-run:%s", rootID, scoped)
 	if a.Gate == "event" && ep != nil {
 		routeCmd += fmt.Sprintf(" --add-label=order:%s --add-label=seq:%d", scoped, headSeq)
 	}
 	if a.Pool != "" {
 		pool := qualifyPool(a.Pool, a.Rig)
-		routeCmd += fmt.Sprintf(" --add-label=pool:%s", pool)
+		routeCmd += fmt.Sprintf(" --set-metadata gc.routed_to=%s", pool)
 	}
 	if _, err := runner("", routeCmd, nil); err != nil {
 		fmt.Fprintf(stderr, "gc order run: labeling wisp: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -499,7 +500,7 @@ func doOrderRun(aa []orders.Order, name, rig, cityPath string, runner SlingRunne
 
 	fmt.Fprintf(stdout, "Order %q executed: wisp %s", name, rootID) //nolint:errcheck
 	if a.Pool != "" {
-		fmt.Fprintf(stdout, " → pool:%s", a.Pool) //nolint:errcheck
+		fmt.Fprintf(stdout, " → gc.routed_to=%s", qualifyPool(a.Pool, a.Rig)) //nolint:errcheck
 	}
 	fmt.Fprintln(stdout) //nolint:errcheck
 	return 0
@@ -561,7 +562,12 @@ func cmdOrderCheck(stdout, stderr io.Writer) int {
 func orderLastRunFn(store beads.Store) orders.LastRunFunc {
 	return func(name string) (time.Time, error) {
 		label := "order-run:" + name
-		results, err := store.ListByLabel(label, 1)
+		results, err := store.List(beads.ListQuery{
+			Label:         label,
+			Limit:         1,
+			IncludeClosed: true,
+			Sort:          beads.SortCreatedDesc,
+		})
 		if err != nil {
 			return time.Time{}, err
 		}
@@ -656,7 +662,11 @@ func doOrderHistory(name, rig string, aa []orders.Order, store beads.Store, stdo
 
 	for _, a := range targets {
 		label := "order-run:" + a.ScopedName()
-		results, err := store.ListByLabel(label, 0)
+		results, err := store.List(beads.ListQuery{
+			Label:         label,
+			IncludeClosed: true,
+			Sort:          beads.SortCreatedDesc,
+		})
 		if err != nil {
 			continue
 		}
@@ -721,7 +731,11 @@ func findOrder(aa []orders.Order, name, rig string) (orders.Order, bool) {
 // label on wisps labeled order:<name>.
 func bdCursorFunc(store beads.Store) orders.CursorFunc {
 	return func(orderName string) uint64 {
-		beadList, err := store.ListByLabel("order:"+orderName, 0)
+		beadList, err := store.List(beads.ListQuery{
+			Label:         "order:" + orderName,
+			IncludeClosed: true,
+			Sort:          beads.SortCreatedDesc,
+		})
 		if err != nil {
 			return 0
 		}

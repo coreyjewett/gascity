@@ -199,6 +199,7 @@ func (t *Tmux) run(args ...string) (string, error) {
 		allArgs = append(allArgs, "-L", t.cfg.SocketName)
 	}
 	allArgs = append(allArgs, args...)
+
 	return t.exec.execute(allArgs)
 }
 
@@ -286,6 +287,17 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	if err := validateSessionName(name); err != nil {
 		return err
 	}
+	// Disable mouse mode and monitor-activity before creating the session.
+	// With mouse on, tmux sends SGR mouse tracking sequences (\x1b[<...M)
+	// into panes. When the gc controller polls tmux state (list-panes,
+	// capture-pane, display-message), these sequences can arrive as stray
+	// ESC bytes on the agent's stdin. Claude Code's TUI misinterprets lone
+	// ESC as an Escape keypress, triggering "Interrupted" mid-tool-call.
+	// Automated agents don't need mouse input, so disabling is safe.
+	defer func() {
+		t.run("set-option", "-t", name, "mouse", "off")             //nolint:errcheck
+		t.run("set-option", "-wt", name, "monitor-activity", "off") //nolint:errcheck
+	}()
 	args := []string{"new-session", "-d", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
@@ -1411,19 +1423,44 @@ func (t *Tmux) IsSessionRunning(session string) bool {
 	return !dead
 }
 
-// GetSessionActivity returns the last activity time for a session.
-// This is updated whenever there's any activity in the session (input/output).
+// GetSessionActivity returns the last meaningful activity time for a session.
+//
+// For detached agent sessions, tmux's #{session_activity} does not advance on
+// pane I/O — it effectively sticks to creation/attach time. Query per-window
+// activity instead and take the most recent timestamp so detached output and
+// send-keys both count as activity.
 func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
-	out, err := t.run("display-message", "-t", session, "-p", "#{session_activity}")
+	out, err := t.run("list-windows", "-t", session, "-F", "#{window_activity}")
 	if err != nil {
 		return time.Time{}, err
 	}
 
-	timestamp, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	timestamp, err := latestActivityTimestamp(out)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("parsing session activity: %w", err)
+		return time.Time{}, err
 	}
 	return time.Unix(timestamp, 0), nil
+}
+
+func latestActivityTimestamp(out string) (int64, error) {
+	var latest int64
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		timestamp, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parsing window activity %q: %w", line, err)
+		}
+		if timestamp > latest {
+			latest = timestamp
+		}
+	}
+	if latest == 0 {
+		return 0, fmt.Errorf("parsing window activity: no timestamps found")
+	}
+	return latest, nil
 }
 
 // ZombieStatus describes the liveness state of a tmux agent session.

@@ -53,6 +53,7 @@ type drainState struct {
 	deadline   time.Time
 	reason     string // "idle", "pool-excess", "config-drift", "user"
 	generation int    // generation at drain start — fence for Stop
+	ackSet     bool   // true after GC_DRAIN_ACK has been set by the reconciler
 }
 
 // idleProbeState tracks an async WaitForIdle probe for interactive idle sleep.
@@ -209,4 +210,17 @@ const (
 	// defaultMaxWakeAttempts is how many consecutive wake failures before
 	// quarantine.
 	defaultMaxWakeAttempts = 5
+
+	// churnProductivityThreshold is how long a session must run to be
+	// considered productive. Sessions that survive past stabilityThreshold
+	// but die before this threshold are "churning" — alive long enough to
+	// not count as a rapid crash, but too short to do useful work. This
+	// catches the context exhaustion death spiral where gc prime gets
+	// re-injected every ~60-90s.
+	churnProductivityThreshold = 5 * time.Minute
+
+	// defaultMaxChurnCycles is how many consecutive non-productive
+	// wake→die cycles before quarantine. Three cycles means the session
+	// failed to be productive three times in a row.
+	defaultMaxChurnCycles = 3
 )

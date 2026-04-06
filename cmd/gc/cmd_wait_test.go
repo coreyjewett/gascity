@@ -11,17 +11,25 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 type waitErrorStore struct {
 	*beads.MemStore
 }
 
-func (s waitErrorStore) ListByLabel(label string, limit int) ([]beads.Bead, error) {
+func (s waitErrorStore) ListByLabel(label string, limit int, _ ...beads.QueryOpt) ([]beads.Bead, error) {
 	if label == waitBeadLabel {
 		return nil, errors.New("wait list failed")
 	}
 	return s.MemStore.ListByLabel(label, limit)
+}
+
+func (s waitErrorStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == waitBeadLabel {
+		return nil, errors.New("wait list failed")
+	}
+	return s.MemStore.List(query)
 }
 
 func TestPrepareWaitWakeState_MarksDepsReady(t *testing.T) {
@@ -342,6 +350,9 @@ func TestRetryClosedWait_CreatesReplacement(t *testing.T) {
 	if retried.ID == wait.ID {
 		t.Fatal("retryClosedWait reused original wait ID")
 	}
+	if retried.Type != waitBeadType {
+		t.Fatalf("retried type = %q, want %q", retried.Type, waitBeadType)
+	}
 	if retried.Metadata["state"] != waitStateReady {
 		t.Fatalf("retried state = %q, want %q", retried.Metadata["state"], waitStateReady)
 	}
@@ -661,6 +672,32 @@ func TestCancelWaitsForSession(t *testing.T) {
 	}
 	if updated.Status != "closed" {
 		t.Fatalf("wait status = %q, want closed", updated.Status)
+	}
+}
+
+func TestLoadSessionWaitBeads_IncludesLegacyWaitType(t *testing.T) {
+	store := beads.NewMemStore()
+	sessionID := "gc-session"
+	if _, err := store.Create(beads.Bead{
+		Type:   sessionpkg.LegacyWaitBeadType,
+		Labels: []string{waitBeadLabel, "session:" + sessionID},
+		Metadata: map[string]string{
+			"session_id": sessionID,
+			"state":      waitStatePending,
+		},
+	}); err != nil {
+		t.Fatalf("create legacy wait bead: %v", err)
+	}
+
+	waits, err := loadSessionWaitBeads(store, sessionID)
+	if err != nil {
+		t.Fatalf("loadSessionWaitBeads: %v", err)
+	}
+	if len(waits) != 1 {
+		t.Fatalf("loadSessionWaitBeads returned %d waits, want 1", len(waits))
+	}
+	if waits[0].Type != sessionpkg.LegacyWaitBeadType {
+		t.Fatalf("wait type = %q, want legacy %q", waits[0].Type, sessionpkg.LegacyWaitBeadType)
 	}
 }
 
