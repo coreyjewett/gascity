@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"strconv"
@@ -37,9 +38,20 @@ func apiClient(cityPath string) *api.Client {
 		}
 
 		baseURL := fmt.Sprintf("http://%s", net.JoinHostPort(bind, strconv.Itoa(cfg.API.Port)))
-		return api.NewClient(baseURL)
+		// Standalone controller serves /v0/city/{cityName}/... routes via
+		// api.NewSupervisorMux, so per-city method calls need a city-scoped
+		// client. Derive the city name from config; the controller only
+		// serves one city in standalone mode.
+		return api.NewCityScopedClient(baseURL, standaloneControllerCityName(cfg, cityPath))
 	}
 	return supervisorCityAPIClient(cityPath)
+}
+
+// standaloneControllerCityName resolves the effective city name for a
+// standalone controller API client. In standalone mode the controller serves
+// exactly one city, so the client must match the runtime identity.
+func standaloneControllerCityName(cfg *config.City, cityPath string) string {
+	return loadedCityName(cfg, cityPath)
 }
 
 // resolveAgentForAPI resolves a bare agent name (e.g., "worker") to its
@@ -47,7 +59,7 @@ func apiClient(cityPath string) *api.Client {
 // the API server can find the agent. If already qualified or resolution
 // fails, the original name is returned.
 func resolveAgentForAPI(cityPath, name string) string {
-	cfg, err := loadCityConfig(cityPath)
+	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		return name
 	}

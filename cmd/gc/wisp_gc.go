@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -17,9 +17,9 @@ type wispGC interface {
 
 	// runGC lists closed molecules, deletes those older than TTL, and returns
 	// the count of purged entries. Errors from individual deletes are
-	// best-effort (logged but not fatal); the returned error is for list
-	// failures.
-	runGC(cityPath string, now time.Time) (int, error)
+	// best-effort and surfaced without stopping the purge; the returned error
+	// also covers list failures.
+	runGC(store beads.Store, now time.Time) (int, error)
 }
 
 // memoryWispGC is the production implementation of wispGC.
@@ -27,19 +27,17 @@ type memoryWispGC struct {
 	interval time.Duration
 	ttl      time.Duration
 	lastRun  time.Time
-	runner   beads.CommandRunner
 }
 
 // newWispGC creates a wisp GC tracker. Returns nil if disabled (interval or
 // TTL is zero). Callers nil-guard before use.
-func newWispGC(interval, ttl time.Duration, runner beads.CommandRunner) wispGC {
+func newWispGC(interval, ttl time.Duration) wispGC {
 	if interval <= 0 || ttl <= 0 {
 		return nil
 	}
 	return &memoryWispGC{
 		interval: interval,
 		ttl:      ttl,
-		runner:   runner,
 	}
 }
 
@@ -47,67 +45,142 @@ func (m *memoryWispGC) shouldRun(now time.Time) bool {
 	return now.Sub(m.lastRun) >= m.interval
 }
 
-// gcEntry is the JSON structure returned by bd list --json for a bead.
-type gcEntry struct {
-	ID        string `json:"id"`
-	CreatedAt string `json:"created_at"`
-	Status    string `json:"status"`
-	Type      string `json:"type"`
-}
-
-func (m *memoryWispGC) runGC(cityPath string, now time.Time) (int, error) {
+func (m *memoryWispGC) runGC(store beads.Store, now time.Time) (int, error) {
 	m.lastRun = now
+	if store == nil {
+		return 0, fmt.Errorf("listing closed molecules: bead store unavailable")
+	}
 
-	// List closed molecules.
-	out, err := m.runner(cityPath, "bd", "list", "--json", "--limit=0", "--status=closed", "--type=molecule")
+	entries, err := store.List(beads.ListQuery{Status: "closed", Type: "molecule"})
 	if err != nil {
 		return 0, fmt.Errorf("listing closed molecules: %w", err)
 	}
 
-	var entries []gcEntry
-	if err := json.Unmarshal(out, &entries); err != nil {
-		return 0, fmt.Errorf("parsing molecule list: %w", err)
-	}
-
 	cutoff := now.Add(-m.ttl)
-	purged := 0
-	for _, e := range entries {
-		created, err := time.Parse(time.RFC3339, e.CreatedAt)
-		if err != nil {
-			continue // skip unparseable timestamps
-		}
-		if created.Before(cutoff) {
-			_, delErr := m.runner(cityPath, "bd", "delete", e.ID, "--force")
-			if delErr != nil {
-				continue // best-effort: skip failed deletes
-			}
-			purged++
-		}
-	}
+	purged, deleteErr := purgeExpiredBeadClosures(store, entries, cutoff)
 
-	// Purge expired closed tracking beads.
-	trackOut, trackErr := m.runner(cityPath, "bd", "list", "--json",
-		"--label=order-tracking", "--all", "--limit=0")
+	trackEntries, trackErr := store.List(beads.ListQuery{Status: "closed", Label: labelOrderTracking})
 	if trackErr == nil {
-		var trackEntries []gcEntry
-		if err := json.Unmarshal(trackOut, &trackEntries); err == nil {
-			for _, e := range trackEntries {
-				if e.Status != "closed" {
-					continue
-				}
-				created, err := time.Parse(time.RFC3339, e.CreatedAt)
-				if err != nil {
-					continue
-				}
-				if created.Before(cutoff) {
-					_, delErr := m.runner(cityPath, "bd", "delete", e.ID, "--force")
-					if delErr == nil {
-						purged++
-					}
-				}
-			}
+		trackPurged, trackDeleteErr := purgeExpiredBeadRoots(store, trackEntries, cutoff)
+		purged += trackPurged
+		deleteErr = errors.Join(deleteErr, trackDeleteErr)
+	} else {
+		deleteErr = errors.Join(deleteErr, fmt.Errorf("listing closed order-tracking beads: %w", trackErr))
+	}
+
+	return purged, deleteErr
+}
+
+func purgeExpiredBeadClosures(store beads.Store, entries []beads.Bead, cutoff time.Time) (int, error) {
+	return purgeExpiredBeads(store, entries, cutoff, deleteExpiredBeadClosure)
+}
+
+func purgeExpiredBeadRoots(store beads.Store, entries []beads.Bead, cutoff time.Time) (int, error) {
+	return purgeExpiredBeads(store, entries, cutoff, deleteWorkflowBead)
+}
+
+func purgeExpiredBeads(store beads.Store, entries []beads.Bead, cutoff time.Time, deleteFn func(beads.Store, string) error) (int, error) {
+	purged := 0
+	var deleteErr error
+	for _, entry := range entries {
+		if entry.CreatedAt.IsZero() || !entry.CreatedAt.Before(cutoff) {
+			continue
+		}
+		if err := deleteFn(store, entry.ID); err != nil {
+			deleteErr = errors.Join(deleteErr, fmt.Errorf("deleting expired bead %q: %w", entry.ID, err))
+			continue
+		}
+		purged++
+	}
+	return purged, deleteErr
+}
+
+func deleteExpiredBeadClosure(store beads.Store, rootID string) error {
+	// deleteWorkflowBead removes every dependency attached to each closure
+	// member before deleting the bead. Only use the closure deleter for roots
+	// whose full ownership tree is safe to collect.
+	ids, err := collectExpiredBeadClosure(store, rootID)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := deleteWorkflowBead(store, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func collectExpiredBeadClosure(store beads.Store, rootID string) ([]string, error) {
+	if store == nil {
+		return nil, fmt.Errorf("bead store unavailable")
+	}
+	rootOwned := make([]string, 0, 4)
+	related, err := store.List(beads.ListQuery{
+		Metadata:      map[string]string{"gc.root_bead_id": rootID},
+		IncludeClosed: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list workflow-owned beads for %s: %w", rootID, err)
+	}
+	for _, bead := range related {
+		if bead.ID != "" && bead.ID != rootID {
+			rootOwned = append(rootOwned, bead.ID)
 		}
 	}
 
-	return purged, nil
+	seen := make(map[string]struct{}, len(rootOwned)+1)
+	ids := make([]string, 0, len(rootOwned)+1)
+	var visit func(string) error
+	visit = func(id string) error {
+		if id == "" {
+			return nil
+		}
+		if _, ok := seen[id]; ok {
+			return nil
+		}
+		seen[id] = struct{}{}
+
+		if id == rootID {
+			for _, relatedID := range rootOwned {
+				if err := visit(relatedID); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Treat structural parentage as workflow ownership. Some molecule step
+		// beads are linked only by ParentID / parent-child deps and do not carry
+		// gc.root_bead_id metadata, so GC must follow those ownership edges while
+		// still ignoring non-ownership deps such as blocks or waits-for.
+		children, err := store.Children(id, beads.IncludeClosed)
+		if err != nil {
+			return fmt.Errorf("list children for %s: %w", id, err)
+		}
+		for _, child := range children {
+			if err := visit(child.ID); err != nil {
+				return err
+			}
+		}
+
+		upDeps, err := store.DepList(id, "up")
+		if err != nil {
+			return fmt.Errorf("list dependents for %s: %w", id, err)
+		}
+		for _, dep := range upDeps {
+			if dep.Type != "parent-child" || dep.IssueID == "" {
+				continue
+			}
+			if err := visit(dep.IssueID); err != nil {
+				return err
+			}
+		}
+
+		ids = append(ids, id)
+		return nil
+	}
+	if err := visit(rootID); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }

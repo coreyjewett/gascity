@@ -1,13 +1,15 @@
 package citylayout
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestPackRuntimeEnv(t *testing.T) {
 	cityRoot := "/city"
 
 	got := PackRuntimeEnv(cityRoot, "rlm")
 	want := map[string]string{
-		"GC_CITY_ROOT":        cityRoot,
+		"GC_CITY":             cityRoot,
 		"GC_CITY_PATH":        cityRoot,
 		"GC_CITY_RUNTIME_DIR": "/city/.gc/runtime",
 		"GC_PACK_STATE_DIR":   "/city/.gc/runtime/packs/rlm",

@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 	"io"
-	"path/filepath"
 
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/spf13/cobra"
@@ -17,7 +17,7 @@ import (
 // newRigStatusCmd creates the "gc rig status <name>" subcommand.
 func newRigStatusCmd(stdout, stderr io.Writer) *cobra.Command {
 	return &cobra.Command{
-		Use:   "status <name>",
+		Use:   "status [name]",
 		Short: "Show rig status and agent running state",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
@@ -31,18 +31,21 @@ func newRigStatusCmd(stdout, stderr io.Writer) *cobra.Command {
 
 // cmdRigStatus is the CLI entry point for showing rig status.
 func cmdRigStatus(args []string, stdout, stderr io.Writer) int {
-	if len(args) < 1 {
-		fmt.Fprintln(stderr, "gc rig status: missing rig name") //nolint:errcheck // best-effort stderr
-		return 1
-	}
-	rigName := args[0]
-
-	cityPath, err := resolveCity()
+	ctx, err := resolveContext()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc rig status: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	cfg, err := loadCityConfig(cityPath)
+	rigName := ctx.RigName
+	if len(args) > 0 {
+		rigName = args[0]
+	}
+	if rigName == "" {
+		fmt.Fprintln(stderr, "gc rig status: missing rig name") //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	cityPath := ctx.CityPath
+	cfg, err := loadCityConfig(cityPath, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc rig status: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -71,10 +74,7 @@ func cmdRigStatus(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	cityName := cfg.Workspace.Name
-	if cityName == "" {
-		cityName = filepath.Base(cityPath)
-	}
+	cityName := loadedCityName(cfg, cityPath)
 	sp := newSessionProvider()
 	dops := newDrainOps(sp)
 	return doRigStatus(sp, dops, rig, rigAgents, cityPath, cityName, cfg.Workspace.SessionTemplate, stdout, stderr)
@@ -90,6 +90,12 @@ func doRigStatus(
 	stdout, stderr io.Writer,
 ) int {
 	_ = stderr // reserved for future error reporting
+	var store beads.Store
+	if cityPath != "" {
+		if opened, err := openCityStoreAt(cityPath); err == nil {
+			store = opened
+		}
+	}
 
 	suspStr := "no"
 	if rig.Suspended {
@@ -103,14 +109,16 @@ func doRigStatus(
 
 	for _, a := range agents {
 		sp0 := scaleParamsFor(&a)
-		if !isMultiSessionCfgAgent(&a) {
+		if !a.SupportsInstanceExpansion() {
 			sn := cliSessionName(cityPath, cityName, a.QualifiedName(), sessionTemplate)
-			status := agentStatusLine(sp, dops, sn, a.Suspended)
+			obs := observeSessionTargetWithWarning("gc rig status", cityPath, store, sp, nil, sn, stderr)
+			status := agentStatusLine(obs.Running, dops, sn, a.Suspended || obs.Suspended)
 			fmt.Fprintf(stdout, "    %-12s%s\n", a.QualifiedName(), status) //nolint:errcheck // best-effort stdout
 		} else {
 			for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, sessionTemplate, sp) {
 				sn := cliSessionName(cityPath, cityName, qualifiedInstance, sessionTemplate)
-				status := agentStatusLine(sp, dops, sn, a.Suspended)
+				obs := observeSessionTargetWithWarning("gc rig status", cityPath, store, sp, nil, sn, stderr)
+				status := agentStatusLine(obs.Running, dops, sn, a.Suspended || obs.Suspended)
 				fmt.Fprintf(stdout, "    %-12s%s\n", qualifiedInstance, status) //nolint:errcheck // best-effort stdout
 			}
 		}
@@ -119,8 +127,7 @@ func doRigStatus(
 }
 
 // agentStatusLine returns a human-readable status string for an agent session.
-func agentStatusLine(sp runtime.Provider, dops drainOps, sn string, suspended bool) string {
-	running := sp.IsRunning(sn)
+func agentStatusLine(running bool, dops drainOps, sn string, suspended bool) string {
 	draining, _ := dops.isDraining(sn)
 
 	switch {

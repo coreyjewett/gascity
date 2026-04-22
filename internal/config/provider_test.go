@@ -64,7 +64,7 @@ func TestBuiltinProvidersClaude(t *testing.T) {
 	if p.ReadyDelayMs != 10000 {
 		t.Errorf("ReadyDelayMs = %d, want 10000", p.ReadyDelayMs)
 	}
-	if !p.EmitsPermissionWarning {
+	if !derefBool(p.EmitsPermissionWarning) {
 		t.Error("EmitsPermissionWarning = false, want true")
 	}
 }
@@ -108,7 +108,7 @@ func TestBuiltinProvidersCodex(t *testing.T) {
 	if p.ReadyDelayMs != 3000 {
 		t.Errorf("ReadyDelayMs = %d, want 3000", p.ReadyDelayMs)
 	}
-	if p.EmitsPermissionWarning {
+	if derefBool(p.EmitsPermissionWarning) {
 		t.Error("EmitsPermissionWarning = true, want false")
 	}
 }
@@ -128,6 +128,15 @@ func TestBuiltinProvidersGemini(t *testing.T) {
 	if p.PromptMode != "arg" {
 		t.Errorf("PromptMode = %q, want %q", p.PromptMode, "arg")
 	}
+	if p.ReadyPromptPrefix != "> " {
+		t.Errorf("ReadyPromptPrefix = %q, want %q", p.ReadyPromptPrefix, "> ")
+	}
+	if p.ReadyDelayMs != 5000 {
+		t.Errorf("ReadyDelayMs = %d, want 5000", p.ReadyDelayMs)
+	}
+	if len(p.ProcessNames) != 2 || p.ProcessNames[0] != "gemini" || p.ProcessNames[1] != "node" {
+		t.Errorf("ProcessNames = %v, want [gemini node]", p.ProcessNames)
+	}
 }
 
 func TestBuiltinProvidersReturnsNewMap(t *testing.T) {
@@ -139,23 +148,25 @@ func TestBuiltinProvidersReturnsNewMap(t *testing.T) {
 	}
 }
 
-// TestBuiltinProvidersOpenCode verifies the opencode provider uses
-// PromptMode "none". OpenCode v1.3+ interprets positional arguments as a
-// project directory path ("opencode [project]"), so passing the beacon +
-// prompt as a bare arg causes ENAMETOOLONG or "failed to change directory"
-// crashes that trigger crash-loop escalation.
+// TestBuiltinProvidersOpenCode verifies the opencode provider keeps startup
+// instructions out of argv. OpenCode treats argv prompt payloads as a normal
+// user message, so hook-enabled sessions must receive startup context through
+// gc prime --hook instead of argv.
 func TestBuiltinProvidersOpenCode(t *testing.T) {
 	p := BuiltinProviders()["opencode"]
 	if p.Command != "opencode" {
 		t.Errorf("Command = %q, want %q", p.Command, "opencode")
 	}
 	if p.PromptMode != "none" {
-		t.Errorf("PromptMode = %q, want %q — opencode treats positional args as project directory, not prompt", p.PromptMode, "none")
+		t.Errorf("PromptMode = %q, want %q", p.PromptMode, "none")
 	}
-	if !p.SupportsHooks {
+	if p.PromptFlag != "" {
+		t.Errorf("PromptFlag = %q, want empty", p.PromptFlag)
+	}
+	if !derefBool(p.SupportsHooks) {
 		t.Error("SupportsHooks = false, want true")
 	}
-	if !p.SupportsACP {
+	if !derefBool(p.SupportsACP) {
 		t.Error("SupportsACP = false, want true")
 	}
 	if p.InstructionsFile != "AGENTS.md" {
@@ -166,20 +177,17 @@ func TestBuiltinProvidersOpenCode(t *testing.T) {
 	}
 }
 
-// TestBuiltinProvidersOpenCodePromptModeRegression guards against
-// reverting PromptMode back to "arg". The prompt text contains the session
-// title, beacon, and behavioral instructions — hundreds of characters that
-// OpenCode would interpret as a filesystem path, causing:
-//   - ENAMETOOLONG when the combined string exceeds 255 bytes
-//   - "Failed to change directory" when the path doesn't exist
-//
-// This is the root cause of the crash-loop escalation observed with
-// multiple OpenCode-backed agents.
+// TestBuiltinProvidersOpenCodePromptModeRegression guards against switching
+// OpenCode back to argv-based prompt delivery. Gas City renders the startup
+// prompt as persona instructions, not as the first user task, so OpenCode must
+// not receive it through argv at startup.
 func TestBuiltinProvidersOpenCodePromptModeRegression(t *testing.T) {
 	p := BuiltinProviders()["opencode"]
 	if p.PromptMode == "arg" {
-		t.Fatal("PromptMode must not be \"arg\" — OpenCode interprets positional args as a project directory path, " +
-			"causing ENAMETOOLONG or directory-not-found errors that trigger crash-loop escalation")
+		t.Fatal("PromptMode must not be \"arg\" — OpenCode interprets positional prompt argv as a project path")
+	}
+	if p.PromptMode == "flag" {
+		t.Fatal("PromptMode must not be \"flag\" — OpenCode treats --prompt as the first user message instead of startup persona context")
 	}
 }
 

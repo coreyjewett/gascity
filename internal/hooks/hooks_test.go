@@ -2,6 +2,9 @@ package hooks
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,46 +14,40 @@ import (
 
 func claudeHookCommand(t *testing.T, data []byte, event string) string {
 	t.Helper()
-	var cfg struct {
-		Hooks map[string][]struct {
-			Hooks []struct {
-				Command string `json:"command"`
-			} `json:"hooks"`
-		} `json:"hooks"`
-	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("unmarshal claude hooks: %v", err)
-	}
-	entries := cfg.Hooks[event]
+	entries := claudeHookEntries(t, data, event)
 	if len(entries) == 0 || len(entries[0].Hooks) == 0 {
 		t.Fatalf("missing claude hook for %s", event)
 	}
 	return entries[0].Hooks[0].Command
 }
 
-func cursorHookCommand(t *testing.T, data []byte, event string) string {
+type claudeHookEntry struct {
+	Matcher string `json:"matcher"`
+	Hooks   []struct {
+		Command string `json:"command"`
+	} `json:"hooks"`
+}
+
+func claudeHookEntries(t *testing.T, data []byte, event string) []claudeHookEntry {
 	t.Helper()
 	var cfg struct {
-		Hooks map[string][]struct {
-			Command string `json:"command"`
-		} `json:"hooks"`
+		Hooks map[string][]claudeHookEntry `json:"hooks"`
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("unmarshal cursor hooks: %v", err)
+		t.Fatalf("unmarshal claude hooks: %v", err)
 	}
-	entries := cfg.Hooks[event]
-	if len(entries) == 0 {
-		t.Fatalf("missing cursor hook for %s", event)
-	}
-	return entries[0].Command
+	return cfg.Hooks[event]
 }
 
 func TestSupportedProviders(t *testing.T) {
 	got := SupportedProviders()
-	if len(got) != 8 {
-		t.Fatalf("SupportedProviders() = %v, want 8 entries", got)
+	want := map[string]bool{
+		"claude": true, "codex": true, "gemini": true, "opencode": true,
+		"copilot": true, "cursor": true, "pi": true, "omp": true,
 	}
-	want := map[string]bool{"claude": true, "codex": true, "gemini": true, "opencode": true, "copilot": true, "cursor": true, "pi": true, "omp": true}
+	if len(got) != len(want) {
+		t.Fatalf("SupportedProviders() = %v, want %d entries", got, len(want))
+	}
 	for _, p := range got {
 		if !want[p] {
 			t.Errorf("unexpected provider %q", p)
@@ -92,25 +89,39 @@ func TestInstallClaude(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	data, ok := fs.Files["/city/hooks/claude.json"]
-	if !ok {
-		t.Fatal("expected /city/hooks/claude.json to be written")
+	// Post stale-mirror fix: hooks/claude.json is no longer seeded on
+	// fresh installs. The gc-managed .gc/settings.json is the sole
+	// Install output for a claude-only fresh install.
+	if _, ok := fs.Files["/city/hooks/claude.json"]; ok {
+		t.Fatal("hooks/claude.json should NOT be written on fresh install (stale-mirror risk)")
 	}
 	runtimeData, ok := fs.Files["/city/.gc/settings.json"]
 	if !ok {
 		t.Fatal("expected /city/.gc/settings.json to be written")
 	}
-	s := string(data)
+	s := string(runtimeData)
 	if !strings.Contains(s, "SessionStart") {
 		t.Error("claude settings should contain SessionStart hook")
 	}
-	if string(runtimeData) != string(data) {
-		t.Error("runtime Claude settings should mirror hooks/claude.json")
-	}
-	if !strings.Contains(claudeHookCommand(t, data, "SessionStart"), "gc prime --hook") {
+	sessionStartCommand := claudeHookCommand(t, runtimeData, "SessionStart")
+	if !strings.Contains(sessionStartCommand, "gc prime --hook") {
 		t.Error("claude SessionStart hook should contain gc prime --hook")
 	}
-	if !strings.Contains(claudeHookCommand(t, data, "PreCompact"), `gc handoff "context cycle"`) {
+	if !strings.Contains(sessionStartCommand, "GC_HOOK_EVENT_NAME=SessionStart") {
+		t.Error("claude SessionStart hook should mark managed hook event")
+	}
+	if !strings.Contains(sessionStartCommand, "GC_MANAGED_SESSION_HOOK=1") {
+		t.Error("claude SessionStart hook should mark managed hook invocation")
+	}
+	if entries := claudeHookEntries(t, runtimeData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != "startup" {
+		t.Errorf("claude SessionStart matcher should be \"startup\" to avoid re-injecting prompt on resume/clear/compact, got %q", func() string {
+			if len(entries) == 0 {
+				return ""
+			}
+			return entries[0].Matcher
+		}())
+	}
+	if !strings.Contains(claudeHookCommand(t, runtimeData, "PreCompact"), `gc handoff "context cycle"`) {
 		t.Error("claude PreCompact hook should use gc handoff (not gc prime) to avoid context accumulation on compaction")
 	}
 	if !strings.Contains(s, "gc nudge drain --inject") {
@@ -133,7 +144,13 @@ func TestInstallClaudeUpgradesStaleGeneratedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readEmbedded: %v", err)
 	}
-	stale := strings.Replace(string(current), `gc handoff "context cycle"`, `gc prime --hook`, 1)
+	// Build a realistic stale fixture: the embedded file stores the command
+	// as JSON, so the literal bytes contain escaped quotes. Matching that
+	// shape is what claudeFileNeedsUpgrade expects.
+	stale := strings.Replace(string(current), `gc handoff \"context cycle\"`, `gc prime --hook`, 1)
+	if stale == string(current) {
+		t.Fatal("stale fixture did not diverge from current embedded config — check stale pattern")
+	}
 	fs.Files["/city/hooks/claude.json"] = []byte(stale)
 	fs.Files["/city/.gc/settings.json"] = []byte(stale)
 
@@ -151,191 +168,583 @@ func TestInstallClaudeUpgradesStaleGeneratedFile(t *testing.T) {
 	}
 }
 
-func TestInstallGemini(t *testing.T) {
-	oldResolve := resolveGCBinary
-	resolveGCBinary = func() string { return "/usr/local/bin/gc" }
-	t.Cleanup(func() { resolveGCBinary = oldResolve })
-
+func TestInstallClaudeUpgradesGeneratedFileMissingManagedSessionMarkers(t *testing.T) {
 	fs := fsys.NewFake()
-	err := Install(fs, "/city", "/work", []string{"gemini"})
+	current, err := readEmbedded("config/claude.json")
 	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	stale := strings.Replace(string(current), `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook`, `gc prime --hook`, 1)
+	if stale == string(current) {
+		t.Fatal("stale fixture did not diverge from current embedded config — check SessionStart marker pattern")
+	}
+	fs.Files["/city/hooks/claude.json"] = []byte(stale)
+	fs.Files["/city/.gc/settings.json"] = []byte(stale)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	data, ok := fs.Files["/work/.gemini/settings.json"]
-	if !ok {
-		t.Fatal("expected /work/.gemini/settings.json to be written")
+
+	hookData := fs.Files["/city/hooks/claude.json"]
+	runtimeData := fs.Files["/city/.gc/settings.json"]
+	sessionStartCommand := claudeHookCommand(t, hookData, "SessionStart")
+	if !strings.Contains(sessionStartCommand, "GC_HOOK_EVENT_NAME=SessionStart") {
+		t.Fatalf("upgraded SessionStart missing event marker: %s", sessionStartCommand)
 	}
-	if !strings.Contains(string(data), "PreCompress") {
-		t.Error("gemini settings should contain PreCompress hook")
+	if !strings.Contains(sessionStartCommand, "GC_MANAGED_SESSION_HOOK=1") {
+		t.Fatalf("upgraded SessionStart missing managed marker: %s", sessionStartCommand)
 	}
-	if !strings.Contains(string(data), "BeforeAgent") {
-		t.Error("gemini settings should contain BeforeAgent hook")
-	}
-	if !strings.Contains(string(data), "/usr/local/bin/gc prime --hook") {
-		t.Error("gemini settings should use resolved gc binary path")
-	}
-	if strings.Contains(string(data), "export PATH=") {
-		t.Error("gemini settings should not use PATH export pattern")
+	if string(runtimeData) != string(hookData) {
+		t.Fatalf("runtime Claude settings should mirror upgraded hook settings:\n%s", string(runtimeData))
 	}
 }
 
-func TestInstallCodex(t *testing.T) {
+func TestInstallClaudeUpgradesGeneratedFileSessionStartMatcher(t *testing.T) {
 	fs := fsys.NewFake()
-	err := Install(fs, "/city", "/work", []string{"codex"})
+	current, err := readEmbedded("config/claude.json")
 	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	stale := strings.Replace(string(current), `"matcher": "startup"`, `"matcher": ""`, 1)
+	if stale == string(current) {
+		t.Fatal("stale fixture did not diverge from current embedded config — check SessionStart matcher pattern")
+	}
+	fs.Files["/city/hooks/claude.json"] = []byte(stale)
+	fs.Files["/city/.gc/settings.json"] = []byte(stale)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	data, ok := fs.Files["/work/.codex/hooks.json"]
-	if !ok {
-		t.Fatal("expected /work/.codex/hooks.json to be written")
+
+	hookData := fs.Files["/city/hooks/claude.json"]
+	runtimeData := fs.Files["/city/.gc/settings.json"]
+	if entries := claudeHookEntries(t, hookData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != "startup" {
+		t.Fatalf("upgraded hook SessionStart matcher = %q, want startup", func() string {
+			if len(entries) == 0 {
+				return ""
+			}
+			return entries[0].Matcher
+		}())
 	}
-	s := string(data)
-	if !strings.Contains(s, "SessionStart") {
-		t.Error("codex hooks should contain SessionStart")
-	}
-	if !strings.Contains(s, "gc prime --hook") {
-		t.Error("codex hooks should contain gc prime --hook")
-	}
-	if !strings.Contains(s, "gc hook --inject") {
-		t.Error("codex hooks should contain gc hook --inject")
+	if string(runtimeData) != string(hookData) {
+		t.Fatalf("runtime Claude settings should mirror upgraded hook settings:\n%s", string(runtimeData))
 	}
 }
 
-func TestInstallOpenCode(t *testing.T) {
+func TestInstallClaudeUpgradesGeneratedFileWithCombinedKnownDrift(t *testing.T) {
 	fs := fsys.NewFake()
-	err := Install(fs, "/city", "/work", []string{"opencode"})
+	current, err := readEmbedded("config/claude.json")
 	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	stale := strings.Replace(string(current), `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook`, `gc prime --hook`, 1)
+	stale = strings.Replace(stale, `"matcher": "startup"`, `"matcher": ""`, 1)
+	if stale == string(current) {
+		t.Fatal("stale fixture did not diverge from current embedded config — check combined SessionStart drift pattern")
+	}
+	fs.Files["/city/hooks/claude.json"] = []byte(stale)
+	fs.Files["/city/.gc/settings.json"] = []byte(stale)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	data, ok := fs.Files["/work/.opencode/plugins/gascity.js"]
-	if !ok {
-		t.Fatal("expected /work/.opencode/plugins/gascity.js to be written")
+
+	hookData := fs.Files["/city/hooks/claude.json"]
+	runtimeData := fs.Files["/city/.gc/settings.json"]
+	sessionStartCommand := claudeHookCommand(t, hookData, "SessionStart")
+	if !strings.Contains(sessionStartCommand, "GC_HOOK_EVENT_NAME=SessionStart") {
+		t.Fatalf("upgraded combined-drift SessionStart missing event marker: %s", sessionStartCommand)
 	}
-	if !strings.Contains(string(data), "gc prime") {
-		t.Error("opencode plugin should contain gc prime")
+	if !strings.Contains(sessionStartCommand, "GC_MANAGED_SESSION_HOOK=1") {
+		t.Fatalf("upgraded combined-drift SessionStart missing managed marker: %s", sessionStartCommand)
+	}
+	if entries := claudeHookEntries(t, hookData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != "startup" {
+		t.Fatalf("upgraded combined-drift hook SessionStart matcher = %q, want startup", func() string {
+			if len(entries) == 0 {
+				return ""
+			}
+			return entries[0].Matcher
+		}())
+	}
+	if string(runtimeData) != string(hookData) {
+		t.Fatalf("runtime Claude settings should mirror upgraded combined-drift hook settings:\n%s", string(runtimeData))
 	}
 }
 
-func TestInstallCopilot(t *testing.T) {
+func TestInstallClaudeUpgradesGeneratedFileWithAllKnownDrift(t *testing.T) {
 	fs := fsys.NewFake()
-	err := Install(fs, "/city", "/work", []string{"copilot"})
+	current, err := readEmbedded("config/claude.json")
 	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	stale := strings.Replace(string(current), `gc handoff \"context cycle\"`, `gc prime --hook`, 1)
+	stale = strings.Replace(stale, `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook`, `gc prime --hook`, 1)
+	stale = strings.Replace(stale, `"matcher": "startup"`, `"matcher": ""`, 1)
+	if stale == string(current) {
+		t.Fatal("stale fixture did not diverge from current embedded config — check all known Claude drift patterns")
+	}
+	fs.Files["/city/hooks/claude.json"] = []byte(stale)
+	fs.Files["/city/.gc/settings.json"] = []byte(stale)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	data, ok := fs.Files["/work/.github/hooks/gascity.json"]
-	if !ok {
-		t.Fatal("expected /work/.github/hooks/gascity.json to be written")
+
+	hookData := fs.Files["/city/hooks/claude.json"]
+	runtimeData := fs.Files["/city/.gc/settings.json"]
+	sessionStartCommand := claudeHookCommand(t, hookData, "SessionStart")
+	if !strings.Contains(sessionStartCommand, "GC_HOOK_EVENT_NAME=SessionStart") {
+		t.Fatalf("upgraded all-drift SessionStart missing event marker: %s", sessionStartCommand)
 	}
-	s := string(data)
-	if !strings.Contains(s, "sessionStart") {
-		t.Error("copilot hooks should contain sessionStart")
+	if !strings.Contains(sessionStartCommand, "GC_MANAGED_SESSION_HOOK=1") {
+		t.Fatalf("upgraded all-drift SessionStart missing managed marker: %s", sessionStartCommand)
 	}
-	if !strings.Contains(s, "gc prime --hook") {
-		t.Error("copilot hooks should contain gc prime --hook")
+	if entries := claudeHookEntries(t, hookData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != "startup" {
+		t.Fatalf("upgraded all-drift hook SessionStart matcher = %q, want startup", func() string {
+			if len(entries) == 0 {
+				return ""
+			}
+			return entries[0].Matcher
+		}())
 	}
-	if !strings.Contains(s, "gc mail check --inject") {
-		t.Error("copilot hooks should contain gc mail check --inject")
+	if !strings.Contains(claudeHookCommand(t, hookData, "PreCompact"), `gc handoff "context cycle"`) {
+		t.Fatalf("upgraded all-drift PreCompact hook missing gc handoff:\n%s", string(hookData))
 	}
-	if !strings.Contains(s, "gc nudge drain --inject") {
-		t.Error("copilot hooks should contain gc nudge drain --inject")
+	if string(runtimeData) != string(hookData) {
+		t.Fatalf("runtime Claude settings should mirror upgraded all-drift hook settings:\n%s", string(runtimeData))
 	}
-	if !strings.Contains(s, "gc hook --inject") {
-		t.Error("copilot hooks should contain gc hook --inject")
+}
+
+func TestInstallClaudeMergesCityDotClaudeSettings(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/.claude/settings.json"] = []byte(`{
+  "custom": true,
+  "mcpServers": {
+    "notes": {
+      "command": "notes-mcp"
+    }
+  }
+}`)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
 	}
-	if _, ok := fs.Files["/work/.github/copilot-instructions.md"]; !ok {
-		t.Fatal("expected /work/.github/copilot-instructions.md companion to be written")
+
+	data := string(fs.Files["/city/.gc/settings.json"])
+	if !strings.Contains(data, `"custom": true`) {
+		t.Fatalf("runtime settings missing custom top-level key:\n%s", data)
+	}
+	if !strings.Contains(data, `"mcpServers"`) {
+		t.Fatalf("runtime settings missing merged mcpServers:\n%s", data)
+	}
+	if !strings.Contains(data, "SessionStart") {
+		t.Fatalf("runtime settings lost default hooks during merge:\n%s", data)
+	}
+	// With the stale-mirror fix, installClaude no longer writes to
+	// hooks/claude.json when the source is .claude/settings.json.
+	// Writing a mirror would produce a stale file: if the user later
+	// removes .claude/settings.json, desiredClaudeSettings would fall
+	// back to the mirror as "legacy hook" and ship previous-generation
+	// settings instead of current defaults.
+	if _, ok := fs.Files["/city/hooks/claude.json"]; ok {
+		t.Fatalf("hooks/claude.json should NOT be written when source is .claude/settings.json (stale-mirror risk)")
+	}
+}
+
+func TestInstallClaudePrefersCityDotClaudeSettingsOverLegacyHookSource(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/.claude/settings.json"] = []byte(`{"preferred": true}`)
+	fs.Files["/city/hooks/claude.json"] = []byte(`{"legacy": true}`)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	data := string(fs.Files["/city/.gc/settings.json"])
+	if !strings.Contains(data, `"preferred": true`) {
+		t.Fatalf("runtime settings missing preferred city .claude override:\n%s", data)
+	}
+	if strings.Contains(data, `"legacy": true`) {
+		t.Fatalf("legacy hooks source should not win over city .claude/settings.json:\n%s", data)
+	}
+}
+
+// TestInstallClaudePreservesUserOwnedHookFile verifies that when both
+// .claude/settings.json and a hand-written hooks/claude.json are present,
+// Install writes only the runtime settings file and leaves the user-owned
+// hook file untouched. The old behavior silently rewrote hooks/claude.json
+// with merged bytes, violating the "hook file is user-authored" contract.
+func TestInstallClaudePreservesUserOwnedHookFile(t *testing.T) {
+	fs := fsys.NewFake()
+	userHook := []byte(`{"user_authored": true}`)
+	fs.Files["/city/hooks/claude.json"] = userHook
+	fs.Files["/city/.claude/settings.json"] = []byte(`{"custom": true}`)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	if got := string(fs.Files["/city/hooks/claude.json"]); got != string(userHook) {
+		t.Errorf("user-owned hooks/claude.json was clobbered:\n  want: %q\n  got:  %q", userHook, got)
+	}
+	runtime := string(fs.Files["/city/.gc/settings.json"])
+	if !strings.Contains(runtime, `"custom": true`) {
+		t.Errorf("runtime settings missing .claude override merge:\n%s", runtime)
+	}
+	if !strings.Contains(runtime, "SessionStart") {
+		t.Errorf("runtime settings missing embedded base hooks:\n%s", runtime)
+	}
+}
+
+// TestInstallClaudeTolerantToUnreadableLegacyCandidate verifies that a
+// non-chosen legacy candidate whose ReadFile fails (simulated by injecting
+// a read error) does not block installation when .claude/settings.json is
+// a valid higher-priority source. Previously readClaudeSettingsCandidate
+// returned a hard error for any existing-but-unreadable candidate,
+// aborting resolution even when the preferred source was perfectly fine.
+func TestInstallClaudeTolerantToUnreadableLegacyCandidate(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/.claude/settings.json"] = []byte(`{"custom": true}`)
+	// Inject a read error on the legacy hook path so any attempt to read
+	// it fails. This models a permission-denied or i/o-error file that
+	// would otherwise have made readClaudeSettingsCandidate abort source
+	// selection.
+	fs.Errors["/city/hooks/claude.json"] = errors.New("permission denied")
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install must tolerate unreadable non-chosen legacy candidate: %v", err)
+	}
+
+	runtime := string(fs.Files["/city/.gc/settings.json"])
+	if !strings.Contains(runtime, `"custom": true`) {
+		t.Errorf("runtime settings missing .claude override:\n%s", runtime)
+	}
+}
+
+// TestInstallClaudePinnedHookFileOutranksRuntime verifies that when a user
+// pins hooks/claude.json to content that happens to match the embedded
+// defaults byte-for-byte, it still wins over .gc/settings.json per the
+// documented precedence. Earlier versions disqualified any
+// bytes-equal-base hook file, silently letting a stale .gc/settings.json
+// override the user's chosen source.
+func TestInstallClaudePinnedHookFileOutranksRuntime(t *testing.T) {
+	fs := fsys.NewFake()
+	base, err := readEmbedded("config/claude.json")
+	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	// User has pinned their hook file to exactly the embedded defaults
+	// and separately has a stale .gc/settings.json with a custom key that
+	// they intended to remove when they pinned the hook file.
+	fs.Files["/city/hooks/claude.json"] = base
+	fs.Files["/city/.gc/settings.json"] = []byte(`{"stale_override": true}`)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	runtime := string(fs.Files["/city/.gc/settings.json"])
+	if strings.Contains(runtime, `"stale_override": true`) {
+		t.Errorf("runtime must reflect pinned hook source, not stale runtime override:\n%s", runtime)
+	}
+	if !strings.Contains(runtime, "SessionStart") {
+		t.Errorf("runtime must contain embedded default hooks:\n%s", runtime)
+	}
+}
+
+// TestInstallClaudeUnreadableHookBlocksRuntimeFallback verifies that when
+// hooks/claude.json exists-but-is-unreadable and .gc/settings.json exists
+// with content, the tolerant-legacy path does NOT silently demote hook
+// precedence and let the runtime file become the source. Earlier versions
+// of the tolerant-read change skipped the unreadable hook file entirely,
+// which allowed a stale .gc/settings.json to override the user-owned but
+// currently-unreadable hook file — a precedence violation. The override
+// now resolves to "no source" (embedded base defaults) so Claude launches
+// with known-good settings instead.
+func TestInstallClaudeUnreadableHookBlocksRuntimeFallback(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Errors["/city/hooks/claude.json"] = errors.New("permission denied")
+	fs.Files["/city/.gc/settings.json"] = []byte(`{"stale_runtime_override": true}`)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	runtime := string(fs.Files["/city/.gc/settings.json"])
+	if strings.Contains(runtime, `"stale_runtime_override": true`) {
+		t.Errorf("unreadable hook must not let stale runtime override win:\n%s", runtime)
+	}
+	if !strings.Contains(runtime, "SessionStart") {
+		t.Errorf("runtime must contain embedded base defaults:\n%s", runtime)
+	}
+}
+
+// TestInstallClaudeUnreadableRuntimeDoesNotDemoteValidHook verifies that
+// when hooks/claude.json is readable and .gc/settings.json is unreadable,
+// the hook file still wins source selection — the runtime file is gc-owned,
+// not user-owned, so its unreadability must not demote a legitimate user
+// hook to "no source." A prior fixup blocked on either candidate being
+// unreadable, which inverted precedence for this case.
+func TestInstallClaudeUnreadableRuntimeDoesNotDemoteValidHook(t *testing.T) {
+	fs := fsys.NewFake()
+	// User pins hooks/claude.json with a custom key (not stale, not base).
+	fs.Files["/city/hooks/claude.json"] = []byte(`{"user_hook": true}`)
+	// The gc-managed runtime file is present but unreadable.
+	fs.Errors["/city/.gc/settings.json"] = errors.New("permission denied")
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		// Install may surface an error from the force-overwrite write if
+		// the injected error also blocks WriteFile (it does, in the Fake).
+		// That's acceptable: a failed write surfaces loudly. What must NOT
+		// happen is silent success with the stale unreadable runtime kept.
+		if !strings.Contains(err.Error(), ".gc/settings.json") {
+			t.Fatalf("unexpected error (expected a write failure surfacing the runtime path): %v", err)
+		}
+		return
+	}
+	// If Install succeeded, the runtime file must now contain the merged
+	// hook-source content (which includes the user_hook key).
+	runtime := string(fs.Files["/city/.gc/settings.json"])
+	if !strings.Contains(runtime, `"user_hook": true`) {
+		t.Errorf("runtime must reflect hook source even when prior runtime was unreadable:\n%s", runtime)
+	}
+}
+
+// TestInstallClaudeForceOverwritesUnreadableRuntimeOSFS verifies the
+// force-overwrite policy against a real filesystem. The gc-managed
+// .gc/settings.json is seeded write-only (mode 0o200): stat succeeds,
+// read fails, but WriteFile still succeeds. Under the old preserve
+// policy Install would silently return without writing; under the new
+// force-overwrite policy it attempts the write and succeeds. The Fake
+// cannot express stat-ok/read-fail (its Errors map is symmetric across
+// ReadFile, Stat, and WriteFile), so real OSFS is the only way to lock
+// this branch.
+//
+// Skipped as root (root bypasses unix permission checks).
+func TestInstallClaudeForceOverwritesUnreadableRuntimeOSFS(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses unix permission checks; cannot simulate stat-ok/read-fail")
+	}
+	cityDir := t.TempDir()
+	claudeDir := filepath.Join(cityDir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(`{"custom": true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gcDir := filepath.Join(cityDir, ".gc")
+	if err := os.MkdirAll(gcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runtimePath := filepath.Join(gcDir, "settings.json")
+	if err := os.WriteFile(runtimePath, []byte(`{"stale": true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Write-only mode: Stat succeeds, ReadFile fails, WriteFile succeeds.
+	// This is the only permission bitmask that can distinguish preserve-on-
+	// unreadable from force-overwrite through observable behavior.
+	if err := os.Chmod(runtimePath, 0o200); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(runtimePath, 0o644) })
+
+	if err := Install(fsys.OSFS{}, cityDir, cityDir, []string{"claude"}); err != nil {
+		t.Fatalf("Install with unreadable-but-writable runtime: %v", err)
+	}
+
+	// The file must be readable immediately after Install — no test-side
+	// chmod. force-overwrite is responsible for normalizing the mode so
+	// Claude can actually open --settings at launch time.
+	//
+	// Asserting the EXACT mode (0o600 from 0o200) pins the "minimal repair"
+	// contract: we add ONLY the owner-read bit. A regression to a broader
+	// chmod (e.g. unconditional 0o644) would widen other bits and still
+	// pass a looser readability check — this assertion catches that.
+	info, err := os.Stat(runtimePath)
+	if err != nil {
+		t.Fatalf("stat runtime after Install: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("runtime mode must be exactly 0o600 (0o200 + 0o400 owner-read); got %o", got)
+	}
+	data, err := os.ReadFile(runtimePath)
+	if err != nil {
+		t.Fatalf("reading runtime immediately after Install: %v", err)
+	}
+	runtime := string(data)
+	if strings.Contains(runtime, `"stale": true`) {
+		t.Errorf("runtime must be overwritten, not preserved:\n%s", runtime)
+	}
+	if !strings.Contains(runtime, `"custom": true`) {
+		t.Errorf("runtime must reflect .claude/settings.json override:\n%s", runtime)
+	}
+}
+
+// TestInstallClaudePreservesTightenedRuntimeMode verifies that a user who
+// intentionally tightened .gc/settings.json permissions (e.g. 0o600 for
+// privacy) keeps that mode after Install rewrites the file. The
+// force-overwrite policy must only ADD owner-read when absent, never
+// widen existing permissions.
+//
+// Skipped as root (root bypasses unix permission checks).
+func TestInstallClaudePreservesTightenedRuntimeMode(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses unix permission checks")
+	}
+	cityDir := t.TempDir()
+	claudeDir := filepath.Join(cityDir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(`{"custom": true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gcDir := filepath.Join(cityDir, ".gc")
+	if err := os.MkdirAll(gcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runtimePath := filepath.Join(gcDir, "settings.json")
+	// User-tightened: readable, but private (no group/other access).
+	if err := os.WriteFile(runtimePath, []byte(`{"stale": true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Install(fsys.OSFS{}, cityDir, cityDir, []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	info, err := os.Stat(runtimePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Must preserve the user's 0o600, not widen to 0o644.
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("runtime mode widened from 0o600 to %o; force-overwrite must not override user tightening", got)
+	}
+}
+
+// TestInstallClaudeSurfacesEmptyPreferredOverride verifies that a
+// zero-byte .claude/settings.json is treated as malformed and surfaces a
+// descriptive error rather than silently degrading to embedded defaults.
+// A truncated or mid-edit file that happens to be zero bytes is
+// indistinguishable from a valid "empty config" intent — strict behavior
+// is to fail loudly so the user notices the truncation.
+func TestInstallClaudeSurfacesEmptyPreferredOverride(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/.claude/settings.json"] = []byte{}
+
+	err := Install(fs, "/city", "/work", []string{"claude"})
+	if err == nil {
+		t.Fatal("Install must surface empty .claude/settings.json as an error")
+	}
+	if !strings.Contains(err.Error(), ".claude/settings.json") {
+		t.Errorf("error must name the offending path: %v", err)
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Errorf("error must indicate emptiness: %v", err)
+	}
+}
+
+// TestInstallClaudeSurfacesMalformedOverride verifies that a syntactically
+// invalid .claude/settings.json surfaces a descriptive error rather than
+// silently falling back to a legacy source or the embedded base.
+func TestInstallClaudeSurfacesMalformedOverride(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/.claude/settings.json"] = []byte(`{not valid json`)
+
+	err := Install(fs, "/city", "/work", []string{"claude"})
+	if err == nil {
+		t.Fatal("Install must surface malformed .claude/settings.json as an error")
+	}
+	if !strings.Contains(err.Error(), ".claude/settings.json") {
+		t.Errorf("error must name the offending path: %v", err)
+	}
+}
+
+// TestInstallOverlayManagedProviders verifies that overlay-managed providers
+// are materialized from the embedded core pack overlay into the workdir.
+func TestInstallOverlayManagedProviders(t *testing.T) {
+	fs := fsys.NewFake()
+	providers := []string{"codex", "gemini", "opencode", "copilot", "cursor", "pi", "omp"}
+	if err := Install(fs, "/city", "/work", providers); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	for _, rel := range []string{
+		"/work/.codex/hooks.json",
+		"/work/.gemini/settings.json",
+		"/work/.opencode/plugins/gascity.js",
+		"/work/.github/hooks/gascity.json",
+		"/work/.github/copilot-instructions.md",
+		"/work/.cursor/hooks.json",
+		"/work/.pi/extensions/gc-hooks.js",
+		"/work/.omp/hooks/gc-hook.ts",
+	} {
+		if _, ok := fs.Files[rel]; !ok {
+			t.Errorf("expected overlay-managed provider file %s to be written", rel)
+		}
 	}
 }
 
 func TestInstallMultipleProviders(t *testing.T) {
 	fs := fsys.NewFake()
+	// Claude writes city-level files; overlay-managed names write their
+	// provider hook files into workDir.
 	err := Install(fs, "/city", "/work", []string{"claude", "codex", "gemini", "copilot"})
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	if _, ok := fs.Files["/city/hooks/claude.json"]; !ok {
-		t.Error("missing claude settings")
-	}
+	// Post stale-mirror fix: hooks/claude.json is no longer written on
+	// fresh installs (only when the user explicitly uses it as the
+	// source). The gc-managed .gc/settings.json is what Install produces.
 	if _, ok := fs.Files["/city/.gc/settings.json"]; !ok {
 		t.Error("missing claude runtime settings")
 	}
-	if _, ok := fs.Files["/work/.codex/hooks.json"]; !ok {
-		t.Error("missing codex hooks")
-	}
-	if _, ok := fs.Files["/work/.gemini/settings.json"]; !ok {
-		t.Error("missing gemini settings")
-	}
-	if _, ok := fs.Files["/work/.github/hooks/gascity.json"]; !ok {
-		t.Error("missing copilot executable hooks")
+	for _, rel := range []string{
+		"/work/.codex/hooks.json",
+		"/work/.gemini/settings.json",
+		"/work/.github/hooks/gascity.json",
+	} {
+		if _, ok := fs.Files[rel]; !ok {
+			t.Errorf("expected overlay-managed provider file %s via Install", rel)
+		}
 	}
 }
 
 func TestInstallIdempotent(t *testing.T) {
 	fs := fsys.NewFake()
-	// Pre-populate with custom content.
+	// Pre-populate with a legacy hook file that carries a custom key. Under
+	// the current contract this is treated as the chosen source and merged
+	// against the embedded base so future default hooks land for users who
+	// stayed on hooks/claude.json.
 	fs.Files["/city/hooks/claude.json"] = []byte(`{"custom": true}`)
 
-	err := Install(fs, "/city", "/work", []string{"claude"})
-	if err != nil {
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 
-	// Should not overwrite existing file.
-	got := string(fs.Files["/city/hooks/claude.json"])
-	if got != `{"custom": true}` {
-		t.Errorf("Install overwrote existing file: got %q", got)
+	hookData := string(fs.Files["/city/hooks/claude.json"])
+	runtimeData := string(fs.Files["/city/.gc/settings.json"])
+	if !strings.Contains(hookData, `"custom": true`) {
+		t.Errorf("merge must preserve user-authored custom key in hook file:\n%s", hookData)
 	}
-	if runtime := string(fs.Files["/city/.gc/settings.json"]); runtime != `{"custom": true}` {
-		t.Errorf("Install should mirror existing hook settings into runtime file: got %q", runtime)
+	if !strings.Contains(hookData, "SessionStart") {
+		t.Errorf("merge must pull embedded default hooks into hook file:\n%s", hookData)
 	}
-}
-
-func TestInstallGeminiUpgradesStaleGeneratedFile(t *testing.T) {
-	oldResolve := resolveGCBinary
-	resolveGCBinary = func() string { return "/opt/gc/bin/gc" }
-	t.Cleanup(func() { resolveGCBinary = oldResolve })
-
-	fs := fsys.NewFake()
-	fs.Files["/work/.gemini/settings.json"] = []byte(`{
-  "hooks": {
-    "SessionStart": [{
-      "hooks": [{
-        "type": "command",
-        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc prime --hook"
-      }]
-    }]
-  }
-}`)
-
-	if err := Install(fs, "/city", "/work", []string{"gemini"}); err != nil {
-		t.Fatalf("Install: %v", err)
+	if hookData != runtimeData {
+		t.Error("runtime settings must mirror merged hook settings")
 	}
 
-	got := string(fs.Files["/work/.gemini/settings.json"])
-	if !strings.Contains(got, "/opt/gc/bin/gc prime --hook") {
-		t.Errorf("upgraded gemini settings missing resolved gc path:\n%s", got)
+	// A second Install must be a true no-op: bytes already match the merged
+	// result, so writeManagedFile short-circuits.
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("second Install: %v", err)
 	}
-	if strings.Contains(got, "export PATH=") {
-		t.Errorf("upgraded gemini settings still use PATH export:\n%s", got)
+	if got := string(fs.Files["/city/hooks/claude.json"]); got != hookData {
+		t.Errorf("second Install changed hook file bytes:\n  before: %q\n  after:  %q", hookData, got)
 	}
-}
-
-func TestInstallGeminiPreservesExistingCustomFile(t *testing.T) {
-	oldResolve := resolveGCBinary
-	resolveGCBinary = func() string { return "/opt/gc/bin/gc" }
-	t.Cleanup(func() { resolveGCBinary = oldResolve })
-
-	fs := fsys.NewFake()
-	custom := `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"custom-hook"}]}]}}`
-	fs.Files["/work/.gemini/settings.json"] = []byte(custom)
-
-	if err := Install(fs, "/city", "/work", []string{"gemini"}); err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-
-	got := string(fs.Files["/work/.gemini/settings.json"])
-	if got != custom {
-		t.Errorf("Install overwrote custom gemini settings: got %q want %q", got, custom)
+	if got := string(fs.Files["/city/.gc/settings.json"]); got != runtimeData {
+		t.Errorf("second Install changed runtime file bytes:\n  before: %q\n  after:  %q", runtimeData, got)
 	}
 }
 
@@ -350,107 +759,8 @@ func TestInstallUnknownProvider(t *testing.T) {
 	}
 }
 
-func TestInstallCursor(t *testing.T) {
-	fs := fsys.NewFake()
-	err := Install(fs, "/city", "/work", []string{"cursor"})
-	if err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-	data, ok := fs.Files["/work/.cursor/hooks.json"]
-	if !ok {
-		t.Fatal("expected /work/.cursor/hooks.json to be written")
-	}
-	if !strings.Contains(string(data), "sessionStart") {
-		t.Error("cursor hooks should contain sessionStart")
-	}
-	if !strings.Contains(cursorHookCommand(t, data, "sessionStart"), "gc prime --hook") {
-		t.Error("cursor sessionStart hook should contain gc prime --hook")
-	}
-	if !strings.Contains(cursorHookCommand(t, data, "preCompact"), `gc handoff "context cycle"`) {
-		t.Error("cursor preCompact hook should contain gc handoff \"context cycle\"")
-	}
-	if !strings.Contains(string(data), "gc mail check --inject") {
-		t.Error("cursor hooks should contain gc mail check --inject")
-	}
-	if !strings.Contains(string(data), "gc nudge drain --inject") {
-		t.Error("cursor hooks should contain gc nudge drain --inject")
-	}
-}
-
-func TestInstallCursorUpgradesStaleGeneratedFile(t *testing.T) {
-	fs := fsys.NewFake()
-	current, err := readEmbedded("config/cursor.json")
-	if err != nil {
-		t.Fatalf("readEmbedded: %v", err)
-	}
-	stale := strings.Replace(string(current), `gc handoff "context cycle"`, `gc prime --hook`, 1)
-	fs.Files["/work/.cursor/hooks.json"] = []byte(stale)
-
-	if err := Install(fs, "/city", "/work", []string{"cursor"}); err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-
-	got := fs.Files["/work/.cursor/hooks.json"]
-	if !strings.Contains(cursorHookCommand(t, got, "preCompact"), `gc handoff "context cycle"`) {
-		t.Fatalf("upgraded cursor hooks missing gc handoff:\n%s", string(got))
-	}
-}
-
-func TestInstallCursorPreservesExistingCustomFile(t *testing.T) {
-	fs := fsys.NewFake()
-	custom := `{"version":1,"hooks":{"sessionStart":[{"command":"custom-start"}],"preCompact":[{"command":"custom-compact"}]}}`
-	fs.Files["/work/.cursor/hooks.json"] = []byte(custom)
-
-	if err := Install(fs, "/city", "/work", []string{"cursor"}); err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-
-	got := string(fs.Files["/work/.cursor/hooks.json"])
-	if got != custom {
-		t.Errorf("Install overwrote custom cursor hooks: got %q want %q", got, custom)
-	}
-}
-
-func TestInstallPi(t *testing.T) {
-	fs := fsys.NewFake()
-	err := Install(fs, "/city", "/work", []string{"pi"})
-	if err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-	data, ok := fs.Files["/work/.pi/extensions/gc-hooks.js"]
-	if !ok {
-		t.Fatal("expected /work/.pi/extensions/gc-hooks.js to be written")
-	}
-	s := string(data)
-	if !strings.Contains(s, "gc prime --hook") {
-		t.Error("pi hooks should contain gc prime --hook")
-	}
-	if !strings.Contains(s, "gc hook --inject") {
-		t.Error("pi hooks should contain gc hook --inject")
-	}
-}
-
-func TestInstallOmp(t *testing.T) {
-	fs := fsys.NewFake()
-	err := Install(fs, "/city", "/work", []string{"omp"})
-	if err != nil {
-		t.Fatalf("Install: %v", err)
-	}
-	data, ok := fs.Files["/work/.omp/hooks/gc-hook.ts"]
-	if !ok {
-		t.Fatal("expected /work/.omp/hooks/gc-hook.ts to be written")
-	}
-	s := string(data)
-	if !strings.Contains(s, "gc prime --hook") {
-		t.Error("omp hooks should contain gc prime --hook")
-	}
-	if !strings.Contains(s, "gc hook --inject") {
-		t.Error("omp hooks should contain gc hook --inject")
-	}
-}
-
-// TestSupportsHooksSyncWithProviderSpec verifies that the hooks supported/unsupported
-// lists stay in sync with ProviderSpec.SupportsHooks across all builtin providers.
+// TestSupportsHooksSyncWithProviderSpec verifies that the hooks supported list
+// stays in sync with ProviderSpec.SupportsHooks across all builtin providers.
 func TestSupportsHooksSyncWithProviderSpec(t *testing.T) {
 	sup := make(map[string]bool, len(SupportedProviders()))
 	for _, p := range SupportedProviders() {
@@ -459,10 +769,11 @@ func TestSupportsHooksSyncWithProviderSpec(t *testing.T) {
 
 	providers := config.BuiltinProviders()
 	for name, spec := range providers {
-		if spec.SupportsHooks && !sup[name] {
+		supports := spec.SupportsHooks != nil && *spec.SupportsHooks
+		if supports && !sup[name] {
 			t.Errorf("provider %q has SupportsHooks=true but is not in hooks.SupportedProviders()", name)
 		}
-		if !spec.SupportsHooks && sup[name] {
+		if !supports && sup[name] {
 			t.Errorf("provider %q is in hooks.SupportedProviders() but has SupportsHooks=false", name)
 		}
 	}
@@ -478,6 +789,9 @@ func TestInstallEmpty(t *testing.T) {
 	fs := fsys.NewFake()
 	err := Install(fs, "/city", "/work", nil)
 	if err != nil {
-		t.Fatalf("Install(nil) = %v, want nil", err)
+		t.Fatalf("Install(nil): %v", err)
+	}
+	if len(fs.Files) != 0 {
+		t.Errorf("Install(nil) should not write files; got %v", fs.Files)
 	}
 }

@@ -101,14 +101,7 @@ func cmdResume(args []string, stdout, stderr io.Writer) int {
 
 // resolveSuspendDir resolves the city directory from args or the current city.
 func resolveSuspendDir(args []string) (string, error) {
-	if len(args) > 0 {
-		p, err := filepath.Abs(args[0])
-		if err != nil {
-			return "", err
-		}
-		return findCity(p)
-	}
-	return resolveCity()
+	return resolveCommandCity(args)
 }
 
 // doSuspendCity sets or clears workspace.suspended in city.toml.
@@ -128,12 +121,7 @@ func doSuspendCity(fs fsys.FS, cityPath string, suspend bool, stdout, stderr io.
 
 	cfg.Workspace.Suspended = suspend
 
-	content, err := cfg.Marshal()
-	if err != nil {
-		fmt.Fprintf(stderr, "%s: %v\n", cmd, err) //nolint:errcheck // best-effort stderr
-		return 1
-	}
-	if err := fs.WriteFile(tomlPath, content, 0o644); err != nil {
+	if err := writeCityConfigForEditFS(fs, tomlPath, cfg); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", cmd, err) //nolint:errcheck // best-effort stderr
 		return 1
 	}

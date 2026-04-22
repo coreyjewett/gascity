@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -38,51 +37,42 @@ running, delegates shutdown to it.`,
 	return cmd
 }
 
+var sessionProviderForStopCity = newSessionProviderForCity
+
+const sleepReasonCityStop = "city-stop"
+
 // cmdStop stops the city by terminating all configured agent sessions.
 // If a path is given, operates there; otherwise uses cwd.
 func cmdStop(args []string, stdout, stderr io.Writer) int {
-	var dir string
-	var err error
-	switch {
-	case len(args) > 0:
-		dir, err = filepath.Abs(args[0])
-	case cityFlag != "":
-		dir, err = filepath.Abs(cityFlag)
-	default:
-		dir, err = os.Getwd()
-	}
+	cityPath, err := resolveCommandCity(args)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc stop: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	cityPath, err := findCity(dir)
+	cfg, err := loadCityConfig(cityPath, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc stop: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	cfg, err := loadCityConfig(cityPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "gc stop: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
-	}
-	cityName := cfg.Workspace.Name
-	if cityName == "" {
-		cityName = filepath.Base(cityPath)
-	}
+	cityName := loadedCityName(cfg, cityPath)
 
 	if handled, code := unregisterCityFromSupervisor(cityPath, stdout, stderr, "gc stop"); handled {
 		if code != 0 {
 			return code
 		}
 		if supervisorAliveHook() != 0 {
+			stopCityManagedBeadsProviderIfRunning(cityPath, stderr)
 			fmt.Fprintln(stdout, "City stopped.") //nolint:errcheck // best-effort stdout
 			return 0
 		}
 	}
 
+	store, _ := openCityStoreAt(cityPath)
+	markCityStopSessionSleepReason(store, stderr)
+
 	// If a controller is running, ask it to shut down (it stops agents).
 	if tryStopController(cityPath, stdout) {
-		if err := waitForStandaloneControllerStop(cityPath, cfg.Daemon.ShutdownTimeoutDuration()+5*time.Second); err != nil {
+		if err := waitForStandaloneControllerStop(cityPath, cfg.Daemon.ShutdownTimeoutDuration()+15*time.Second); err != nil {
 			fmt.Fprintf(stderr, "gc stop: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
@@ -94,16 +84,15 @@ func cmdStop(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	sp := newSessionProvider()
+	sp := sessionProviderForStopCity(cfg, cityPath)
 	st := cfg.Workspace.SessionTemplate
-	store, _ := openCityStoreAt(cityPath)
 	var sessionNames []string
 	desired := make(map[string]bool, len(cfg.Agents))
 	for _, a := range cfg.Agents {
 		sp0 := scaleParamsFor(&a)
 		qn := a.QualifiedName()
-		if !isMultiSessionCfgAgent(&a) {
-			// Single agent.
+		if !a.SupportsInstanceExpansion() {
+			// Non-expanding template.
 			sn := lookupSessionNameOrLegacy(store, cityName, qn, st)
 			sessionNames = append(sessionNames, sn)
 			desired[sn] = true
@@ -136,6 +125,41 @@ func cmdStop(args []string, stdout, stderr io.Writer) int {
 	return code
 }
 
+func markCityStopSessionSleepReason(store beads.Store, stderr io.Writer) {
+	if store == nil {
+		return
+	}
+	sessions, err := store.ListByLabel("gc:session", 0)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc stop: marking sessions: %v\n", err) //nolint:errcheck // best-effort warning
+		return
+	}
+	for _, session := range sessions {
+		state := sessionMetadataState(session)
+		if state != "active" && state != "creating" {
+			continue
+		}
+		if strings.TrimSpace(session.Metadata["sleep_reason"]) != "" {
+			continue
+		}
+		if err := store.SetMetadata(session.ID, "sleep_reason", sleepReasonCityStop); err != nil {
+			fmt.Fprintf(stderr, "gc stop: marking session %s: %v\n", session.ID, err) //nolint:errcheck // best-effort warning
+		}
+	}
+}
+
+func stopCityManagedBeadsProviderIfRunning(cityPath string, stderr io.Writer) {
+	if rawBeadsProvider(cityPath) != "bd" {
+		return
+	}
+	if currentManagedDoltPort(cityPath) == "" {
+		return
+	}
+	if err := shutdownBeadsProvider(cityPath); err != nil {
+		fmt.Fprintf(stderr, "gc stop: bead store: %v\n", err) //nolint:errcheck // best-effort warning
+	}
+}
+
 // stopOrphans stops sessions that are not in the desired set. Used by gc stop
 // to clean up orphans after stopping config agents. With per-city socket
 // isolation, all sessions on the socket belong to this city.
@@ -143,9 +167,13 @@ func stopOrphans(sp runtime.Provider, desired map[string]bool, cfg *config.City,
 	timeout time.Duration, rec events.Recorder, stdout, stderr io.Writer,
 ) {
 	running, err := sp.ListRunning("")
-	if err != nil {
+	partialList := runtime.IsPartialListError(err)
+	if err != nil && !partialList {
 		fmt.Fprintf(stderr, "gc stop: listing sessions: %v\n", err) //nolint:errcheck // best-effort stderr
 		return
+	}
+	if partialList {
+		fmt.Fprintf(stderr, "gc stop: listing sessions partially failed: %v\n", err) //nolint:errcheck // best-effort stderr
 	}
 	var orphans []string
 	for _, name := range running {
@@ -157,11 +185,11 @@ func stopOrphans(sp runtime.Provider, desired map[string]bool, cfg *config.City,
 	gracefulStopAll(orphans, sp, timeout, rec, cfg, store, stdout, stderr)
 }
 
-// tryStopController connects to .gc/controller.sock and sends "stop".
+// tryStopController connects to the controller socket and sends "stop".
 // Returns true if a controller acknowledged the shutdown. If no controller
 // is running (socket doesn't exist or connection refused), returns false.
 func tryStopController(cityPath string, stdout io.Writer) bool {
-	sockPath := filepath.Join(cityPath, ".gc", "controller.sock")
+	sockPath := controllerSocketPath(cityPath)
 	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
 	if err != nil {
 		return false
@@ -213,7 +241,7 @@ func doStop(sessionNames []string, sp runtime.Provider, cfg *config.City, store 
 ) int {
 	var running []string
 	for _, sn := range sessionNames {
-		if sp.IsRunning(sn) {
+		if alive, err := workerSessionTargetRunningWithConfig("", store, sp, cfg, sn); err == nil && alive {
 			running = append(running, sn)
 		}
 	}

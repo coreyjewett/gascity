@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -133,7 +134,11 @@ func (c *StateCache) refresh() {
 			return nil, err
 		}
 
-		log.Printf("tmux state cache: refreshed %d sessions in %v", len(sessions), elapsed)
+		// Successful refresh is noisy on the session loop; opt-in via env var
+		// keeps it available for diagnostics without polluting normal CLI use.
+		if os.Getenv("GC_LOG_TMUX_CACHE") == "true" {
+			log.Printf("tmux state cache: refreshed %d sessions in %v", len(sessions), elapsed)
+		}
 
 		c.mu.Lock()
 		c.sessions = sessions
@@ -193,7 +198,7 @@ func (f *tmuxFetcher) FetchRunning(ctx context.Context) (map[string]bool, error)
 
 // isNoServerError checks if the error is a "no server running" error.
 func isNoServerError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "no server running")
+	return errors.Is(err, ErrNoServer) || (err != nil && strings.Contains(err.Error(), "no server running"))
 }
 
 // cacheTTLFromEnv reads GC_TMUX_CACHE_TTL from the environment and parses

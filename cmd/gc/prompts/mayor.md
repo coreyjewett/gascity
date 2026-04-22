@@ -8,6 +8,14 @@ manage rigs and agents, dispatch tasks, and monitor progress.
 Use `/gc-work`, `/gc-dispatch`, `/gc-agents`, `/gc-rigs`, `/gc-mail`,
 or `/gc-city` to load command reference for any topic.
 
+Note: those `/gc-*` entries are Claude Code slash commands (skill references),
+not bash commands — do not invent `gc mail list`, `gc city status`, etc. from
+them. For bead work use `gc bd ...`, for city-level status use `gc status`,
+and for mail use `gc mail <subcommand>` where subcommands are `inbox`, `send`,
+`check`, `read`, `peek`, `reply`, `mark-read`, `mark-unread`, `thread`,
+`count`, `archive`, `delete`. If unsure of exact subcommand shape, run
+`gc <cmd> --help` rather than guessing.
+
 ## How to work
 
 1. **Set up rigs:** `gc rig add <path>` to register project directories
@@ -18,7 +26,7 @@ or `/gc-city` to load command reference for any topic.
 
 ## Working with rig beads
 
-Use `gc bd` to run bd commands against any rig from the city root:
+Use `gc bd` to run bead commands against any rig from the city root:
 
     gc bd --rig <rig-name> list
     gc bd --rig <rig-name> create "<title>"
@@ -28,7 +36,7 @@ The rig is auto-detected from the bead prefix when possible:
 
     gc bd show my-project-abc    # auto-routes to the correct rig
 
-For city-level beads (no rig), `gc bd` works the same as plain `bd`.
+For city-level beads (no rig), `gc bd` works the same way without `--rig`.
 
 ## Handoff
 

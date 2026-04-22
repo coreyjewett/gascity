@@ -29,10 +29,32 @@ type City struct {
 // The city is NOT initialized — call Init() or InitFrom() next.
 func NewCity(t *testing.T, env *Env) *City {
 	t.Helper()
-	dir := t.TempDir()
+	return newCityAt(t, env, t.TempDir())
+}
+
+// NewCityInRoot creates a city under the provided root directory.
+// Useful for flows that need shorter paths than t.TempDir() normally yields
+// (for example Unix socket paths under supervisor-managed acceptance tests).
+func NewCityInRoot(t *testing.T, env *Env, root string) *City {
+	t.Helper()
+	return newCityAt(t, env, root)
+}
+
+func newCityAt(t *testing.T, env *Env, dir string) *City {
+	t.Helper()
 	cityDir := filepath.Join(dir, uniqueName())
+	return NewCityAt(t, env, cityDir)
+}
+
+// NewCityAt creates a city DSL handle rooted at an explicit directory.
+// The directory is created if needed. Callers own cleanup of the parent path.
+func NewCityAt(t *testing.T, env *Env, cityDir string) *City {
+	t.Helper()
 	if err := os.MkdirAll(cityDir, 0o755); err != nil {
 		t.Fatalf("acceptance: creating city dir: %v", err)
+	}
+	if err := EnsureClaudeProjectState(env, cityDir); err != nil {
+		t.Fatalf("acceptance: seeding Claude state for city %s: %v", cityDir, err)
 	}
 	return &City{t: t, Dir: cityDir, Env: env}
 }
@@ -50,7 +72,8 @@ func (c *City) Init(provider string) {
 		c.t.Fatalf("gc init failed: %v\n%s", err, out)
 	}
 	c.t.Cleanup(func() {
-		RunGC(c.Env, c.Dir, "stop", c.Dir) //nolint:errcheck
+		RunGC(c.Env, c.Dir, "stop", c.Dir)       //nolint:errcheck
+		RunGC(c.Env, c.Dir, "unregister", c.Dir) //nolint:errcheck
 	})
 }
 
@@ -62,7 +85,8 @@ func (c *City) InitFrom(srcDir string) {
 		c.t.Fatalf("gc init --from %s failed: %v\n%s", srcDir, err, out)
 	}
 	c.t.Cleanup(func() {
-		RunGC(c.Env, c.Dir, "stop", c.Dir) //nolint:errcheck
+		RunGC(c.Env, c.Dir, "stop", c.Dir)       //nolint:errcheck
+		RunGC(c.Env, c.Dir, "unregister", c.Dir) //nolint:errcheck
 	})
 }
 
@@ -78,6 +102,9 @@ func (c *City) RigAdd(rigPath string, include string) {
 	out, err := RunGC(c.Env, c.Dir, args...)
 	if err != nil {
 		c.t.Fatalf("gc rig add failed: %v\n%s", err, out)
+	}
+	if err := EnsureClaudeProjectState(c.Env, rigPath); err != nil {
+		c.t.Fatalf("acceptance: seeding Claude state for rig %s: %v", rigPath, err)
 	}
 }
 

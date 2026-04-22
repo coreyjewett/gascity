@@ -2,7 +2,6 @@ package api
 
 import (
 	"log"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +12,8 @@ import (
 )
 
 const maxOrdersFeedLimit = 500
+
+var orderFeedLogf = log.Printf
 
 type monitorFeedItemResponse struct {
 	ID                 string `json:"id"`
@@ -29,6 +30,7 @@ type monitorFeedItemResponse struct {
 	WorkflowID         string `json:"workflow_id,omitempty"`
 	RootBeadID         string `json:"root_bead_id,omitempty"`
 	RootStoreRef       string `json:"root_store_ref,omitempty"`
+	StoreRef           string `json:"store_ref,omitempty"`
 	AttachedBeadID     string `json:"attached_bead_id,omitempty"`
 	LogicalBeadID      string `json:"logical_bead_id,omitempty"`
 	RunDetailAvailable bool   `json:"run_detail_available,omitempty"`
@@ -55,76 +57,10 @@ type workflowRunProjectionResult struct {
 	PartialErrors []string
 }
 
-func (s *Server) handleOrdersFeed(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	scopeKind, scopeRef, scopeErr := parseWorkflowRequestScope(q.Get("scope_kind"), q.Get("scope_ref"))
-	if scopeErr != "" {
-		writeError(w, http.StatusBadRequest, "invalid", scopeErr)
-		return
-	}
-
-	limit := parseOrdersFeedLimit(q.Get("limit"))
-	index := s.latestIndex()
-	cacheKey := responseCacheKey("orders-feed", r)
-	if body, ok := s.cachedResponse(cacheKey, index); ok {
-		writeCachedJSON(w, r, index, body)
-		return
-	}
-
-	workflowRuns, err := buildWorkflowRunProjections(s.state, scopeKind, scopeRef, "")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "workflow feed failed")
-		return
-	}
-	orderRuns, err := buildOrderRunFeedItems(s.state, scopeKind, scopeRef)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "order feed failed")
-		return
-	}
-
-	items := make([]monitorFeedItemResponse, 0, len(workflowRuns.Items)+len(orderRuns))
-	for _, run := range workflowRuns.Items {
-		items = append(items, workflowRunProjectionFeedItem(run))
-	}
-	items = append(items, orderRuns...)
-
-	sort.SliceStable(items, func(i, j int) bool {
-		iRank := monitorStatusRank(items[i].Status)
-		jRank := monitorStatusRank(items[j].Status)
-		if iRank != jRank {
-			return iRank < jRank
-		}
-		iTypeRank := monitorItemRank(items[i])
-		jTypeRank := monitorItemRank(items[j])
-		if iTypeRank != jTypeRank {
-			return iTypeRank < jTypeRank
-		}
-		iUpdated := parseMonitorTimestamp(items[i].UpdatedAt)
-		jUpdated := parseMonitorTimestamp(items[j].UpdatedAt)
-		if !iUpdated.Equal(jUpdated) {
-			return iUpdated.After(jUpdated)
-		}
-		return items[i].Title < items[j].Title
-	})
-
-	if limit > 0 && len(items) > limit {
-		items = items[:limit]
-	}
-
-	resp := map[string]any{
-		"items":   items,
-		"partial": workflowRuns.Partial,
-	}
-	if len(workflowRuns.PartialErrors) > 0 {
-		resp["partial_errors"] = workflowRuns.PartialErrors
-	}
-
-	body, err := s.storeResponse(cacheKey, index, resp)
-	if err != nil {
-		writeJSON(w, http.StatusOK, resp)
-		return
-	}
-	writeCachedJSON(w, r, index, body)
+type orderRunFeedResult struct {
+	Items         []monitorFeedItemResponse
+	Partial       bool
+	PartialErrors []string
 }
 
 func buildWorkflowRunProjections(state State, requestedScopeKind, requestedScopeRef, formulaNameFilter string) (workflowRunProjectionResult, error) {
@@ -354,20 +290,8 @@ func listActiveWorkflowProjectionBeads(store beads.Store) ([]beads.Bead, error) 
 	return store.List(beads.ListQuery{AllowScan: true})
 }
 
-func buildOrderRunFeedItems(state State, requestedScopeKind, requestedScopeRef string) ([]monitorFeedItemResponse, error) {
-	store := state.CityBeadStore()
-	if store == nil {
-		return []monitorFeedItemResponse{}, nil
-	}
-
-	results, err := store.List(beads.ListQuery{
-		Label: "order-tracking",
-		Sort:  beads.SortCreatedDesc,
-	})
-	if err != nil {
-		return nil, err
-	}
-
+func buildOrderRunFeedItems(state State, requestedScopeKind, requestedScopeRef string) (orderRunFeedResult, error) {
+	stores := workflowStores(state)
 	orderByScopedName := make(map[string]orders.Order, len(state.Orders()))
 	for _, order := range state.Orders() {
 		orderByScopedName[order.ScopedName()] = order
@@ -375,46 +299,72 @@ func buildOrderRunFeedItems(state State, requestedScopeKind, requestedScopeRef s
 
 	cityScopeRef := workflowCityScopeRef(state.CityName())
 	includeAllForCity := requestedScopeKind == "city" && requestedScopeRef == cityScopeRef
-	items := make([]monitorFeedItemResponse, 0, len(results))
-	updatedAtByScopedName := make(map[string]time.Time, len(results))
-	for _, bead := range results {
-		scopedName := orderTrackingScopedName(bead)
-		if scopedName == "" {
+	items := make([]monitorFeedItemResponse, 0)
+	partialErrors := make([]string, 0)
+	var requestedScopeErr error
+	for _, info := range stores {
+		if info.store == nil {
 			continue
 		}
-		scopeKind, scopeRef := orderTrackingScope(scopedName, cityScopeRef)
-		if !includeAllForCity && (scopeKind != requestedScopeKind || scopeRef != requestedScopeRef) {
+		results, err := info.store.List(beads.ListQuery{
+			Label: "order-tracking",
+			Sort:  beads.SortCreatedDesc,
+		})
+		if err != nil {
+			if requestedScopeErr == nil && info.scopeKind == requestedScopeKind && info.scopeRef == requestedScopeRef {
+				requestedScopeErr = err
+			}
+			if includeAllForCity {
+				msg := info.ref + " store unavailable"
+				log.Printf("api: order feed list failed for %s: %v", info.ref, err)
+				partialErrors = append(partialErrors, msg)
+			}
 			continue
 		}
 
-		updatedAt := updatedAtByScopedName[scopedName]
-		if updatedAt.IsZero() {
-			updatedAt = orderTrackingUpdatedAt(store, bead, scopedName)
-			updatedAtByScopedName[scopedName] = updatedAt
-		}
+		for _, bead := range results {
+			scopedName := orderTrackingScopedName(bead)
+			if scopedName == "" {
+				continue
+			}
+			scopeKind, scopeRef := orderTrackingScope(scopedName, cityScopeRef)
+			if !includeAllForCity && (scopeKind != requestedScopeKind || scopeRef != requestedScopeRef) {
+				continue
+			}
 
-		orderDef, ok := orderByScopedName[scopedName]
-		title := orderTrackingTitle(scopedName, orderDef, ok)
-		target := orderTrackingTarget(orderDef, ok, bead)
-		itemType := orderTrackingType(orderDef, ok, bead)
-		item := monitorFeedItemResponse{
-			ID:                 "order:" + bead.ID,
-			Type:               itemType,
-			Status:             normalizeMonitorStatus(orderTrackingStatus(bead)),
-			Title:              title,
-			ScopeKind:          scopeKind,
-			ScopeRef:           scopeRef,
-			Target:             target,
-			StartedAt:          bead.CreatedAt.Format(time.RFC3339Nano),
-			UpdatedAt:          updatedAt.Format(time.RFC3339Nano),
-			BeadID:             bead.ID,
-			DetailAvailable:    ok && orderDef.IsExec(),
-			RunDetailAvailable: ok && orderDef.IsExec(),
+			updatedAt := orderTrackingUpdatedAt(info.store, bead, scopedName)
+			orderDef, ok := orderByScopedName[scopedName]
+			title := orderTrackingTitle(scopedName, orderDef, ok)
+			target := orderTrackingTarget(orderDef, ok, bead)
+			itemType := orderTrackingType(orderDef, ok, bead)
+			item := monitorFeedItemResponse{
+				ID:                 "order:" + info.ref + ":" + bead.ID,
+				Type:               itemType,
+				Status:             normalizeMonitorStatus(orderTrackingStatus(bead)),
+				Title:              title,
+				ScopeKind:          scopeKind,
+				ScopeRef:           scopeRef,
+				Target:             target,
+				StartedAt:          bead.CreatedAt.Format(time.RFC3339Nano),
+				UpdatedAt:          updatedAt.Format(time.RFC3339Nano),
+				BeadID:             bead.ID,
+				StoreRef:           info.ref,
+				DetailAvailable:    ok && orderDef.IsExec(),
+				RunDetailAvailable: ok && orderDef.IsExec(),
+			}
+			items = append(items, item)
 		}
-		items = append(items, item)
 	}
 
-	return items, nil
+	if requestedScopeErr != nil && !includeAllForCity {
+		return orderRunFeedResult{}, requestedScopeErr
+	}
+
+	return orderRunFeedResult{
+		Items:         items,
+		Partial:       len(partialErrors) > 0,
+		PartialErrors: partialErrors,
+	}, nil
 }
 
 func orderTrackingUpdatedAt(store beads.Store, tracking beads.Bead, scopedName string) time.Time {
@@ -429,6 +379,7 @@ func orderTrackingUpdatedAt(store beads.Store, tracking beads.Bead, scopedName s
 		Sort:  beads.SortCreatedDesc,
 	})
 	if err != nil {
+		orderFeedLogf("api: order feed update lookup failed for %s bead %s: %v", scopedName, tracking.ID, err)
 		return updatedAt
 	}
 	if len(runs) > 0 && runs[0].CreatedAt.After(updatedAt) {
@@ -580,15 +531,26 @@ func orderTrackingStatus(bead beads.Bead) string {
 	return "completed"
 }
 
-func parseOrdersFeedLimit(raw string) int {
+// normalizeFeedLimit clamps a caller-supplied feed limit to a sensible
+// range. 0 (or negative) means "use the default"; anything past the
+// hard ceiling is clipped.
+func normalizeFeedLimit(raw int) int {
 	limit := 50
-	if parsed, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && parsed > 0 {
-		limit = parsed
+	if raw > 0 {
+		limit = raw
 	}
 	if limit > maxOrdersFeedLimit {
 		return maxOrdersFeedLimit
 	}
 	return limit
+}
+
+// parseOrdersFeedLimit keeps the string-input path alive for the feed
+// helpers that still read untyped config values. Prefer normalizeFeedLimit
+// in typed handlers.
+func parseOrdersFeedLimit(raw string) int {
+	parsed, _ := strconv.Atoi(strings.TrimSpace(raw))
+	return normalizeFeedLimit(parsed)
 }
 
 func workflowRunProjectionFeedItem(run workflowRunProjection) monitorFeedItemResponse {

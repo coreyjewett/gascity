@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 func TestConditionEnvEnviron(t *testing.T) {
@@ -40,7 +42,7 @@ func TestConditionEnvEnviron(t *testing.T) {
 		"BEADS_DIR":                 "/home/test/city/.beads",
 		"GC_BEAD_ID":                "bead-123",
 		"GC_ITERATION":              "3",
-		"GC_CITY_ROOT":              "/home/test/city",
+		"GC_CITY":                   "/home/test/city",
 		"GC_CITY_PATH":              "/home/test/city",
 		"GC_CITY_RUNTIME_DIR":       "/home/test/city/.gc/runtime",
 		"GC_WISP_ID":                "wisp-456",
@@ -109,6 +111,31 @@ func TestConditionEnvEnvironOptionalEmpty(t *testing.T) {
 	}
 }
 
+func TestConditionEnvEnvironPreservesIntegrationRealBD(t *testing.T) {
+	t.Setenv("GC_INTEGRATION_REAL_BD", "/tmp/test-real-bd")
+
+	env := ConditionEnv{
+		BeadID:      "bead-789",
+		Iteration:   1,
+		CityPath:    "/city",
+		WispID:      "wisp-abc",
+		ArtifactDir: "/tmp/art",
+	}
+
+	vars := env.Environ()
+	lookup := make(map[string]string)
+	for _, v := range vars {
+		parts := strings.SplitN(v, "=", 2)
+		if len(parts) == 2 {
+			lookup[parts[0]] = parts[1]
+		}
+	}
+
+	if got := lookup["GC_INTEGRATION_REAL_BD"]; got != "/tmp/test-real-bd" {
+		t.Fatalf("GC_INTEGRATION_REAL_BD = %q, want %q", got, "/tmp/test-real-bd")
+	}
+}
+
 func TestResolveConditionPath(t *testing.T) {
 	t.Run("absolute path", func(t *testing.T) {
 		dir := t.TempDir()
@@ -121,9 +148,7 @@ func TestResolveConditionPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got != script {
-			t.Errorf("got %q, want %q", got, script)
-		}
+		testutil.AssertSamePath(t, got, script)
 	})
 
 	t.Run("relative path", func(t *testing.T) {
@@ -140,9 +165,7 @@ func TestResolveConditionPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got != script {
-			t.Errorf("got %q, want %q", got, script)
-		}
+		testutil.AssertSamePath(t, got, script)
 	})
 
 	t.Run("symlink allowed", func(t *testing.T) {
@@ -161,9 +184,7 @@ func TestResolveConditionPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error for symlink: %v", err)
 		}
-		if got != link {
-			t.Errorf("got %q, want %q", got, link)
-		}
+		testutil.AssertSamePath(t, got, link)
 	})
 
 	t.Run("path traversal rejection", func(t *testing.T) {

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 
 type graphBead struct {
 	ID       string         `json:"id"`
+	Title    string         `json:"title"`
 	Ref      string         `json:"ref"`
 	Status   string         `json:"status"`
 	Type     string         `json:"type"`
@@ -43,23 +43,6 @@ func metaValue(bead graphBead, key string) string {
 	default:
 		return fmt.Sprint(v)
 	}
-}
-
-var graphWorkflowSupervisorOnce sync.Once
-
-func ensureGraphWorkflowSupervisor(t *testing.T) {
-	t.Helper()
-
-	graphWorkflowSupervisorOnce.Do(func() {
-		out, err := gcDolt("", "supervisor", "start")
-		if err == nil {
-			return
-		}
-		if strings.Contains(out, "already running") {
-			return
-		}
-		t.Fatalf("gc supervisor start failed: %v\noutput: %s", err, out)
-	})
 }
 
 func TestGraphWorkflowSuccessPath(t *testing.T) {
@@ -170,8 +153,7 @@ func assertControlDispatcherLane(t *testing.T, cityDir string) {
 
 func setupGraphWorkflowCity(t *testing.T, mode string) string {
 	t.Helper()
-
-	ensureGraphWorkflowSupervisor(t)
+	env := newIsolatedCommandEnv(t, true)
 
 	var cityName string
 	if usingSubprocess() {
@@ -181,23 +163,35 @@ func setupGraphWorkflowCity(t *testing.T, mode string) string {
 	}
 	cityDir := filepath.Join(t.TempDir(), cityName)
 
-	startCommand := "GC_GRAPH_MODE=" + mode + " bash " + agentScript("graph-workflow.sh")
-	cityToml := fmt.Sprintf("[workspace]\nname = %q\n\n[session]\nprovider = \"subprocess\"\n\n[daemon]\npatrol_interval = \"100ms\"\n\n[[agent]]\nname = \"worker\"\nstart_command = %q\n", cityName, startCommand)
+	startCommand := "GC_GRAPH_MODE=" + mode + " bash " + agentScript("graph-dispatch.sh")
+	cityToml := fmt.Sprintf(
+		"[workspace]\nname = %q\n\n[session]\nprovider = \"subprocess\"\n\n[daemon]\nformula_v2 = true\npatrol_interval = \"100ms\"\n\n[[agent]]\nname = \"worker\"\nmax_active_sessions = 1\nstart_command = %q\n\n[[named_session]]\ntemplate = \"worker\"\nmode = \"always\"\n",
+		cityName, startCommand,
+	)
 	configPath := filepath.Join(t.TempDir(), "graph-workflow.toml")
 	if err := os.WriteFile(configPath, []byte(cityToml), 0o644); err != nil {
 		t.Fatalf("writing graph workflow config: %v", err)
 	}
 
-	out, err := gcDolt("", "init", "--skip-provider-readiness", "--file", configPath, cityDir)
+	out, err := runGCDoltWithEnv(env, "", "init", "--skip-provider-readiness", "--file", configPath, cityDir)
 	if err != nil {
 		t.Fatalf("gc init --file failed: %v\noutput: %s", err, out)
 	}
-	out, err = gcDolt("", "start", cityDir)
-	if err != nil {
-		t.Fatalf("gc start failed: %v\noutput: %s", err, out)
-	}
+	registerCityCommandEnv(cityDir, env)
 	t.Cleanup(func() {
-		gcDolt("", "stop", cityDir) //nolint:errcheck // best-effort cleanup
+		unregisterCityCommandEnv(cityDir)
+		runGCDoltWithEnv(env, "", "stop", cityDir)                //nolint:errcheck // best-effort cleanup
+		runGCDoltWithEnv(env, "", "supervisor", "stop", "--wait") //nolint:errcheck // best-effort cleanup
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			cleanupTestCityDir(cityDir)
+			if _, err := os.Stat(cityDir); os.IsNotExist(err) {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		beadsEntries, _ := os.ReadDir(filepath.Join(cityDir, ".beads"))
+		t.Fatalf("graph workflow city cleanup did not quiesce; .beads entries=%v", beadsEntries)
 	})
 
 	return cityDir
@@ -225,35 +219,26 @@ func startScopedWorkflow(t *testing.T, cityDir string) (string, string) {
 	}
 	slingOutput := out
 
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	if _, workflowID, err := waitForBeadMetadataValue(t, cityDir, issueID, "workflow_id", 10*time.Second); err == nil {
+		return issueID, workflowID
+	} else {
 		issue := showBead(t, cityDir, issueID)
-		if workflowID := metaValue(issue, "workflow_id"); workflowID != "" {
-			return issueID, workflowID
-		}
-		time.Sleep(200 * time.Millisecond)
+		t.Fatalf("timed out waiting for workflow_id on source bead %s: %v\ngc sling output:\n%s\nsource bead:\n%+v", issueID, err, slingOutput, issue)
 	}
-
-	issue := showBead(t, cityDir, issueID)
-	t.Fatalf("timed out waiting for workflow_id on source bead %s\ngc sling output:\n%s\nsource bead:\n%+v", issueID, slingOutput, issue)
 	return "", ""
 }
 
 func waitForBeadClosed(t *testing.T, cityDir, beadID string, timeout time.Duration) graphBead {
 	t.Helper()
 
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		bead, err := tryShowBead(cityDir, beadID)
-		if err != nil {
-			t.Logf("bd show error (retrying): %v", err)
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		if bead.Status == "closed" {
-			return bead
-		}
-		time.Sleep(200 * time.Millisecond)
+	var waitErr error
+	if bead, err := waitForBeadCondition(t, cityDir, beadID, timeout, func(bead graphBead) bool {
+		return bead.Status == "closed"
+	}); err == nil {
+		return bead
+	} else {
+		waitErr = err
+		t.Logf("waitForBeadClosed(%s) ended with %v; collecting diagnostics", beadID, err)
 	}
 
 	out, err := bdDolt(cityDir, "list", "--json", "--all", "--limit=0")
@@ -278,8 +263,8 @@ func waitForBeadClosed(t *testing.T, cityDir, beadID string, timeout time.Durati
 	}
 	traceOut := readOptionalFile(filepath.Join(cityDir, "graph-workflow-trace.log"))
 	workflowTraceOut := readOptionalFile(filepath.Join(cityDir, "control-dispatcher-trace.log"))
-	t.Fatalf("timed out waiting for bead %s to close\nready:\n%s\nready worker:\n%s\nsessions:\n%s\nworker peek:\n%s\ntrace:\n%s\nworkflow trace:\n%s\nbeads:\n%s",
-		beadID, readyOut, readyAssigneeOut, sessionListOut, sessionPeekOut, traceOut, workflowTraceOut, out)
+	t.Fatalf("waiting for bead %s to close failed: %v\nready:\n%s\nready worker:\n%s\nsessions:\n%s\nworker peek:\n%s\ntrace:\n%s\nworkflow trace:\n%s\nbeads:\n%s",
+		beadID, waitErr, readyOut, readyAssigneeOut, sessionListOut, sessionPeekOut, traceOut, workflowTraceOut, out)
 	return graphBead{}
 }
 

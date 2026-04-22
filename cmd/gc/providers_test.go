@@ -29,6 +29,185 @@ func TestTmuxConfigFromSessionPreservesExplicitSocket(t *testing.T) {
 	}
 }
 
+func TestSessionProviderContextForCityUsesTargetCityAndEnvOverride(t *testing.T) {
+	t.Setenv("GC_SESSION", "subprocess")
+
+	cfg := &config.City{
+		Workspace: config.Workspace{
+			Name:            "bright-lights",
+			SessionTemplate: "{{.Agent}}",
+		},
+		Session: config.SessionConfig{
+			Provider: "tmux",
+			Socket:   "from-config",
+		},
+		Agents: []config.Agent{
+			{Name: "mayor"},
+		},
+	}
+
+	ctx := sessionProviderContextForCity(cfg, "/tmp/city-a", os.Getenv("GC_SESSION"))
+	if ctx.cityPath != "/tmp/city-a" {
+		t.Fatalf("cityPath = %q, want %q", ctx.cityPath, "/tmp/city-a")
+	}
+	if ctx.cityName != "bright-lights" {
+		t.Fatalf("cityName = %q, want %q", ctx.cityName, "bright-lights")
+	}
+	if ctx.providerName != "subprocess" {
+		t.Fatalf("providerName = %q, want %q", ctx.providerName, "subprocess")
+	}
+	if ctx.sessionTemplate != "{{.Agent}}" {
+		t.Fatalf("sessionTemplate = %q, want %q", ctx.sessionTemplate, "{{.Agent}}")
+	}
+	if len(ctx.agents) != 1 || ctx.agents[0].Name != "mayor" {
+		t.Fatalf("agents = %#v, want mayor", ctx.agents)
+	}
+}
+
+func TestRawBeadsProviderNormalizesManagedExecEnv(t *testing.T) {
+	cityPath := t.TempDir()
+	t.Setenv("GC_BEADS", "exec:"+gcBeadsBdScriptPath(cityPath))
+
+	if got := rawBeadsProvider(cityPath); got != "bd" {
+		t.Fatalf("rawBeadsProvider() = %q, want bd", got)
+	}
+}
+
+func TestRawBeadsProviderPreservesCustomExecOverride(t *testing.T) {
+	t.Setenv("GC_BEADS", "exec:/tmp/custom-beads")
+
+	if got := rawBeadsProvider(t.TempDir()); got != "exec:/tmp/custom-beads" {
+		t.Fatalf("rawBeadsProvider() = %q, want custom exec override", got)
+	}
+}
+
+func TestRawBeadsProviderForScopePreservesExplicitEnvOverride(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "bd"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_BEADS", "file")
+
+	if got := rawBeadsProviderForScope(rigDir, cityDir); got != "file" {
+		t.Fatalf("rawBeadsProviderForScope() = %q, want explicit env override", got)
+	}
+}
+
+func TestRawBeadsProviderForScopePreservesCustomExecProvider(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "exec:/tmp/custom-beads"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rawBeadsProviderForScope(rigDir, cityDir); got != "exec:/tmp/custom-beads" {
+		t.Fatalf("rawBeadsProviderForScope() = %q, want custom exec provider", got)
+	}
+}
+
+func TestRawBeadsProviderForScopeKeepsSessionOverrideScoped(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", rigDir)
+
+	if got := rawBeadsProviderForScope(rigDir, cityDir); got != "bd" {
+		t.Fatalf("rawBeadsProviderForScope(rig) = %q, want bd", got)
+	}
+	if got := rawBeadsProviderForScope(cityDir, cityDir); got != "file" {
+		t.Fatalf("rawBeadsProviderForScope(city) = %q, want file outside scoped override", got)
+	}
+}
+
+func TestRawBeadsProviderForScopeIgnoresConfigYamlWithoutMetadata(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "config.yaml"), []byte("issue_prefix: fe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rawBeadsProviderForScope(rigDir, cityDir); got != "file" {
+		t.Fatalf("rawBeadsProviderForScope() = %q, want city provider without bd metadata", got)
+	}
+}
+
+func TestRawBeadsProviderForScopePrefersBdMetadataOverFileMarker(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".gc", "beads.json"), []byte("[]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rawBeadsProviderForScope(rigDir, cityDir); got != "bd" {
+		t.Fatalf("rawBeadsProviderForScope() = %q, want bd metadata to outrank stale file marker", got)
+	}
+}
+
 func TestConfiguredACPSessionNames_UsesProvidedSnapshot(t *testing.T) {
 	snapshot := newSessionBeadSnapshot([]beads.Bead{{
 		Type:   sessionBeadType,

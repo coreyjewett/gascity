@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/telemetry"
+	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
 
 type poolSessionRef struct {
@@ -27,24 +29,71 @@ type poolSessionRef struct {
 
 // ScaleCheckRunner runs a scale_check command and returns stdout.
 // dir specifies the working directory for the command (e.g., rig path
-// for rig-scoped pools so bd queries the correct database).
-type ScaleCheckRunner func(command, dir string) (string, error)
+// for rig-scoped pools so bd queries the correct database). env, when
+// non-nil, is merged into the subprocess environment after sanitizing
+// inherited GC_DOLT_* and BEADS_* keys.
+//
+// Implementations MUST be safe to invoke concurrently from multiple
+// goroutines. Both evaluatePendingPools and computeWorkSet dispatch
+// runner calls in parallel, bounded by bdProbeConcurrency. The
+// production implementation shellScaleCheck satisfies this trivially
+// because it only reads its arguments and spawns an independent
+// subprocess; test doubles should avoid shared mutable state or
+// protect it explicitly.
+type ScaleCheckRunner func(command, dir string, env map[string]string) (string, error)
 
-// shellScaleCheck runs a scale_check command via sh -c and returns stdout.
-// dir sets the command's working directory. Times out after 30 seconds.
-func shellScaleCheck(command, dir string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// Default bd probe concurrency is config.DefaultProbeConcurrency (8).
+// Override via [daemon] probe_concurrency in city.toml. Both
+// evaluatePendingPools and computeWorkSet create independent
+// semaphores from cfg.Daemon.ProbeConcurrencyOrDefault(); since they
+// run sequentially within a single reconciler tick (buildDesiredState
+// completes before beadReconcileTick), the effective concurrency never
+// exceeds this limit at any given moment.
+
+// bdProbeTimeout is the timeout for bd subprocess probes (scale_check,
+// work_query). Generous to accommodate bd calls that serialize through
+// a shared dolt sql-server when many pool probes run in parallel.
+const bdProbeTimeout = 180 * time.Second
+
+// hookTimeout is the timeout for lifecycle hook commands (on_death,
+// on_boot). Kept shorter than probe timeout because hooks run
+// synchronously in the reconciler loop and should not stall a tick.
+const hookTimeout = 30 * time.Second
+
+// shellCommand runs a command via sh -c with the given timeout and
+// returns stdout. dir sets the command's working directory. When env is
+// non-nil, it is merged into the subprocess environment after sanitizing
+// inherited GC_DOLT_* and BEADS_* keys.
+func shellCommand(command, dir string, timeout time.Duration, env map[string]string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.WaitDelay = 2 * time.Second
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	if env != nil {
+		cmd.Env = mergeRuntimeEnv(os.Environ(), env)
+	}
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("running scale_check %q: %w", command, err)
+		return "", fmt.Errorf("running command %q: %w", command, err)
 	}
 	return string(out), nil
+}
+
+// shellScaleCheck runs a scale_check command via sh -c and returns stdout.
+// dir sets the command's working directory. Uses bdProbeTimeout (180s).
+func shellScaleCheck(command, dir string, env map[string]string) (string, error) {
+	return shellCommand(command, dir, bdProbeTimeout, env)
+}
+
+// shellRunHook runs a lifecycle hook command (on_death, on_boot) via
+// sh -c with the shorter hookTimeout (30s). Separated from
+// shellScaleCheck so that hung hooks don't stall the reconciler for
+// the full bd probe timeout.
+func shellRunHook(command, dir string, env map[string]string) (string, error) {
+	return shellCommand(command, dir, hookTimeout, env)
 }
 
 // scaleParams holds the resolved scaling parameters for an agent.
@@ -70,9 +119,9 @@ func scaleParamsFor(a *config.Agent) scaleParams {
 
 // evaluatePool runs check, parses the output as an integer, and clamps
 // the result to [min, max]. Returns min on error (honors configured minimum).
-func evaluatePool(agentName string, sp scaleParams, dir string, runner ScaleCheckRunner) (int, error) {
+func evaluatePool(agentName string, sp scaleParams, dir string, env map[string]string, runner ScaleCheckRunner) (int, error) {
 	start := time.Now()
-	out, err := runner(sp.Check, dir)
+	out, err := runner(sp.Check, dir, env)
 	durationMs := float64(time.Since(start).Milliseconds())
 	if err != nil {
 		telemetry.RecordPoolCheck(context.Background(), agentName, durationMs, sp.Min, err)
@@ -137,13 +186,44 @@ func expandSessionSetup(cmds []string, ctx SessionSetupContext) []string {
 	return result
 }
 
-// resolveSetupScript resolves a session_setup_script path relative to cityPath.
-// Returns the path unchanged if already absolute.
-func resolveSetupScript(script, cityPath string) string {
+// resolveSetupScript resolves a session_setup_script path for runtime use.
+// Absolute paths pass through unchanged. "//" paths resolve against cityPath.
+// Other relative paths resolve against sourceDir when present; otherwise they
+// resolve against cityPath. City-root-relative strings produced by older
+// composition code remain supported during the transition.
+func resolveSetupScript(script, sourceDir, cityPath string) string {
+	if strings.HasPrefix(script, "//") {
+		return filepath.Join(cityPath, strings.TrimPrefix(script, "//"))
+	}
 	if script == "" || filepath.IsAbs(script) {
 		return script
 	}
+	if sourceDir != "" {
+		relSource, err := filepath.Rel(cityPath, sourceDir)
+		if err == nil {
+			relSource = filepath.Clean(relSource)
+			cleanScript := filepath.Clean(script)
+			if relSource != "." && relSource != "" && !strings.HasPrefix(relSource, "..") &&
+				(cleanScript == relSource || strings.HasPrefix(cleanScript, relSource+string(os.PathSeparator))) {
+				return filepath.Join(cityPath, cleanScript)
+			}
+		}
+		sourceCandidate := filepath.Join(sourceDir, script)
+		cityCandidate := filepath.Join(cityPath, filepath.Clean(script))
+		if fileExists(cityCandidate) && !fileExists(sourceCandidate) {
+			return cityCandidate
+		}
+		return sourceCandidate
+	}
 	return filepath.Join(cityPath, script)
+}
+
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // deepCopyAgent creates a deep copy of a config.Agent with a new name and dir.
@@ -151,25 +231,26 @@ func resolveSetupScript(script, cityPath string) string {
 // don't affect the original.
 func deepCopyAgent(src *config.Agent, name, dir string) config.Agent {
 	dst := config.Agent{
-		Name:                 name,
-		Description:          src.Description,
-		Dir:                  dir,
-		WorkDir:              src.WorkDir,
-		Scope:                src.Scope,
-		Session:              src.Session,
-		Provider:             src.Provider,
-		PromptTemplate:       src.PromptTemplate,
-		Nudge:                src.Nudge,
-		StartCommand:         src.StartCommand,
-		PromptMode:           src.PromptMode,
-		PromptFlag:           src.PromptFlag,
-		ReadyPromptPrefix:    src.ReadyPromptPrefix,
-		DefaultSlingFormula:  src.DefaultSlingFormula,
-		WorkQuery:            src.WorkQuery,
-		SlingQuery:           src.SlingQuery,
-		SessionSetupScript:   src.SessionSetupScript,
-		OverlayDir:           src.OverlayDir,
-		SourceDir:            src.SourceDir,
+		Name:              name,
+		Description:       src.Description,
+		Dir:               dir,
+		WorkDir:           src.WorkDir,
+		Scope:             src.Scope,
+		Session:           src.Session,
+		Provider:          src.Provider,
+		PromptTemplate:    src.PromptTemplate,
+		Nudge:             src.Nudge,
+		StartCommand:      src.StartCommand,
+		PromptMode:        src.PromptMode,
+		PromptFlag:        src.PromptFlag,
+		ReadyPromptPrefix: src.ReadyPromptPrefix,
+		// DefaultSlingFormula: deep-copied below with other pointer fields.
+		WorkQuery:          src.WorkQuery,
+		SlingQuery:         src.SlingQuery,
+		SessionSetupScript: src.SessionSetupScript,
+		OverlayDir:         src.OverlayDir,
+		SourceDir:          src.SourceDir,
+		// InheritedDefaultSlingFormula: deep-copied below with other pointer fields.
 		Fallback:             src.Fallback,
 		IdleTimeout:          src.IdleTimeout,
 		SleepAfterIdle:       src.SleepAfterIdle,
@@ -180,6 +261,8 @@ func deepCopyAgent(src *config.Agent, name, dir string) config.Agent {
 		PoolName:             src.QualifiedName(),
 		Implicit:             src.Implicit,
 		ScaleCheck:           src.ScaleCheck,
+		BindingName:          src.BindingName,
+		PackName:             src.PackName,
 	}
 	if len(src.DependsOn) > 0 {
 		dst.DependsOn = make([]string, len(src.DependsOn))
@@ -215,10 +298,20 @@ func deepCopyAgent(src *config.Agent, name, dir string) config.Agent {
 		dst.InjectFragments = make([]string, len(src.InjectFragments))
 		copy(dst.InjectFragments, src.InjectFragments)
 	}
+	if len(src.AppendFragments) > 0 {
+		dst.AppendFragments = make([]string, len(src.AppendFragments))
+		copy(dst.AppendFragments, src.AppendFragments)
+	}
+	if len(src.InheritedAppendFragments) > 0 {
+		dst.InheritedAppendFragments = make([]string, len(src.InheritedAppendFragments))
+		copy(dst.InheritedAppendFragments, src.InheritedAppendFragments)
+	}
 	if len(src.InstallAgentHooks) > 0 {
 		dst.InstallAgentHooks = make([]string, len(src.InstallAgentHooks))
 		copy(dst.InstallAgentHooks, src.InstallAgentHooks)
 	}
+	dst.SkillsDir = src.SkillsDir
+	dst.MCPDir = src.MCPDir
 	if src.MaxActiveSessions != nil {
 		v := *src.MaxActiveSessions
 		dst.MaxActiveSessions = &v
@@ -245,6 +338,18 @@ func deepCopyAgent(src *config.Agent, name, dir string) config.Agent {
 		v := *src.HooksInstalled
 		dst.HooksInstalled = &v
 	}
+	if src.InjectAssignedSkills != nil {
+		v := *src.InjectAssignedSkills
+		dst.InjectAssignedSkills = &v
+	}
+	if src.DefaultSlingFormula != nil {
+		v := *src.DefaultSlingFormula
+		dst.DefaultSlingFormula = &v
+	}
+	if src.InheritedDefaultSlingFormula != nil {
+		v := *src.InheritedDefaultSlingFormula
+		dst.InheritedDefaultSlingFormula = &v
+	}
 	if src.Attach != nil {
 		v := *src.Attach
 		dst.Attach = &v
@@ -269,18 +374,18 @@ func deepCopyAgent(src *config.Agent, name, dir string) config.Agent {
 // runPoolOnBoot runs on_boot commands for all pool agents at controller startup.
 // Errors are logged but not fatal — the controller continues regardless.
 func runPoolOnBoot(cfg *config.City, cityPath string, runner ScaleCheckRunner, stderr io.Writer) {
+	cityName := workdirutil.CityName(cityPath, cfg)
 	for _, a := range cfg.Agents {
-		maxSess := a.EffectiveMaxActiveSessions()
-		isMultiSession := maxSess == nil || *maxSess != 1
-		if !isMultiSession || a.Implicit {
+		if !a.SupportsInstanceExpansion() || a.Implicit {
 			continue
 		}
 		cmd := a.EffectiveOnBoot()
 		if cmd == "" {
 			continue
 		}
+		cmd = expandAgentCommandTemplate(cityPath, cityName, &a, cfg.Rigs, "on_boot", cmd, stderr)
 		dir := agentCommandDir(cityPath, &a, cfg.Rigs)
-		if _, err := runner(cmd, dir); err != nil {
+		if _, err := runner(cmd, dir, controllerQueryRuntimeEnv(cityPath, cfg, &a)); err != nil {
 			fmt.Fprintf(stderr, "on_boot %s: %v\n", a.QualifiedName(), err) //nolint:errcheck // best-effort stderr
 		}
 	}
@@ -335,8 +440,7 @@ func discoverPoolInstances(agentName, agentDir string, sp0 scaleParams, a *confi
 			if templatePrefix != "" && strings.HasPrefix(qnSanitized, templatePrefix) {
 				qnSanitized = qnSanitized[len(templatePrefix):]
 			}
-			// Unsanitize: "--" → "/"
-			qn := strings.ReplaceAll(qnSanitized, "--", "/")
+			qn := agent.UnsanitizeQualifiedNameFromSession(qnSanitized)
 			names = append(names, qn)
 		}
 	}

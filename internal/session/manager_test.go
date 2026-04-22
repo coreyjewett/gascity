@@ -146,6 +146,18 @@ type waitFailStore struct {
 	*beads.MemStore
 }
 
+type failMetadataKeyStore struct {
+	*beads.MemStore
+	key string
+}
+
+func (s failMetadataKeyStore) SetMetadata(id, key, value string) error {
+	if key == s.key {
+		return errors.New("set metadata failed")
+	}
+	return s.MemStore.SetMetadata(id, key, value)
+}
+
 func (s waitFailStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	if query.Label == WaitBeadLabel || strings.HasPrefix(query.Label, "session:") {
 		return nil, errors.New("wait list failed")
@@ -657,6 +669,183 @@ func TestClose_ConfiguredNamedSessionRetiresIdentifiers(t *testing.T) {
 	}
 	if got := b.Metadata["alias_history"]; got != "mayor" {
 		t.Fatalf("alias_history = %q, want mayor", got)
+	}
+}
+
+func TestCreateInjectsUnifiedSessionRuntimeEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManager(store, sp)
+
+	info, err := mgr.CreateAliasedNamedWithTransportAndMetadata(
+		context.Background(),
+		"mayor",
+		"test-city--mayor",
+		"reviewer",
+		"Mayor",
+		"claude",
+		"/tmp",
+		"claude",
+		"",
+		map[string]string{"GC_AGENT": "stale"},
+		ProviderResume{},
+		runtime.Config{},
+		map[string]string{
+			"configured_named_session":  "true",
+			"configured_named_identity": "mayor",
+			"session_origin":            "named",
+		},
+	)
+	if err != nil {
+		t.Fatalf("CreateAliasedNamedWithTransportAndMetadata: %v", err)
+	}
+
+	var start *runtime.Call
+	for i := range sp.Calls {
+		if sp.Calls[i].Method == "Start" {
+			start = &sp.Calls[i]
+			break
+		}
+	}
+	if start == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	env := start.Config.Env
+	for key, want := range map[string]string{
+		"GC_SESSION_ID":     info.ID,
+		"GC_SESSION_NAME":   "test-city--mayor",
+		"GC_ALIAS":          "mayor",
+		"GC_TEMPLATE":       "reviewer",
+		"GC_SESSION_ORIGIN": "named",
+		"GC_AGENT":          "mayor",
+	} {
+		if got := env[key]; got != want {
+			t.Fatalf("Env[%s] = %q, want %q (env=%v)", key, got, want, env)
+		}
+	}
+}
+
+func TestCreateUsesBuiltinAncestorForGCProviderEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManager(store, sp)
+
+	info, err := mgr.CreateAliasedNamedWithTransportAndMetadata(
+		context.Background(),
+		"mayor",
+		"test-city--mayor",
+		"reviewer",
+		"Mayor",
+		"claude",
+		"/tmp",
+		"claude-max",
+		"",
+		nil,
+		ProviderResume{},
+		runtime.Config{},
+		map[string]string{
+			"builtin_ancestor": "claude",
+			"provider_kind":    "claude-max",
+			"session_origin":   "named",
+		},
+	)
+	if err != nil {
+		t.Fatalf("CreateAliasedNamedWithTransportAndMetadata: %v", err)
+	}
+
+	cfg := sp.LastStartConfig("test-city--mayor")
+	if cfg == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	if got := cfg.Env["GC_PROVIDER"]; got != "claude" {
+		t.Fatalf("GC_PROVIDER = %q, want claude for %s", got, info.ID)
+	}
+}
+
+func TestAttachUsesBuiltinAncestorForGCProviderEnv(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManager(store, sp)
+	b, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":     "test-city--worker",
+			"state":            string(StateSuspended),
+			"template":         "worker",
+			"work_dir":         "/tmp",
+			"provider":         "claude-max",
+			"provider_kind":    "claude-max",
+			"builtin_ancestor": "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("creating session bead: %v", err)
+	}
+
+	if err := mgr.Attach(context.Background(), b.ID, "claude --resume abc", runtime.Config{}); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	cfg := sp.LastStartConfig("test-city--worker")
+	if cfg == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	if got := cfg.Env["GC_PROVIDER"]; got != "claude" {
+		t.Fatalf("GC_PROVIDER = %q, want claude", got)
+	}
+}
+
+func TestCreateAliaslessMultiSessionUsesConcreteRuntimeIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManager(store, sp)
+
+	info, err := mgr.CreateAliasedNamedWithTransportAndMetadata(
+		context.Background(),
+		"",
+		"ant-adhoc-123",
+		"demo/ant",
+		"Ant",
+		"claude",
+		"/tmp",
+		"claude",
+		"",
+		nil,
+		ProviderResume{},
+		runtime.Config{},
+		map[string]string{
+			"agent_name":     "demo/ant-adhoc-123",
+			"session_origin": "manual",
+		},
+	)
+	if err != nil {
+		t.Fatalf("CreateAliasedNamedWithTransportAndMetadata: %v", err)
+	}
+
+	var start *runtime.Call
+	for i := range sp.Calls {
+		if sp.Calls[i].Method == "Start" {
+			start = &sp.Calls[i]
+			break
+		}
+	}
+	if start == nil {
+		t.Fatalf("Start call not recorded: %#v", sp.Calls)
+	}
+	env := start.Config.Env
+	for key, want := range map[string]string{
+		"GC_SESSION_ID":     info.ID,
+		"GC_SESSION_NAME":   "ant-adhoc-123",
+		"GC_ALIAS":          "demo/ant-adhoc-123",
+		"GC_TEMPLATE":       "demo/ant",
+		"GC_SESSION_ORIGIN": "manual",
+		"GC_AGENT":          "demo/ant-adhoc-123",
+	} {
+		if got := env[key]; got != want {
+			t.Fatalf("Env[%s] = %q, want %q (env=%v)", key, got, want, env)
+		}
 	}
 }
 
@@ -2103,7 +2292,7 @@ func TestStopTurnInterruptsActiveSession(t *testing.T) {
 	}
 }
 
-func TestStopTurnRejectsPoolManagedSession(t *testing.T) {
+func TestStopTurnAllowsPoolManagedSession(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
 	mgr := NewManager(store, sp)
@@ -2119,19 +2308,23 @@ func TestStopTurnRejectsPoolManagedSession(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 
-	err = mgr.StopTurn(info.ID)
-	if !errors.Is(err, ErrPoolManaged) {
-		t.Fatalf("StopTurn = %v, want ErrPoolManaged", err)
+	if err := mgr.StopTurn(info.ID); err != nil {
+		t.Fatalf("StopTurn: %v", err)
 	}
 
+	found := false
 	for _, call := range sp.Calls {
 		if call.Method == "Interrupt" {
-			t.Fatalf("pool-managed session should not receive Interrupt, got call for %q", call.Name)
+			found = true
+			break
 		}
+	}
+	if !found {
+		t.Fatal("expected Interrupt call for pool-managed session")
 	}
 }
 
-func TestStopTurnRejectsPoolSlotOnlySession(t *testing.T) {
+func TestStopTurnAllowsPoolSlotOnlySession(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()
 	mgr := NewManager(store, sp)
@@ -2147,15 +2340,19 @@ func TestStopTurnRejectsPoolSlotOnlySession(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 
-	err = mgr.StopTurn(info.ID)
-	if !errors.Is(err, ErrPoolManaged) {
-		t.Fatalf("StopTurn = %v, want ErrPoolManaged for pool_slot-only bead", err)
+	if err := mgr.StopTurn(info.ID); err != nil {
+		t.Fatalf("StopTurn: %v", err)
 	}
 
+	found := false
 	for _, call := range sp.Calls {
 		if call.Method == "Interrupt" {
-			t.Fatalf("pool-slot session should not receive Interrupt, got call for %q", call.Name)
+			found = true
+			break
 		}
+	}
+	if !found {
+		t.Fatal("expected Interrupt call for pool-slot session")
 	}
 }
 
@@ -2659,5 +2856,51 @@ func TestEnsureRunning_StartupDeathWithoutStrippableResumeClearsMetadata(t *test
 	}
 	if b.Metadata["state"] != string(StateSuspended) {
 		t.Errorf("state should remain suspended after failed unstrippable fallback, got %q", b.Metadata["state"])
+	}
+}
+
+func TestEnsureRunning_StartupDeathClearMetadataFailurePropagates(t *testing.T) {
+	store := failMetadataKeyStore{MemStore: beads.NewMemStore(), key: "session_key"}
+	base := runtime.NewFake()
+	sp := &startupDeathProvider{Fake: base}
+	mgr := NewManager(store, sp)
+
+	info, err := mgr.Create(context.Background(), "worker", "", "claude --dangerously", "/tmp", "claude", nil, ProviderResume{
+		ResumeFlag:    "--resume",
+		SessionIDFlag: "--session-id",
+	}, runtime.Config{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get bead: %v", err)
+	}
+	sessionKey := b.Metadata["session_key"]
+	if sessionKey == "" {
+		t.Fatal("expected session_key in bead metadata after Create with ResumeFlag")
+	}
+
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	sp.armed = true
+	resumeCmd := "claude --dangerously --resume " + sessionKey
+	err = mgr.Send(context.Background(), info.ID, "hello", resumeCmd, runtime.Config{WorkDir: "/tmp"})
+	if err == nil {
+		t.Fatal("Send should fail when stale resume metadata cannot be cleared")
+	}
+	if !strings.Contains(err.Error(), "clearing stale resume metadata session_key") {
+		t.Fatalf("Send error = %v, want stale metadata clear failure", err)
+	}
+
+	b, err = store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get bead after failure: %v", err)
+	}
+	if b.Metadata["session_key"] == "" {
+		t.Fatal("session_key should remain set after failed metadata clear")
 	}
 }

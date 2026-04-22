@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 // Provenance: This file was copied from github.com/steveyegge/gastown
@@ -119,6 +121,12 @@ var (
 	ErrIdleTimeout        = errors.New("agent not idle before timeout")
 )
 
+const (
+	hiddenAttachReadyTimeout = 2 * time.Second
+	hiddenAttachMaxLifetime  = 20 * time.Second
+	hiddenAttachPollInterval = 50 * time.Millisecond
+)
+
 // validateSessionName checks that a session name contains only safe characters.
 // Returns ErrInvalidSessionName if the name contains dots, colons, or other
 // characters that cause tmux to silently fail or produce cryptic errors.
@@ -165,8 +173,19 @@ func (realExecutor) executeCtx(ctx context.Context, args []string) (string, erro
 
 // Tmux wraps tmux operations.
 type Tmux struct {
-	cfg  Config
-	exec executor
+	cfg                  Config
+	exec                 executor
+	interactionDedup     *approvalDedup
+	interactionDedupOnce sync.Once
+	hiddenAttachMu       sync.Mutex
+	hiddenAttachClients  map[string]*hiddenAttachClient
+}
+
+type hiddenAttachClient struct {
+	cancel  context.CancelFunc
+	done    chan error
+	stdin   io.WriteCloser
+	writeMu sync.Mutex
 }
 
 // NewTmux creates a new Tmux wrapper with default configuration.
@@ -177,6 +196,13 @@ func NewTmux() *Tmux {
 // NewTmuxWithConfig creates a new Tmux wrapper with the given configuration.
 func NewTmuxWithConfig(cfg Config) *Tmux {
 	return &Tmux{cfg: cfg, exec: realExecutor{}}
+}
+
+func (t *Tmux) approvalDedup() *approvalDedup {
+	t.interactionDedupOnce.Do(func() {
+		t.interactionDedup = &approvalDedup{lastHash: make(map[string]string)}
+	})
+	return t.interactionDedup
 }
 
 // runCtx executes a tmux command with a context (for timeout/cancellation).
@@ -1075,6 +1101,207 @@ func (t *Tmux) WakePaneIfDetached(target string) {
 	t.WakePane(target)
 }
 
+func (t *Tmux) providerEnv(target string) string {
+	provider, err := t.GetEnvironment(target, "GC_PROVIDER")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(provider)
+}
+
+func (t *Tmux) requiresHiddenAttachedInterrupt(target string) bool {
+	switch t.providerEnv(target) {
+	case "gemini":
+		return true
+	case "":
+		return t.targetLooksLikeProvider(target, "gemini")
+	default:
+		return false
+	}
+}
+
+func (t *Tmux) ensureHiddenAttachedClient(target string) error {
+	if t.IsSessionAttached(target) {
+		return nil
+	}
+
+	t.hiddenAttachMu.Lock()
+	if client := t.hiddenAttachClients[target]; client != nil {
+		t.hiddenAttachMu.Unlock()
+		return t.waitForHiddenAttachReady(target, client)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), hiddenAttachMaxLifetime)
+	cmdArgs := []string{"-u"}
+	if t.cfg.SocketName != "" {
+		cmdArgs = append(cmdArgs, "-L", t.cfg.SocketName)
+	}
+	cmdArgs = append(cmdArgs, "attach-session", "-t", target)
+	cmd := exec.CommandContext(ctx, "script", "-qfc", "tmux "+shellquote.Join(cmdArgs), "/dev/null")
+	cmd.Env = append(cmd.Environ(), "TERM=xterm-256color")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		t.hiddenAttachMu.Unlock()
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		cancel()
+		t.hiddenAttachMu.Unlock()
+		return err
+	}
+	client := &hiddenAttachClient{
+		cancel: cancel,
+		done:   make(chan error, 1),
+		stdin:  stdin,
+	}
+	if t.hiddenAttachClients == nil {
+		t.hiddenAttachClients = make(map[string]*hiddenAttachClient)
+	}
+	t.hiddenAttachClients[target] = client
+	t.hiddenAttachMu.Unlock()
+
+	go func() {
+		err := cmd.Wait()
+		_ = stdin.Close()
+		client.done <- err
+		close(client.done)
+		t.clearHiddenAttachClient(target, client)
+	}()
+
+	if err := t.waitForHiddenAttachReady(target, client); err != nil {
+		t.CloseHiddenAttachClient(target)
+		return err
+	}
+	return nil
+}
+
+func (t *Tmux) hiddenAttachClient(target string) *hiddenAttachClient {
+	t.hiddenAttachMu.Lock()
+	defer t.hiddenAttachMu.Unlock()
+	return t.hiddenAttachClients[target]
+}
+
+func (t *Tmux) waitForHiddenAttachReady(target string, client *hiddenAttachClient) error {
+	deadline := time.Now().Add(hiddenAttachReadyTimeout)
+	for time.Now().Before(deadline) {
+		if t.IsSessionAttached(target) {
+			return nil
+		}
+		select {
+		case err, ok := <-client.done:
+			if !ok {
+				return fmt.Errorf("hidden tmux client exited before attaching")
+			}
+			if err != nil {
+				return fmt.Errorf("hidden tmux client exited before attaching: %w", err)
+			}
+			return fmt.Errorf("hidden tmux client exited before attaching")
+		default:
+		}
+		time.Sleep(hiddenAttachPollInterval)
+	}
+	return fmt.Errorf("timed out waiting for hidden tmux client to attach")
+}
+
+func (t *Tmux) clearHiddenAttachClient(target string, client *hiddenAttachClient) {
+	t.hiddenAttachMu.Lock()
+	defer t.hiddenAttachMu.Unlock()
+	if existing := t.hiddenAttachClients[target]; existing == client {
+		delete(t.hiddenAttachClients, target)
+	}
+}
+
+// CloseHiddenAttachClient tears down the short-lived hidden client used to
+// make detached Gemini Ctrl-C interrupts behave like a real attached terminal.
+func (t *Tmux) CloseHiddenAttachClient(target string) {
+	t.hiddenAttachMu.Lock()
+	client := t.hiddenAttachClients[target]
+	delete(t.hiddenAttachClients, target)
+	t.hiddenAttachMu.Unlock()
+
+	if client == nil {
+		return
+	}
+	client.cancel()
+	_ = client.stdin.Close()
+	select {
+	case <-client.done:
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func (c *hiddenAttachClient) write(input []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_, err := c.stdin.Write(input)
+	return err
+}
+
+func hiddenAttachedKeyBytes(key string) ([]byte, bool) {
+	switch strings.TrimSpace(key) {
+	case "C-c":
+		return []byte{0x03}, true
+	case "C-u":
+		return []byte{0x15}, true
+	case "Enter":
+		return []byte{'\r'}, true
+	case "Escape":
+		return []byte{0x1b}, true
+	case "Up":
+		return []byte{0x1b, '[', 'A'}, true
+	case "Down":
+		return []byte{0x1b, '[', 'B'}, true
+	case "Right":
+		return []byte{0x1b, '[', 'C'}, true
+	case "Left":
+		return []byte{0x1b, '[', 'D'}, true
+	default:
+		return nil, false
+	}
+}
+
+func (t *Tmux) sendHiddenAttachedKeys(target string, keys ...string) (bool, error) {
+	client := t.hiddenAttachClient(target)
+	if client == nil {
+		return false, nil
+	}
+	for _, key := range keys {
+		seq, ok := hiddenAttachedKeyBytes(key)
+		if !ok {
+			return false, nil
+		}
+		if err := client.write(seq); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
+func (t *Tmux) sendHiddenAttachedText(target, text string) (bool, error) {
+	client := t.hiddenAttachClient(target)
+	if client == nil {
+		return false, nil
+	}
+	if text == "" {
+		return true, nil
+	}
+	if err := client.write([]byte(text)); err != nil {
+		return true, err
+	}
+	if t.cfg.DebounceMs > 0 {
+		time.Sleep(time.Duration(t.cfg.DebounceMs) * time.Millisecond)
+	}
+	if err := client.write([]byte{'\r'}); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 // isTransientSendKeysError returns true if the error from tmux send-keys is
 // transient and safe to retry. "not in a mode" occurs when the target pane's
 // TUI hasn't initialized its input handling yet (common during cold startup).
@@ -1135,7 +1362,7 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 
 // NudgeSession sends a message to a Claude Code session reliably.
 // This is the canonical way to send messages to Claude sessions.
-// Uses: literal mode + 500ms debounce + ESC (for vim mode) + separate Enter.
+// Uses: literal mode + 500ms debounce + separate Enter.
 // After sending, triggers SIGWINCH to wake Claude in detached sessions.
 // Verification is the Witness's job (AI), not this function.
 //
@@ -1169,12 +1396,21 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	// 2. Wait 500ms for paste to complete (tested, required)
 	time.Sleep(500 * time.Millisecond)
 
-	// 3. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
-	// See: https://github.com/anthropics/gastown/issues/307
-	_, _ = t.run("send-keys", "-t", target, "Escape")
-	time.Sleep(100 * time.Millisecond)
+	// 3. Send Escape only for TUIs where it's an insert-mode escape, not a
+	// semantic input key. Claude, Codex, and Gemini all treat Escape as a
+	// semantic control key in some busy states, so default submit must not
+	// synthesize it for them.
+	if t.shouldSendEscapeBeforeEnter(target) {
+		// See: https://github.com/anthropics/gastown/issues/307
+		_, _ = t.run("send-keys", "-t", target, "Escape")
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	// 4. Send Enter with retry (critical for message submission)
+	// 4. Wake detached panes before Enter. Some TUIs accept pasted input while
+	// detached but drop the submit key until a terminal resize wakes their loop.
+	t.WakePaneIfDetached(session)
+
+	// 5. Send Enter with retry (critical for message submission)
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -1184,7 +1420,7 @@ func (t *Tmux) NudgeSession(session, message string) error {
 			lastErr = err
 			continue
 		}
-		// 5. Wake the pane to trigger SIGWINCH for detached sessions
+		// 6. Wake again so the submitted turn is processed promptly.
 		t.WakePaneIfDetached(session)
 		return nil
 	}
@@ -1211,12 +1447,17 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	// 2. Wait 500ms for paste to complete (tested, required)
 	time.Sleep(500 * time.Millisecond)
 
-	// 3. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
-	// See: https://github.com/anthropics/gastown/issues/307
-	_, _ = t.run("send-keys", "-t", pane, "Escape")
-	time.Sleep(100 * time.Millisecond)
+	// 3. See NudgeSession for why Escape is provider-specific.
+	if t.shouldSendEscapeBeforeEnter(pane) {
+		_, _ = t.run("send-keys", "-t", pane, "Escape")
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	// 4. Send Enter with retry (critical for message submission)
+	// 4. Wake detached panes before Enter. See NudgeSession for why this
+	// happens before and after submit.
+	t.WakePaneIfDetached(pane)
+
+	// 5. Send Enter with retry (critical for message submission)
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -1226,11 +1467,48 @@ func (t *Tmux) NudgePane(pane, message string) error {
 			lastErr = err
 			continue
 		}
-		// 5. Wake the pane to trigger SIGWINCH for detached sessions
+		// 6. Wake again so the submitted turn is processed promptly.
 		t.WakePaneIfDetached(pane)
 		return nil
 	}
 	return fmt.Errorf("failed to send Enter after 3 attempts: %w", lastErr)
+}
+
+func (t *Tmux) shouldSendEscapeBeforeEnter(target string) bool {
+	provider, err := t.GetEnvironment(target, "GC_PROVIDER")
+	if err == nil {
+		switch strings.TrimSpace(provider) {
+		case "claude", "codex", "gemini":
+			return false
+		default:
+			// Unrecognized provider (custom alias) — fall through to
+			// process-tree detection instead of assuming escape is needed.
+		}
+	}
+	if t.targetLooksLikeNoEscapeProvider(target) {
+		return false
+	}
+	return true
+}
+
+func (t *Tmux) targetLooksLikeNoEscapeProvider(target string) bool {
+	noEscapeProviders := []string{"claude", "codex", "gemini"}
+	return t.targetLooksLikeAnyProvider(target, noEscapeProviders...)
+}
+
+func (t *Tmux) targetLooksLikeProvider(target, provider string) bool {
+	return t.targetLooksLikeAnyProvider(target, provider)
+}
+
+func (t *Tmux) targetLooksLikeAnyProvider(target string, providers ...string) bool {
+	pid, err := t.GetPanePID(target)
+	if err != nil || strings.TrimSpace(pid) == "" {
+		return false
+	}
+	if processMatchesNames(pid, providers) {
+		return true
+	}
+	return hasDescendantWithNames(pid, providers, 0)
 }
 
 // AcceptStartupDialogs dismisses all Claude Code startup dialogs that can block
@@ -1240,7 +1518,13 @@ func (t *Tmux) NudgePane(pane, message string) error {
 // Call this after starting Claude and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts. Idempotent: safe to call on sessions without dialogs.
 func (t *Tmux) AcceptStartupDialogs(ctx context.Context, sess string) error {
-	return runtime.AcceptStartupDialogs(ctx,
+	return t.DismissKnownDialogs(ctx, sess, 8*time.Second)
+}
+
+// DismissKnownDialogs dismisses known trust, permissions, and rate-limit
+// dialogs using a bounded timeout.
+func (t *Tmux) DismissKnownDialogs(ctx context.Context, sess string, timeout time.Duration) error {
+	return runtime.AcceptStartupDialogsWithTimeout(ctx, timeout,
 		func(lines int) (string, error) { return t.CapturePane(sess, lines) },
 		func(keys ...string) error {
 			for _, k := range keys {
@@ -1544,6 +1828,11 @@ func processMatchesNames(pid string, names []string) bool {
 	if len(names) == 0 {
 		return false
 	}
+	nameSet := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		nameSet[name] = struct{}{}
+	}
+
 	// Use ps to get the command name (COMM column gives the executable name)
 	cmd := exec.Command("ps", "-p", pid, "-o", "comm=")
 	out, err := cmd.Output()
@@ -1553,11 +1842,58 @@ func processMatchesNames(pid string, names []string) bool {
 	// Get just the base name (in case it's a full path like /Users/.../claude)
 	commPath := strings.TrimSpace(string(out))
 	comm := filepath.Base(commPath)
+	if _, ok := nameSet[comm]; ok {
+		return true
+	}
 
-	// Check if any name matches
-	for _, name := range names {
-		if comm == name {
-			return true
+	// Fall back to argv[0] from the full command line. This catches wrapper
+	// scripts launched as "/path/to/codex" where COMM may report "bash" or
+	// another interpreter instead of the provider name.
+	cmd = exec.Command("ps", "-p", pid, "-o", "args=")
+	out, err = cmd.Output()
+	if err != nil {
+		return false
+	}
+	args := strings.Fields(strings.TrimSpace(string(out)))
+	if len(args) == 0 {
+		return false
+	}
+	argv0 := filepath.Base(args[0])
+	if _, ok := nameSet[argv0]; ok {
+		return true
+	}
+
+	// Wrapper runtimes often execute providers through interpreters such as bun,
+	// node, or npx, leaving the actual provider name only in the first positional
+	// argument. Only check the first non-flag argument after a known interpreter
+	// to avoid false positives (e.g., "vim claude.txt" or "tail -f gemini.log").
+	knownInterpreters := map[string]struct{}{
+		"node": {}, "bun": {}, "npx": {}, "deno": {},
+	}
+	// Runner subcommands (e.g., "bun run gemini") that should be skipped
+	// when scanning for the provider name in positional args.
+	runnerSubcommands := map[string]struct{}{
+		"run": {}, "exec": {}, "x": {},
+	}
+	if _, isInterpreter := knownInterpreters[argv0]; isInterpreter {
+		for _, token := range args[1:] {
+			token = strings.TrimSpace(token)
+			if token == "" || strings.HasPrefix(token, "-") {
+				continue
+			}
+			// Skip known runner subcommands like "run" in "bun run gemini".
+			if _, isRunner := runnerSubcommands[token]; isRunner {
+				continue
+			}
+			base := filepath.Base(token)
+			if _, ok := nameSet[base]; ok {
+				return true
+			}
+			baseNoExt := strings.TrimSuffix(base, filepath.Ext(base))
+			if _, ok := nameSet[baseNoExt]; ok {
+				return true
+			}
+			break // only check the first positional argument
 		}
 	}
 	return false
@@ -1571,37 +1907,23 @@ func hasDescendantWithNames(pid string, names []string, depth int) bool {
 	if len(names) == 0 || depth > maxDepth {
 		return false
 	}
-	// Use pgrep to find child processes
-	cmd := exec.Command("pgrep", "-P", pid, "-l")
+	// Use pgrep to find child processes.
+	cmd := exec.Command("pgrep", "-P", pid)
 	out, err := cmd.Output()
 	if err != nil {
 		return false
 	}
-	// Build a set of names for fast lookup
-	nameSet := make(map[string]bool, len(names))
-	for _, n := range names {
-		nameSet[n] = true
-	}
-	// Check if any child matches, or recursively check grandchildren
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
+		childPid := strings.TrimSpace(line)
+		if childPid == "" {
 			continue
 		}
-		// Format: "PID name" e.g., "29677 node"
-		parts := strings.Fields(line)
-		if len(parts) >= 2 {
-			childPid := parts[0]
-			childName := parts[1]
-			// Direct match
-			if nameSet[childName] {
-				return true
-			}
-			// Recursive check of descendants
-			if hasDescendantWithNames(childPid, names, depth+1) {
-				return true
-			}
+		if processMatchesNames(childPid, names) {
+			return true
+		}
+		if hasDescendantWithNames(childPid, names, depth+1) {
+			return true
 		}
 	}
 	return false
@@ -2015,8 +2337,9 @@ func (t *Tmux) WaitForRuntimeReady(ctx context.Context, session string, rc *Runt
 			return ctx.Err()
 		default:
 		}
-		// Capture last few lines of the pane
-		lines, err := t.CapturePaneLines(session, 10)
+		// Claude-style full-screen UIs often leave the prompt above a footer of
+		// blank lines, so the last 10 lines can miss a perfectly visible prompt.
+		lines, err := t.CapturePaneLines(session, promptObservationLines)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -2042,7 +2365,27 @@ func (t *Tmux) WaitForRuntimeReady(ctx context.Context, session string, rc *Runt
 
 // DefaultReadyPromptPrefix is the Claude Code prompt prefix used for idle detection.
 // Claude Code uses ❯ (U+276F) as the prompt character.
-const DefaultReadyPromptPrefix = "❯ "
+const (
+	DefaultReadyPromptPrefix = "❯ "
+	sessionReadyPromptEnvKey = "GC_READY_PROMPT_PREFIX"
+	// promptObservationLines widens prompt detection beyond the pane footer.
+	// Claude's welcome/idle UI can leave several blank rows below the prompt,
+	// so capturing only the last handful of lines misses the ready indicator.
+	promptObservationLines = 120
+	// codexInterruptBoundaryTailBytes is the transcript tail window scanned for
+	// Codex's durable interrupt acknowledgement marker.
+	codexInterruptBoundaryTailBytes = 16 * 1024
+	// codexInterruptBoundaryRecentLines limits detection to the newest transcript
+	// entries so an older interrupt marker does not satisfy a later interrupt.
+	codexInterruptBoundaryRecentLines = 12
+)
+
+func idlePromptPrefix(configured string) string {
+	if strings.TrimSpace(configured) != "" {
+		return configured
+	}
+	return DefaultReadyPromptPrefix
+}
 
 // WaitForIdle polls until the agent appears to be at an idle prompt.
 // Unlike WaitForRuntimeReady (which is for bootstrap), this is for steady-state
@@ -2057,6 +2400,9 @@ const DefaultReadyPromptPrefix = "❯ "
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(ctx context.Context, session string, timeout time.Duration) error {
 	promptPrefix := DefaultReadyPromptPrefix
+	if configured, err := t.GetEnvironment(session, sessionReadyPromptEnvKey); err == nil {
+		promptPrefix = idlePromptPrefix(configured)
+	}
 	prefix := strings.TrimSpace(promptPrefix)
 
 	consecutiveIdle := 0
@@ -2067,7 +2413,7 @@ func (t *Tmux) WaitForIdle(ctx context.Context, session string, timeout time.Dur
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		lines, err := t.CapturePaneLines(session, 10)
+		lines, err := t.CapturePaneLines(session, promptObservationLines)
 		if err != nil {
 			// Distinguish terminal errors from transient ones.
 			// Session not found or no server means the session is gone —
@@ -2076,7 +2422,7 @@ func (t *Tmux) WaitForIdle(ctx context.Context, session string, timeout time.Dur
 				return err
 			}
 			consecutiveIdle = 0
-			if err := waitForIdlePoll(ctx, 200*time.Millisecond); err != nil {
+			if err := waitForIdlePoll(ctx); err != nil {
 				return err
 			}
 			continue
@@ -2087,7 +2433,7 @@ func (t *Tmux) WaitForIdle(ctx context.Context, session string, timeout time.Dur
 		// the agent is busy regardless of whether the prompt is visible.
 		if paneContainsBusyIndicator(lines) {
 			consecutiveIdle = 0
-			if err := waitForIdlePoll(ctx, 200*time.Millisecond); err != nil {
+			if err := waitForIdlePoll(ctx); err != nil {
 				return err
 			}
 			continue
@@ -2116,15 +2462,15 @@ func (t *Tmux) WaitForIdle(ctx context.Context, session string, timeout time.Dur
 		} else {
 			consecutiveIdle = 0
 		}
-		if err := waitForIdlePoll(ctx, 200*time.Millisecond); err != nil {
+		if err := waitForIdlePoll(ctx); err != nil {
 			return err
 		}
 	}
 	return ErrIdleTimeout
 }
 
-func waitForIdlePoll(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
+func waitForIdlePoll(ctx context.Context) error {
+	timer := time.NewTimer(200 * time.Millisecond)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -2134,12 +2480,138 @@ func waitForIdlePoll(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// WaitForInterruptBoundary waits for a provider-native interrupt
+// acknowledgement before the next user turn is injected.
+func (t *Tmux) WaitForInterruptBoundary(ctx context.Context, session string, since time.Time, timeout time.Duration) error {
+	provider, _ := t.GetEnvironment(session, "GC_PROVIDER")
+	switch strings.TrimSpace(provider) {
+	case "", "codex":
+		// Continue below. Empty provider env can happen in tests or with
+		// older sessions; fall back to process-tree detection.
+	default:
+		return runtime.ErrInteractionUnsupported
+	}
+	if strings.TrimSpace(provider) == "" && !t.targetLooksLikeProvider(session, "codex") {
+		return runtime.ErrInteractionUnsupported
+	}
+	codexHome, err := t.GetEnvironment(session, "CODEX_HOME")
+	if err != nil {
+		return runtime.ErrInteractionUnsupported
+	}
+	codexHome = strings.TrimSpace(codexHome)
+	if codexHome == "" {
+		return runtime.ErrInteractionUnsupported
+	}
+	return waitForCodexInterruptBoundary(ctx, codexHome, since, timeout)
+}
+
+func waitForCodexInterruptBoundary(ctx context.Context, codexHome string, since time.Time, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		transcriptPath, modTime, err := latestCodexTranscriptPath(codexHome)
+		if err == nil && !modTime.Before(since) {
+			tail, err := readFileTail(transcriptPath, codexInterruptBoundaryTailBytes)
+			if err == nil && codexTranscriptTailContainsTurnAborted(tail) {
+				return nil
+			}
+		}
+		if err := waitForIdlePoll(ctx); err != nil {
+			return err
+		}
+	}
+	return ErrIdleTimeout
+}
+
+func latestCodexTranscriptPath(codexHome string) (string, time.Time, error) {
+	root := filepath.Join(codexHome, "sessions")
+	var latestPath string
+	var latestMod time.Time
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || filepath.Ext(path) != ".jsonl" {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if latestPath == "" || info.ModTime().After(latestMod) {
+			latestPath = path
+			latestMod = info.ModTime()
+		}
+		return nil
+	})
+	if latestPath == "" {
+		if err != nil {
+			return "", time.Time{}, err
+		}
+		return "", time.Time{}, os.ErrNotExist
+	}
+	return latestPath, latestMod, nil
+}
+
+func readFileTail(path string, maxBytes int64) (_ string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	offset := info.Size() - maxBytes
+	if offset < 0 {
+		offset = 0
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return "", err
+	}
+	buf, err := io.ReadAll(f)
+	if err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func codexTranscriptTailContainsTurnAborted(tail string) bool {
+	lines := strings.Split(strings.TrimSpace(tail), "\n")
+	seen := 0
+	for i := len(lines) - 1; i >= 0 && seen < codexInterruptBoundaryRecentLines; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		seen++
+		if !strings.Contains(line, "<turn_aborted>") {
+			continue
+		}
+		if strings.Contains(line, `"role":"user"`) || strings.Contains(line, `"role": "user"`) ||
+			strings.Contains(line, `"type":"user_message"`) || strings.Contains(line, `"type": "user_message"`) {
+			return true
+		}
+	}
+	return false
+}
+
 // paneContainsBusyIndicator checks captured pane lines for signs that the
 // agent is actively processing. Claude Code displays "esc to interrupt" in
 // the status bar while running tools or generating responses.
 func paneContainsBusyIndicator(lines []string) bool {
 	for _, line := range lines {
-		if strings.Contains(line, "esc to interrupt") {
+		if strings.Contains(line, "esc to interrupt") ||
+			strings.Contains(line, "Press Esc or Ctrl+C to cancel") ||
+			strings.Contains(line, "[current working directory ") {
 			return true
 		}
 	}

@@ -1,11 +1,13 @@
 package doctor
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -15,11 +17,11 @@ import (
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
-	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
@@ -57,13 +59,14 @@ func (c *CityStructureCheck) CanFix() bool { return false }
 // Fix is a no-op.
 func (c *CityStructureCheck) Fix(_ *CheckContext) error { return nil }
 
-// CityConfigCheck verifies city.toml parses and workspace.name is set.
+// CityConfigCheck verifies city.toml parses and an effective workspace name can
+// be resolved.
 type CityConfigCheck struct{}
 
 // Name returns the check identifier.
 func (c *CityConfigCheck) Name() string { return "city-config" }
 
-// Run parses city.toml and checks workspace.name.
+// Run parses city.toml and checks effective workspace identity.
 func (c *CityConfigCheck) Run(ctx *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(ctx.CityPath, "city.toml"))
@@ -77,12 +80,7 @@ func (c *CityConfigCheck) Run(ctx *CheckContext) *CheckResult {
 		r.Message = "workspace.name not set (and could not derive from path)"
 		return r
 	}
-	summary := fmt.Sprintf("city.toml loaded (%d agents, %d rigs)", len(cfg.Agents), len(cfg.Rigs))
-	if cfg.Workspace.Name == "" {
-		r.Status = StatusWarning
-		r.Message = fmt.Sprintf("workspace.name not set (using derived name %q); %s", cfg.ResolvedWorkspaceName, summary)
-		return r
-	}
+	summary := fmt.Sprintf("city.toml loaded (%d agents, %d rigs); effective city name %q", len(cfg.Agents), len(cfg.Rigs), cfg.ResolvedWorkspaceName)
 	r.Status = StatusOK
 	r.Message = summary
 	return r
@@ -165,23 +163,23 @@ func (c *ConfigRefsCheck) Run(_ *CheckContext) *CheckResult {
 	for _, a := range c.cfg.Agents {
 		qn := a.QualifiedName()
 		if a.PromptTemplate != "" {
-			path := filepath.Join(c.cityPath, a.PromptTemplate)
+			path := resolveConfigRefPath(c.cityPath, a.PromptTemplate)
 			if _, err := os.Stat(path); err != nil {
-				issues = append(issues, fmt.Sprintf("agent %q: prompt_template %q not found", qn, a.PromptTemplate))
+				issues = append(issues, fmt.Sprintf("agent %q: prompt_template %q not found", qn, path))
 			}
 		}
 		if a.SessionSetupScript != "" {
-			path := filepath.Join(c.cityPath, a.SessionSetupScript)
+			path := resolveConfigRefPath(c.cityPath, a.SessionSetupScript)
 			if _, err := os.Stat(path); err != nil {
-				issues = append(issues, fmt.Sprintf("agent %q: session_setup_script %q not found", qn, a.SessionSetupScript))
+				issues = append(issues, fmt.Sprintf("agent %q: session_setup_script %q not found", qn, path))
 			}
 		}
 		if a.OverlayDir != "" {
-			path := filepath.Join(c.cityPath, a.OverlayDir)
+			path := resolveConfigRefPath(c.cityPath, a.OverlayDir)
 			if fi, err := os.Stat(path); err != nil {
-				issues = append(issues, fmt.Sprintf("agent %q: overlay_dir %q not found", qn, a.OverlayDir))
+				issues = append(issues, fmt.Sprintf("agent %q: overlay_dir %q not found", qn, path))
 			} else if !fi.IsDir() {
-				issues = append(issues, fmt.Sprintf("agent %q: overlay_dir %q is not a directory", qn, a.OverlayDir))
+				issues = append(issues, fmt.Sprintf("agent %q: overlay_dir %q is not a directory", qn, path))
 			}
 		}
 		if a.Provider != "" && len(c.cfg.Providers) > 0 {
@@ -208,6 +206,16 @@ func (c *ConfigRefsCheck) CanFix() bool { return false }
 // Fix is a no-op.
 func (c *ConfigRefsCheck) Fix(_ *CheckContext) error { return nil }
 
+// resolveConfigRefPath resolves an agent config path reference against the
+// city root. Schema=2 packs emit absolute paths; legacy [[agent]] tables
+// use city-relative paths, so guard against double-rooting before joining.
+func resolveConfigRefPath(cityPath, p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(cityPath, p)
+}
+
 // BuiltinPackFamilyCheck fails when a city overrides only one member of the
 // builtin bd/dolt pack family. Mixed system/user families are unsupported.
 type BuiltinPackFamilyCheck struct {
@@ -231,7 +239,7 @@ func (c *BuiltinPackFamilyCheck) Run(_ *CheckContext) *CheckResult {
 	if v := os.Getenv("GC_BEADS"); v != "" {
 		provider = v
 	}
-	if provider != "" && provider != "bd" {
+	if !providerUsesBDDoltStore(provider) {
 		r.Status = StatusOK
 		r.Message = "builtin bd/dolt pack family not required"
 		return r
@@ -545,7 +553,8 @@ func (c *OrphanSessionsCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	prefix := "" // per-city socket isolation: all sessions belong to this city
 	running, err := c.sp.ListRunning(prefix)
-	if err != nil {
+	partialList := runtime.IsPartialListError(err)
+	if err != nil && !partialList {
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("listing sessions: %v", err)
 		return r
@@ -566,12 +575,21 @@ func (c *OrphanSessionsCheck) Run(_ *CheckContext) *CheckResult {
 	}
 
 	if len(orphans) == 0 {
+		if partialList {
+			r.Status = StatusWarning
+			r.Message = fmt.Sprintf("listing sessions partially failed: %v", err)
+			return r
+		}
 		r.Status = StatusOK
 		r.Message = "no orphaned sessions"
 		return r
 	}
 	r.Status = StatusWarning
-	r.Message = fmt.Sprintf("%d orphaned session(s)", len(orphans))
+	if partialList {
+		r.Message = fmt.Sprintf("listing sessions partially failed: %v (%d visible orphaned session(s))", err, len(orphans))
+	} else {
+		r.Message = fmt.Sprintf("%d orphaned session(s)", len(orphans))
+	}
 	r.Details = orphans
 	return r
 }
@@ -583,6 +601,9 @@ func (c *OrphanSessionsCheck) CanFix() bool { return true }
 func (c *OrphanSessionsCheck) Fix(_ *CheckContext) error {
 	prefix := "" // per-city socket isolation: all sessions belong to this city
 	running, err := c.sp.ListRunning(prefix)
+	if runtime.IsPartialListError(err) {
+		return fmt.Errorf("listing sessions partially failed: %w", err)
+	}
 	if err != nil {
 		return err
 	}
@@ -621,6 +642,26 @@ func (c *BeadsStoreCheck) Name() string { return "beads-store" }
 // Run opens the store and pings it to verify accessibility.
 func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
+	target, fixHint, active, err := validateBDStoreTarget(c.cityPath, c.cityPath)
+	if err != nil {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("resolve dolt target: %v", err)
+		if active {
+			r.FixHint = fixHint
+		}
+		return r
+	}
+	if active {
+		addr := net.JoinHostPort(target.Host, target.Port)
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			r.Status = StatusError
+			r.Message = fmt.Sprintf("dolt server not reachable at %s", addr)
+			r.FixHint = doltServerFixHint(target)
+			return r
+		}
+		conn.Close() //nolint:errcheck // best-effort close
+	}
 	store, err := c.newStore(c.cityPath)
 	if err != nil {
 		r.Status = StatusError
@@ -642,6 +683,378 @@ func (c *BeadsStoreCheck) CanFix() bool { return false }
 
 // Fix is a no-op.
 func (c *BeadsStoreCheck) Fix(_ *CheckContext) error { return nil }
+
+// BDSplitStoreCheck warns when legacy bd embedded/server store directories
+// coexist and the inactive store still contains Dolt data.
+type BDSplitStoreCheck struct {
+	cityPath  string
+	name      string
+	scopePath string
+}
+
+// NewBDSplitStoreCheck creates a city-level split-store check.
+func NewBDSplitStoreCheck(scopePath string) *BDSplitStoreCheck {
+	return &BDSplitStoreCheck{cityPath: scopePath, name: "bd-split-store", scopePath: scopePath}
+}
+
+// NewRigBDSplitStoreCheck creates a rig-level split-store check.
+func NewRigBDSplitStoreCheck(cityPath string, rig config.Rig) *BDSplitStoreCheck {
+	return &BDSplitStoreCheck{cityPath: cityPath, name: "rig:" + rig.Name + ":bd-split-store", scopePath: rig.Path}
+}
+
+// Name returns the check identifier.
+func (c *BDSplitStoreCheck) Name() string { return c.name }
+
+// Run detects legacy split bd store directories and reports inactive Dolt repos.
+func (c *BDSplitStoreCheck) Run(_ *CheckContext) *CheckResult {
+	r := &CheckResult{Name: c.Name()}
+	beadsDir := filepath.Join(c.scopePath, ".beads")
+	serverDir := filepath.Join(beadsDir, "dolt")
+	embeddedDir := filepath.Join(beadsDir, "embeddeddolt")
+
+	serverExists := splitStoreDirExists(serverDir)
+	embeddedExists := splitStoreDirExists(embeddedDir)
+	if !serverExists || !embeddedExists {
+		r.Status = StatusOK
+		r.Message = "no legacy split store detected"
+		return r
+	}
+
+	serverRepos, serverErr := doltReposUnder(serverDir)
+	embeddedRepos, embeddedErr := doltReposUnder(embeddedDir)
+	if serverErr != nil || embeddedErr != nil {
+		r.Status = StatusWarning
+		r.Message = "could not inspect legacy bd split store directories"
+		r.FixHint = "inspect .beads/dolt and .beads/embeddeddolt manually before deleting either directory"
+		if serverErr != nil {
+			r.Details = append(r.Details, fmt.Sprintf("scan .beads/dolt: %v", serverErr))
+		}
+		if embeddedErr != nil {
+			r.Details = append(r.Details, fmt.Sprintf("scan .beads/embeddeddolt: %v", embeddedErr))
+		}
+		return r
+	}
+
+	activeSource, activeStore := c.activeBDStore(beadsDir)
+	if activeStore == "" {
+		if len(serverRepos)+len(embeddedRepos) == 0 {
+			r.Status = StatusOK
+			r.Message = "legacy split store directories present but no Dolt repos found"
+			return r
+		}
+		r.Status = StatusWarning
+		r.Message = "legacy split store detected: both .beads/dolt and .beads/embeddeddolt contain or may contain data, but no active local store was identified"
+		r.Details = splitStoreDetails("unknown", activeSource, serverRepos, embeddedRepos)
+		r.FixHint = splitStoreFixHint("unknown")
+		return r
+	}
+
+	inactiveStore := "embeddeddolt"
+	inactiveRepos := embeddedRepos
+	if activeStore == "embeddeddolt" {
+		inactiveStore = "dolt"
+		inactiveRepos = serverRepos
+	}
+	if len(inactiveRepos) == 0 {
+		r.Status = StatusOK
+		r.Message = "legacy split store directories present but inactive store is empty"
+		return r
+	}
+
+	r.Status = StatusWarning
+	r.Message = fmt.Sprintf("legacy split store detected: active .beads/%s (%s), inactive .beads/%s contains %d Dolt repo(s)", activeStore, activeSource, inactiveStore, len(inactiveRepos))
+	r.Details = splitStoreDetails(activeStore, activeSource, serverRepos, embeddedRepos)
+	r.FixHint = splitStoreFixHint(activeStore)
+	return r
+}
+
+// CanFix returns false; reconciliation requires explicit user review.
+func (c *BDSplitStoreCheck) CanFix() bool { return false }
+
+// Fix is a no-op.
+func (c *BDSplitStoreCheck) Fix(_ *CheckContext) error { return nil }
+
+func (c *BDSplitStoreCheck) activeBDStore(beadsDir string) (string, string) {
+	activeSource, activeStore := activeBDStoreFromMetadata(filepath.Join(beadsDir, "metadata.json"))
+	if c.cityPath == "" {
+		return activeSource, activeStore
+	}
+	if !scopeUsesBDDoltStore(c.cityPath, c.scopePath) {
+		return activeSource, ""
+	}
+	resolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, c.cityPath, c.scopePath, "")
+	if err != nil {
+		if source, ok := c.rawNonLocalEndpointSource(); ok {
+			return source, ""
+		}
+		if source, ok := c.rawCityNonLocalEndpointSource(); ok {
+			return source, ""
+		}
+		return activeSource, activeStore
+	}
+	if resolved.Kind != contract.ScopeConfigAuthoritative {
+		if source, ok := c.rawCityNonLocalEndpointSource(); ok {
+			return source, ""
+		}
+		return activeSource, activeStore
+	}
+	switch resolved.State.EndpointOrigin {
+	case contract.EndpointOriginManagedCity:
+		if sameDoctorScope(c.cityPath, c.scopePath) {
+			return "canonical endpoint_origin=" + string(resolved.State.EndpointOrigin), "dolt"
+		}
+		return "canonical endpoint_origin=" + string(resolved.State.EndpointOrigin), ""
+	case contract.EndpointOriginCityCanonical, contract.EndpointOriginExplicit, contract.EndpointOriginInheritedCity:
+		return "canonical endpoint_origin=" + string(resolved.State.EndpointOrigin), ""
+	default:
+		return activeSource, activeStore
+	}
+}
+
+func (c *BDSplitStoreCheck) rawNonLocalEndpointSource() (string, bool) {
+	return rawNonLocalEndpointSource(c.scopePath)
+}
+
+func (c *BDSplitStoreCheck) rawCityNonLocalEndpointSource() (string, bool) {
+	if sameDoctorScope(c.cityPath, c.scopePath) {
+		return "", false
+	}
+	return rawNonLocalEndpointSource(c.cityPath)
+}
+
+func rawNonLocalEndpointSource(scopePath string) (string, bool) {
+	cfg, ok, err := contract.ReadConfigState(fsys.OSFS{}, filepath.Join(scopePath, ".beads", "config.yaml"))
+	if err != nil || !ok {
+		return "", false
+	}
+	switch cfg.EndpointOrigin {
+	case contract.EndpointOriginCityCanonical, contract.EndpointOriginExplicit, contract.EndpointOriginInheritedCity:
+		return "canonical endpoint_origin=" + string(cfg.EndpointOrigin), true
+	default:
+		return "", false
+	}
+}
+
+func activeBDStoreFromMetadata(path string) (string, string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	var meta struct {
+		Database string `json:"database"`
+		Backend  string `json:"backend"`
+		DoltMode string `json:"dolt_mode"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return "", ""
+	}
+	mode := strings.ToLower(strings.TrimSpace(meta.DoltMode))
+	database := strings.ToLower(strings.TrimSpace(meta.Database))
+	backend := strings.ToLower(strings.TrimSpace(meta.Backend))
+	declaresNonDoltStore := (database != "" && database != "dolt") || (backend != "" && backend != "dolt")
+	declaresDoltStore := database == "dolt" || backend == "dolt"
+	if mode != "" && declaresNonDoltStore && !declaresDoltStore {
+		return mode, ""
+	}
+	switch mode {
+	case "server":
+		return "metadata.json dolt_mode=" + mode, "dolt"
+	case "embedded", "local":
+		return "metadata.json dolt_mode=" + mode, "embeddeddolt"
+	default:
+		return mode, ""
+	}
+}
+
+func sameDoctorScope(a, b string) bool {
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func splitStoreDetails(activeStore, activeSource string, serverRepos, embeddedRepos []string) []string {
+	activeLine := "active store: unknown"
+	recoveryLine := "recovery: export from copies of the legacy stores, review with bd import --dry-run, then import into the current or intended active store"
+	if activeStore != "unknown" && activeStore != "" {
+		activeLine = fmt.Sprintf("active store: .beads/%s (%s)", activeStore, activeSource)
+		recoveryLine = "recovery: export from a copy of the inactive store, review with bd import --dry-run, then import into the active store"
+	}
+	details := []string{
+		activeLine,
+		fmt.Sprintf(".beads/dolt repositories: %s", describeRepoList(serverRepos)),
+		fmt.Sprintf(".beads/embeddeddolt repositories: %s", describeRepoList(embeddedRepos)),
+		recoveryLine,
+	}
+	return details
+}
+
+func splitStoreFixHint(activeStore string) string {
+	if activeStore == "" || activeStore == "unknown" {
+		return "export from each legacy store into backup JSONL, review with bd import --dry-run, then import into the current or intended active store; keep both directories until reconciled"
+	}
+	return "export from the inactive store into a backup JSONL, review with bd import --dry-run, then import into the active store; keep both directories until reconciled"
+}
+
+func describeRepoList(repos []string) string {
+	if len(repos) == 0 {
+		return "(none)"
+	}
+	return strings.Join(repos, ", ")
+}
+
+func doltReposUnder(root string) ([]string, error) {
+	var repos []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if d.Name() == ".dolt" {
+			return filepath.SkipDir
+		}
+		if !splitStoreDirExists(filepath.Join(path, ".dolt")) {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil || rel == "." {
+			rel = filepath.Base(path)
+		}
+		repos = append(repos, filepath.ToSlash(rel))
+		return filepath.SkipDir
+	})
+	sort.Strings(repos)
+	return repos, err
+}
+
+func splitStoreDirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func validateBDStoreTarget(cityPath, scopeRoot string) (contract.DoltConnectionTarget, string, bool, error) {
+	if !scopeUsesBDDoltStore(cityPath, scopeRoot) {
+		return contract.DoltConnectionTarget{}, "", false, nil
+	}
+	resolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, scopeRoot, "")
+	if err != nil {
+		return contract.DoltConnectionTarget{}, "reconcile the canonical Dolt endpoint", true, err
+	}
+	if resolved.Kind == contract.ScopeConfigMissing {
+		return contract.DoltConnectionTarget{}, "", false, nil
+	}
+	target, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityPath, scopeRoot)
+	if err != nil {
+		return contract.DoltConnectionTarget{}, fixHintForBDScopeResolution(cityPath, resolved), true, err
+	}
+	return target, "", true, nil
+}
+
+func fixHintForBDScopeResolution(cityPath string, resolved contract.ScopeConfigResolution) string {
+	if resolved.Kind == contract.ScopeConfigAuthoritative {
+		origin := resolved.State.EndpointOrigin
+		if origin == contract.EndpointOriginInheritedCity {
+			if cityState, ok, err := contract.ResolveAuthoritativeConfigState(fsys.OSFS{}, cityPath, cityPath, ""); err == nil && ok {
+				origin = cityState.EndpointOrigin
+			}
+		}
+		return doltServerFixHint(contract.DoltConnectionTarget{EndpointOrigin: origin})
+	}
+	return resolveDoltServerFixHint(fsys.OSFS{}, cityPath)
+}
+
+func providerUsesBDDoltStore(provider string) bool {
+	provider = strings.TrimSpace(provider)
+	if provider == "" || provider == "bd" {
+		return true
+	}
+	if strings.HasPrefix(provider, "exec:") && doctorExecProviderBase(provider) == "gc-beads-bd" {
+		return true
+	}
+	return false
+}
+
+func doctorExecProviderBase(provider string) string {
+	script := strings.TrimSpace(strings.TrimPrefix(provider, "exec:"))
+	return strings.TrimSuffix(filepath.Base(script), ".sh")
+}
+
+func effectiveDoctorBeadsProvider(cityPath string) string {
+	if v := strings.TrimSpace(os.Getenv("GC_BEADS")); v != "" {
+		return v
+	}
+	return configuredDoctorBeadsProvider(cityPath)
+}
+
+func configuredDoctorBeadsProvider(cityPath string) string {
+	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
+	if err != nil {
+		return "bd"
+	}
+	return cfg.Beads.Provider
+}
+
+func scopeUsesBDDoltStore(cityPath, scopePath string) bool {
+	resolvedScope := resolveDoctorScopePath(cityPath, scopePath)
+	if explicit, ok := scopedDoctorBeadsProviderOverride(cityPath, resolvedScope); ok {
+		return providerUsesBDDoltStore(explicit)
+	}
+	provider := effectiveDoctorBeadsProvider(cityPath)
+	if strings.TrimSpace(os.Getenv("GC_BEADS_SCOPE_ROOT")) != "" {
+		provider = configuredDoctorBeadsProvider(cityPath)
+	}
+	if sameDoctorScope(resolvedScope, cityPath) {
+		return providerUsesBDDoltStore(provider)
+	}
+	if strings.HasPrefix(strings.TrimSpace(provider), "exec:") && !providerUsesBDDoltStore(provider) {
+		return false
+	}
+	if doctorScopeHasBDMetadata(resolvedScope) {
+		return true
+	}
+	if doctorScopeHasFileStoreMarker(resolvedScope) {
+		return false
+	}
+	return providerUsesBDDoltStore(provider)
+}
+
+func scopedDoctorBeadsProviderOverride(cityPath, scopePath string) (string, bool) {
+	provider := strings.TrimSpace(os.Getenv("GC_BEADS"))
+	if provider == "" {
+		return "", false
+	}
+	scopedRoot := strings.TrimSpace(os.Getenv("GC_BEADS_SCOPE_ROOT"))
+	if scopedRoot == "" {
+		return provider, true
+	}
+	if sameDoctorScope(resolveDoctorScopePath(cityPath, scopedRoot), scopePath) {
+		return provider, true
+	}
+	return "", false
+}
+
+func resolveDoctorScopePath(cityPath, scopePath string) string {
+	scopePath = strings.TrimSpace(scopePath)
+	if scopePath == "" {
+		scopePath = cityPath
+	}
+	if !filepath.IsAbs(scopePath) {
+		scopePath = filepath.Join(cityPath, scopePath)
+	}
+	return filepath.Clean(scopePath)
+}
+
+func doctorScopeHasBDMetadata(scopePath string) bool {
+	info, err := os.Stat(filepath.Join(scopePath, ".beads", "metadata.json"))
+	return err == nil && !info.IsDir()
+}
+
+func doctorScopeHasFileStoreMarker(scopePath string) bool {
+	if doctorScopeHasBDMetadata(scopePath) {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(scopePath, ".gc", "beads.json"))
+	return err == nil && !info.IsDir()
+}
 
 // DoltServerCheck verifies the dolt server is running and reachable.
 type DoltServerCheck struct {
@@ -667,35 +1080,21 @@ func (c *DoltServerCheck) Run(_ *CheckContext) *CheckResult {
 		return r
 	}
 
-	// Determine host and port.
-	// Priority: GC_DOLT_PORT env → .beads/dolt-server.port file → error.
-	// The old default of 3307 was wrong — gc-beads-bd uses hashed ephemeral
-	// ports, not the default MySQL port.
-	host := os.Getenv("GC_DOLT_HOST")
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	port := os.Getenv("GC_DOLT_PORT")
-	if port == "" {
-		portFile := filepath.Join(c.cityPath, ".beads", "dolt-server.port")
-		if data, err := os.ReadFile(portFile); err == nil {
-			port = strings.TrimSpace(string(data))
-		}
-	}
-	if port == "" {
-		r.Status = StatusWarning
-		r.Message = "dolt server port unknown (no GC_DOLT_PORT and no .beads/dolt-server.port)"
-		r.FixHint = "run gc start to start the dolt server"
+	target, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, c.cityPath, c.cityPath)
+	if err != nil {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("resolve dolt target: %v", err)
+		r.FixHint = resolveDoltServerFixHint(fsys.OSFS{}, c.cityPath)
 		return r
 	}
-	addr := net.JoinHostPort(host, port)
+	addr := net.JoinHostPort(target.Host, target.Port)
 
 	// Check TCP reachability.
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("dolt server not reachable at %s", addr)
-		r.FixHint = "run gc start to start the dolt server"
+		r.FixHint = doltServerFixHint(target)
 		return r
 	}
 	conn.Close() //nolint:errcheck // best-effort close
@@ -710,6 +1109,99 @@ func (c *DoltServerCheck) CanFix() bool { return false }
 
 // Fix is a no-op.
 func (c *DoltServerCheck) Fix(_ *CheckContext) error { return nil }
+
+// RigDoltServerCheck verifies a rig-local explicit Dolt endpoint is reachable.
+type RigDoltServerCheck struct {
+	cityPath string
+	rig      config.Rig
+	skip     bool
+}
+
+// NewRigDoltServerCheck creates a check for an explicit rig Dolt endpoint.
+func NewRigDoltServerCheck(cityPath string, rig config.Rig, skip bool) *RigDoltServerCheck {
+	return &RigDoltServerCheck{cityPath: cityPath, rig: rig, skip: skip}
+}
+
+// Name returns the check identifier.
+func (c *RigDoltServerCheck) Name() string { return "rig:" + c.rig.Name + ":dolt-server" }
+
+// Run checks if an explicit rig Dolt endpoint is reachable. Inherited rigs are
+// handled by the city-level DoltServerCheck and therefore skip here.
+func (c *RigDoltServerCheck) Run(_ *CheckContext) *CheckResult {
+	r := &CheckResult{Name: c.Name()}
+	if c.skip {
+		r.Status = StatusOK
+		r.Message = "skipped (file backend or GC_DOLT=skip)"
+		return r
+	}
+	rigPath := c.rig.Path
+	if !filepath.IsAbs(rigPath) {
+		rigPath = filepath.Join(c.cityPath, rigPath)
+	}
+	if err := contract.ValidateInheritedCityEndpointMirror(fsys.OSFS{}, c.cityPath, rigPath); err != nil {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("inherited city endpoint drift: %v", err)
+		r.FixHint = "reconcile the inherited city endpoint mirror"
+		return r
+	}
+	explicit, err := contract.ScopeUsesExplicitEndpoint(fsys.OSFS{}, c.cityPath, rigPath)
+	if err != nil {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("resolve dolt target: %v", err)
+		r.FixHint = "reconcile the canonical external Dolt endpoint"
+		return r
+	}
+	if !explicit {
+		r.Status = StatusOK
+		r.Message = "inherits city dolt endpoint"
+		return r
+	}
+	target, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, c.cityPath, rigPath)
+	if err != nil {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("resolve dolt target: %v", err)
+		r.FixHint = "reconcile the canonical external Dolt endpoint"
+		return r
+	}
+	addr := net.JoinHostPort(target.Host, target.Port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("dolt server not reachable at %s", addr)
+		r.FixHint = doltServerFixHint(target)
+		return r
+	}
+	conn.Close() //nolint:errcheck // best-effort close
+
+	r.Status = StatusOK
+	r.Message = fmt.Sprintf("reachable on %s", addr)
+	return r
+}
+
+// CanFix returns false.
+func (c *RigDoltServerCheck) CanFix() bool { return false }
+
+// Fix is a no-op.
+func (c *RigDoltServerCheck) Fix(_ *CheckContext) error { return nil }
+
+func resolveDoltServerFixHint(fs fsys.FS, cityPath string) string {
+	state, ok, err := contract.ResolveAuthoritativeConfigState(fs, cityPath, cityPath, "")
+	if err != nil || !ok {
+		return "reconcile the canonical Dolt endpoint"
+	}
+	return doltServerFixHint(contract.DoltConnectionTarget{EndpointOrigin: state.EndpointOrigin})
+}
+
+func doltServerFixHint(target contract.DoltConnectionTarget) string {
+	switch target.EndpointOrigin {
+	case contract.EndpointOriginManagedCity:
+		return "run gc start to start the dolt server"
+	case contract.EndpointOriginCityCanonical, contract.EndpointOriginExplicit, contract.EndpointOriginInheritedCity:
+		return "reconcile the canonical external Dolt endpoint"
+	default:
+		return "reconcile the canonical Dolt endpoint"
+	}
+}
 
 // EventsLogCheck verifies .gc/events.jsonl exists and is writable.
 type EventsLogCheck struct{}
@@ -854,13 +1346,14 @@ func (c *RigGitCheck) Fix(_ *CheckContext) error { return nil }
 
 // RigBeadsCheck verifies a rig's beads store is accessible.
 type RigBeadsCheck struct {
+	cityPath string
 	rig      config.Rig
 	newStore func(rigPath string) (beads.Store, error)
 }
 
 // NewRigBeadsCheck creates a rig beads store accessibility check.
-func NewRigBeadsCheck(rig config.Rig, newStore func(string) (beads.Store, error)) *RigBeadsCheck {
-	return &RigBeadsCheck{rig: rig, newStore: newStore}
+func NewRigBeadsCheck(cityPath string, rig config.Rig, newStore func(string) (beads.Store, error)) *RigBeadsCheck {
+	return &RigBeadsCheck{cityPath: cityPath, rig: rig, newStore: newStore}
 }
 
 // Name returns the check identifier.
@@ -869,7 +1362,31 @@ func (c *RigBeadsCheck) Name() string { return "rig:" + c.rig.Name + ":beads" }
 // Run opens the rig's bead store and pings it to verify accessibility.
 func (c *RigBeadsCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
-	store, err := c.newStore(c.rig.Path)
+	rigPath := c.rig.Path
+	if !filepath.IsAbs(rigPath) {
+		rigPath = filepath.Join(c.cityPath, rigPath)
+	}
+	target, fixHint, active, err := validateBDStoreTarget(c.cityPath, rigPath)
+	if err != nil {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("resolve dolt target: %v", err)
+		if active {
+			r.FixHint = fixHint
+		}
+		return r
+	}
+	if active {
+		addr := net.JoinHostPort(target.Host, target.Port)
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			r.Status = StatusError
+			r.Message = fmt.Sprintf("dolt server not reachable at %s", addr)
+			r.FixHint = doltServerFixHint(target)
+			return r
+		}
+		conn.Close() //nolint:errcheck // best-effort close
+	}
+	store, err := c.newStore(rigPath)
 	if err != nil {
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("store open failed: %v", err)
@@ -1037,84 +1554,6 @@ func isWorktreeValid(wtPath string) bool {
 	return err == nil
 }
 
-// --- System formulas check ---
-
-// SystemFormulasCheck verifies formulas/ and orders/ contain all expected
-// system files with correct content.
-type SystemFormulasCheck struct {
-	CityPath string
-	// Expected is the list of relative paths from ListEmbeddedSystemFormulas.
-	// Order files (orders/*) are checked under orders/; formula files under formulas/.
-	Expected []string
-	// ExpectedContent maps relative path → file content for staleness detection.
-	// If nil, only presence is checked (not content).
-	ExpectedContent map[string][]byte
-	// FixFn re-materializes system formulas. Called by Fix().
-	FixFn func() error
-}
-
-// Name returns the check identifier.
-func (c *SystemFormulasCheck) Name() string { return "system-formulas" }
-
-// systemFileAbsPath returns the absolute path for a system formula/order
-// file. Orders (orders/*) resolve under the city orders/ directory;
-// formulas resolve under formulas/.
-func (c *SystemFormulasCheck) systemFileAbsPath(rel string) string {
-	if strings.HasPrefix(rel, "orders/") {
-		return filepath.Join(c.CityPath, citylayout.OrdersRoot, strings.TrimPrefix(rel, "orders/"))
-	}
-	return filepath.Join(c.CityPath, citylayout.FormulasRoot, rel)
-}
-
-// Run checks that the formulas/ and orders/ directories have all expected system files.
-func (c *SystemFormulasCheck) Run(_ *CheckContext) *CheckResult {
-	r := &CheckResult{Name: c.Name()}
-
-	if len(c.Expected) == 0 {
-		r.Status = StatusOK
-		r.Message = "no system formulas expected"
-		return r
-	}
-
-	var stale []string
-	for _, rel := range c.Expected {
-		path := c.systemFileAbsPath(rel)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			stale = append(stale, rel+" (missing)")
-			continue
-		}
-		if c.ExpectedContent != nil {
-			if expected, ok := c.ExpectedContent[rel]; ok && string(data) != string(expected) {
-				stale = append(stale, rel+" (stale)")
-			}
-		}
-	}
-
-	if len(stale) == 0 {
-		r.Status = StatusOK
-		r.Message = fmt.Sprintf("all %d system formula(s) present", len(c.Expected))
-		return r
-	}
-
-	r.Status = StatusError
-	r.Message = fmt.Sprintf("%d system formula(s) missing or stale", len(stale))
-	r.Details = stale
-	r.FixHint = "run gc doctor --fix to re-materialize"
-	return r
-}
-
-// CanFix returns true — system formulas can be re-materialized.
-func (c *SystemFormulasCheck) CanFix() bool { return c.FixFn != nil }
-
-// Fix re-materializes system formulas from the embedded FS.
-func (c *SystemFormulasCheck) Fix(_ *CheckContext) error {
-	if c.FixFn == nil {
-		return fmt.Errorf("no fix function provided")
-	}
-	return c.FixFn()
-}
-
 // IsControllerRunning probes the controller lock file to determine if a
 // controller is currently running. It tries to acquire the flock — if it
 // fails with EWOULDBLOCK, the controller holds the lock.
@@ -1135,131 +1574,4 @@ func IsControllerRunning(cityPath string) bool {
 	// We got the lock, release immediately — no controller running.
 	syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck // best-effort unlock
 	return false
-}
-
-// --- Global rig index checks ---
-
-// RigIndexCheck verifies that all rigs in the current city's city.toml
-// are registered in the global cities.toml rig index, and that each rig's
-// .beads/.env has the correct GT_ROOT.
-type RigIndexCheck struct {
-	// RegistryPath is the path to cities.toml. If empty, uses the default.
-	RegistryPath string
-	// FixFn is called during Fix to backfill entries. If nil, fix is unavailable.
-	FixFn func(cityPath string) error
-	// missing is populated by Run for use by Fix.
-	missing []rigIndexIssue
-}
-
-type rigIndexIssue struct {
-	rigName  string
-	rigPath  string
-	issue    string // "not_registered", "wrong_default", "missing_gt_root", "wrong_gt_root"
-	cityPath string
-}
-
-// Name returns the check identifier.
-func (c *RigIndexCheck) Name() string { return "rig-index" }
-
-// Run checks global rig index consistency.
-func (c *RigIndexCheck) Run(ctx *CheckContext) *CheckResult {
-	r := &CheckResult{Name: c.Name()}
-	c.missing = nil
-
-	regPath := c.RegistryPath
-	if regPath == "" {
-		regPath = supervisor.RegistryPath()
-	}
-
-	reg := supervisor.NewRegistry(regPath)
-	cfg, err := config.Load(fsys.OSFS{}, filepath.Join(ctx.CityPath, "city.toml"))
-	if err != nil {
-		r.Status = StatusWarning
-		r.Message = fmt.Sprintf("cannot load city config: %v", err)
-		return r
-	}
-
-	for _, rig := range cfg.Rigs {
-		rigPath := rig.Path
-		if !filepath.IsAbs(rigPath) {
-			rigPath = filepath.Join(ctx.CityPath, rigPath)
-		}
-		rigPath = filepath.Clean(rigPath)
-
-		// Check global registry.
-		entry, ok := reg.LookupRigByName(rig.Name)
-		if !ok {
-			c.missing = append(c.missing, rigIndexIssue{
-				rigName: rig.Name, rigPath: rigPath,
-				issue: "not_registered", cityPath: ctx.CityPath,
-			})
-			r.Details = append(r.Details, fmt.Sprintf("rig %q not in global index", rig.Name))
-			continue
-		}
-
-		// Check default_city.
-		if entry.DefaultCity == "" {
-			c.missing = append(c.missing, rigIndexIssue{
-				rigName: rig.Name, rigPath: rigPath,
-				issue: "wrong_default", cityPath: ctx.CityPath,
-			})
-			r.Details = append(r.Details, fmt.Sprintf("rig %q has no default city", rig.Name))
-		}
-
-		// Check .beads/.env GT_ROOT.
-		envPath := filepath.Join(rigPath, ".beads", ".env")
-		envData, envErr := os.ReadFile(envPath)
-		if envErr != nil {
-			c.missing = append(c.missing, rigIndexIssue{
-				rigName: rig.Name, rigPath: rigPath,
-				issue: "missing_gt_root", cityPath: ctx.CityPath,
-			})
-			r.Details = append(r.Details, fmt.Sprintf("rig %q: .beads/.env missing", rig.Name))
-			continue
-		}
-		gtRoot := parseGTRoot(string(envData))
-		expectedCity := entry.DefaultCity
-		if expectedCity == "" {
-			expectedCity = ctx.CityPath
-		}
-		if gtRoot != expectedCity {
-			c.missing = append(c.missing, rigIndexIssue{
-				rigName: rig.Name, rigPath: rigPath,
-				issue: "wrong_gt_root", cityPath: ctx.CityPath,
-			})
-			r.Details = append(r.Details, fmt.Sprintf("rig %q: GT_ROOT=%s, want %s", rig.Name, gtRoot, expectedCity))
-		}
-	}
-
-	if len(c.missing) == 0 {
-		r.Status = StatusOK
-		r.Message = fmt.Sprintf("all %d rigs in global index with correct .beads/.env", len(cfg.Rigs))
-		return r
-	}
-
-	r.Status = StatusWarning
-	r.Message = fmt.Sprintf("%d rig index issues found", len(c.missing))
-	r.FixHint = "run \"gc doctor --fix\" to backfill"
-	return r
-}
-
-// CanFix returns true when a fix function is provided.
-func (c *RigIndexCheck) CanFix() bool { return c.FixFn != nil }
-
-// Fix backfills missing rig index entries and .beads/.env.
-func (c *RigIndexCheck) Fix(ctx *CheckContext) error {
-	if c.FixFn != nil {
-		return c.FixFn(ctx.CityPath)
-	}
-	return fmt.Errorf("no fix function provided")
-}
-
-// parseGTRoot extracts the GT_ROOT value from .env file content.
-func parseGTRoot(content string) string {
-	for _, line := range strings.Split(content, "\n") {
-		if strings.HasPrefix(line, "GT_ROOT=") {
-			return strings.TrimPrefix(line, "GT_ROOT=")
-		}
-	}
-	return ""
 }

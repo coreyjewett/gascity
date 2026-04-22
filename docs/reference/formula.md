@@ -3,13 +3,15 @@ title: Formula Files
 description: Structure and placement of Gas City formula files.
 ---
 
-Gas City resolves formula files from configured formula layers and stages the
-winning `*.formula.toml` files into `.beads/formulas/` with
+Gas City resolves formula files from PackV2 formula layers and stages the
+winning formula files into `.beads/formulas/` with
 [`ResolveFormulas`](https://github.com/gastownhall/gascity/blob/main/cmd/gc/formula_resolve.go).
 
-Formula instantiation happens through the store interface:
+Formula instantiation happens via the CLI or the store interface:
 
-- `Store.MolCook(formula, title, vars)` creates a new molecule or wisp
+- `gc formula cook <name>` creates a molecule (every step materialized as a bead)
+- `gc sling <target> <name> --formula` creates a wisp (lightweight, ephemeral)
+- `Store.MolCook(formula, title, vars)` creates a molecule or wisp programmatically
 - `Store.MolCookOn(formula, beadID, title, vars)` attaches a molecule to an
   existing bead
 
@@ -41,7 +43,7 @@ needs = ["dry", "wet"]
 
 | Key | Type | Purpose |
 |---|---|---|
-| `formula` | string | Unique formula name used by `gc mol create` and `Store.MolCook*` |
+| `formula` | string | Unique formula name used by `gc formula cook`, `gc sling --formula`, and `Store.MolCook*` |
 | `description` | string | Human-readable description |
 | `version` | integer | Optional formula version marker |
 | `extends` | []string | Optional parent formulas to compose from |
@@ -57,6 +59,11 @@ molecule.
 | `title` | string | Short step title |
 | `description` | string | Step instructions shown to the agent |
 | `needs` | []string | Step IDs that must complete before this step is ready |
+| `condition` | string | Equality expression (`{{var}} == value` or `!=`) — step is excluded when false |
+| `children` | []step | Nested sub-steps; parent acts as a container dependency |
+| `loop` | object | Static loop expansion: `count` iterations at compile time |
+| `check` | object | Runtime retry: `max_attempts` with a `check` script after each attempt |
+| `timeout` | duration string | Default timeout for this step's `check` script; `check.check.timeout` takes precedence |
 
 ## Variable Substitution
 
@@ -64,7 +71,7 @@ Formula descriptions can use `{{key}}` placeholders. Variables are supplied as
 `key=value` pairs when the formula is instantiated, for example:
 
 ```bash
-gc sling --formula deploy --var env=prod worker
+gc sling worker deploy --formula --var env=prod
 ```
 
 ## Convergence-Specific Fields
@@ -80,9 +87,17 @@ Convergence uses a formula subset defined in
 
 ## Where Formulas Come From
 
-- City-level layers are resolved from `[formulas].dir`
-- Rig-local overrides come from `[[rigs]].formulas_dir`
-- Pack formulas participate through pack composition and formula layers
+PackV2 formula discovery is convention-based:
+
+- a pack's reusable formulas live in `formulas/`
+- a city pack's own `formulas/` layer wins over imported pack formulas
+- rig-level imports can provide rig-specific formulas
+- imported pack formulas keep their pack provenance during resolution
+
+Legacy fields such as `[formulas].dir` and `[[rigs]].formulas_dir` may still
+appear in the config schema for migration compatibility. New packs should use
+the PackV2 `formulas/` directory convention instead of declaring formula
+directories in TOML.
 
 For the current formula-resolution behavior, see
 Architecture: Formulas & Molecules (`engdocs/architecture/formulas`).

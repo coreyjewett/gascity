@@ -2,7 +2,10 @@ package tmux
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 // fakeExecutor captures tmux command arguments for unit testing.
@@ -37,6 +40,79 @@ func (f *fakeExecutor) execute(args []string) (string, error) {
 
 func (f *fakeExecutor) executeCtx(_ context.Context, args []string) (string, error) {
 	return f.execute(args)
+}
+
+func TestNewSessionWithCommandAndEnvClearsEmptyVars(t *testing.T) {
+	exec := &fakeExecutor{}
+	tm := NewTmux()
+	tm.exec = exec
+
+	env := map[string]string{
+		"LANG":     "en_US.UTF-8",
+		"LC_ALL":   "",
+		"LC_CTYPE": "",
+	}
+	if err := tm.NewSessionWithCommandAndEnv("gc-test-locale-clear", "", "claude", env); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	if len(exec.calls) == 0 {
+		t.Fatal("no tmux calls recorded")
+	}
+
+	args := exec.calls[0]
+	joined := strings.Join(args, "\x00")
+	if !strings.Contains(joined, "\x00-e\x00LANG=en_US.UTF-8\x00") {
+		t.Fatalf("new-session args missing LANG -e flag: %v", args)
+	}
+	if got := args[len(args)-1]; got != "env -u LC_ALL -u LC_CTYPE claude" {
+		t.Fatalf("command = %q, want env -u LC_ALL -u LC_CTYPE claude", got)
+	}
+}
+
+type promptFooterExecutor struct {
+	calls [][]string
+}
+
+func (p *promptFooterExecutor) execute(args []string) (string, error) {
+	cp := make([]string, len(args))
+	copy(cp, args)
+	p.calls = append(p.calls, cp)
+	if len(args) == 0 {
+		return "", nil
+	}
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] != "-S" {
+			continue
+		}
+		lines, err := strconv.Atoi(strings.TrimPrefix(args[i+1], "-"))
+		if err != nil {
+			return "", nil
+		}
+		if lines >= promptObservationLines {
+			return strings.Join([]string{
+				"Claude Code v2.1.112",
+				"status line",
+				"❯\u00a0",
+				"",
+				"",
+				"",
+				"",
+				"",
+				"",
+				"",
+				"",
+				"",
+				"",
+				"",
+			}, "\n"), nil
+		}
+		return strings.Repeat("\n", 20), nil
+	}
+	return "", nil
+}
+
+func (p *promptFooterExecutor) executeCtx(_ context.Context, args []string) (string, error) {
+	return p.execute(args)
 }
 
 func TestRunInjectsSocketFlag(t *testing.T) {
@@ -75,6 +151,24 @@ func TestRunNoSocketFlagWhenEmpty(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("args[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestHiddenAttachedKeyBytesSupportsArrowNavigation(t *testing.T) {
+	tests := map[string]string{
+		"Up":    "\x1b[A",
+		"Down":  "\x1b[B",
+		"Right": "\x1b[C",
+		"Left":  "\x1b[D",
+	}
+	for key, want := range tests {
+		got, ok := hiddenAttachedKeyBytes(key)
+		if !ok {
+			t.Fatalf("hiddenAttachedKeyBytes(%q) not supported", key)
+		}
+		if string(got) != want {
+			t.Fatalf("hiddenAttachedKeyBytes(%q) = %q, want %q", key, string(got), want)
 		}
 	}
 }
@@ -174,5 +268,34 @@ func TestIsSessionRunningFallsBackToSessionExistsOnPaneQueryError(t *testing.T) 
 
 	if !tm.IsSessionRunning("runner") {
 		t.Fatal("IsSessionRunning = false, want true when pane query fails after session exists")
+	}
+}
+
+func TestWaitForRuntimeReadyCapturesPromptAboveBlankFooter(t *testing.T) {
+	fe := &promptFooterExecutor{}
+	tm := &Tmux{cfg: DefaultConfig(), exec: fe}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := tm.WaitForRuntimeReady(ctx, "mayor", &RuntimeConfig{
+		Tmux: &RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "},
+	}, time.Second)
+	if err != nil {
+		t.Fatalf("WaitForRuntimeReady() error = %v, want nil", err)
+	}
+
+	if len(fe.calls) == 0 {
+		t.Fatal("expected capture-pane call")
+	}
+	got := fe.calls[0]
+	want := []string{"-u", "capture-pane", "-p", "-t", "mayor", "-S", "-120"}
+	if len(got) != len(want) {
+		t.Fatalf("first call = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("first call arg %d = %q, want %q", i, got[i], want[i])
+		}
 	}
 }

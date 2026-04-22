@@ -138,6 +138,33 @@ func TestFindProbeBinaryUsesUserLocalInstallDir(t *testing.T) {
 	}
 }
 
+func TestFindProbeBinaryUsesNVMInstallDir(t *testing.T) {
+	homeDir := t.TempDir()
+	nvmBin := filepath.Join(homeDir, ".nvm", "versions", "node", "v22.14.0", "bin")
+	if err := os.MkdirAll(nvmBin, 0o755); err != nil {
+		t.Fatalf("mkdir nvm bin: %v", err)
+	}
+	writeExecutable(t, nvmBin, "claude", "#!/bin/sh\nexit 0\n")
+
+	originalPathEnv := providerProbePathEnv
+	originalGOOS := providerProbeGOOS
+	providerProbePathEnv = "/usr/local/bin:/usr/bin:/bin"
+	providerProbeGOOS = "darwin"
+	defer func() {
+		providerProbePathEnv = originalPathEnv
+		providerProbeGOOS = originalGOOS
+	}()
+
+	got, ok := findProbeBinary("claude", homeDir)
+	if !ok {
+		t.Fatal("findProbeBinary did not find nvm-installed claude")
+	}
+	want := filepath.Join(nvmBin, "claude")
+	if got != want {
+		t.Fatalf("findProbeBinary = %q, want %q", got, want)
+	}
+}
+
 func TestProbeCommandEnvUsesCuratedProbePath(t *testing.T) {
 	homeDir := t.TempDir()
 
@@ -163,6 +190,38 @@ func TestProbeCommandEnvUsesCuratedProbePath(t *testing.T) {
 	}, string(os.PathListSeparator))
 	if !slices.Contains(env, wantPath) {
 		t.Fatalf("probeCommandEnv missing curated PATH %q in %v", wantPath, env)
+	}
+}
+
+func TestProbeCommandEnvIncludesNVMInstallDir(t *testing.T) {
+	homeDir := t.TempDir()
+	nvmBin := filepath.Join(homeDir, ".nvm", "versions", "node", "v22.14.0", "bin")
+	if err := os.MkdirAll(nvmBin, 0o755); err != nil {
+		t.Fatalf("mkdir nvm bin: %v", err)
+	}
+
+	originalPathEnv := providerProbePathEnv
+	originalGOOS := providerProbeGOOS
+	providerProbePathEnv = "/usr/local/bin:/usr/bin:/bin"
+	providerProbeGOOS = "darwin"
+	defer func() {
+		providerProbePathEnv = originalPathEnv
+		providerProbeGOOS = originalGOOS
+	}()
+
+	env := probeCommandEnv(homeDir)
+	pathEntry := ""
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			pathEntry = strings.TrimPrefix(entry, "PATH=")
+			break
+		}
+	}
+	if pathEntry == "" {
+		t.Fatalf("probeCommandEnv missing PATH in %v", env)
+	}
+	if !slices.Contains(filepath.SplitList(pathEntry), nvmBin) {
+		t.Fatalf("probeCommandEnv PATH %q missing nvm bin %q", pathEntry, nvmBin)
 	}
 }
 
@@ -217,10 +276,11 @@ printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstPar
 		providerProbeCommandContext = originalCommandContext
 	}()
 
-	srv := New(newFakeState(t))
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
 	req := httptest.NewRequest(http.MethodGet, "/v0/provider-readiness?providers=claude,codex,gemini", nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
@@ -304,10 +364,11 @@ printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstPar
 		providerProbeCommandContext = originalCommandContext
 	}()
 
-	srv := New(newFakeState(t))
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
 	req := httptest.NewRequest(http.MethodGet, "/v0/readiness?items=claude,codex,gemini,github_cli", nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
@@ -354,8 +415,9 @@ func TestHandleProviderReadinessFreshBypassesCache(t *testing.T) {
 		providerProbeCommandContext = originalCommandContext
 	}()
 
-	srv := New(newFakeState(t))
-	assertProviderStatus(t, srv, "/v0/provider-readiness?providers=claude&fresh=0", "claude", probeStatusNeedsAuth)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertProviderStatus(t, h, state, "/provider-readiness?providers=claude&fresh=0", "claude", probeStatusNeedsAuth)
 
 	if err := os.WriteFile(
 		filepath.Join(homeDir, "claude-status.json"),
@@ -365,15 +427,16 @@ func TestHandleProviderReadinessFreshBypassesCache(t *testing.T) {
 		t.Fatalf("rewrite claude status: %v", err)
 	}
 
-	assertProviderStatus(t, srv, "/v0/provider-readiness?providers=claude&fresh=0", "claude", probeStatusNeedsAuth)
-	assertProviderStatus(t, srv, "/v0/provider-readiness?providers=claude&fresh=1", "claude", probeStatusConfigured)
+	assertProviderStatus(t, h, state, "/provider-readiness?providers=claude&fresh=0", "claude", probeStatusNeedsAuth)
+	assertProviderStatus(t, h, state, "/provider-readiness?providers=claude&fresh=1", "claude", probeStatusConfigured)
 }
 
 func TestHandleProviderReadinessRejectsUnknownProviders(t *testing.T) {
-	srv := New(newFakeState(t))
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
 	req := httptest.NewRequest(http.MethodGet, "/v0/provider-readiness?providers=claude,unknown", nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
@@ -381,10 +444,11 @@ func TestHandleProviderReadinessRejectsUnknownProviders(t *testing.T) {
 }
 
 func TestHandleReadinessRejectsUnknownItems(t *testing.T) {
-	srv := New(newFakeState(t))
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
 	req := httptest.NewRequest(http.MethodGet, "/v0/readiness?items=claude,unknown", nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
@@ -417,10 +481,11 @@ func TestHandleProviderReadinessReturnsNeedsAuthForCodexWithoutTokens(t *testing
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	req := httptest.NewRequest(http.MethodGet, "/v0/provider-readiness?providers=codex", nil)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	req := httptest.NewRequest(http.MethodGet, cityURL(state, "/provider-readiness?providers=codex"), nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
@@ -461,8 +526,9 @@ func TestHandleProviderReadinessReturnsNeedsAuthForCodexWithEmptyTokensObject(t 
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	assertProviderStatus(t, srv, "/v0/provider-readiness?providers=codex&fresh=1", "codex", probeStatusNeedsAuth)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertProviderStatus(t, h, state, "/provider-readiness?providers=codex&fresh=1", "codex", probeStatusNeedsAuth)
 }
 
 func TestHandleProviderReadinessReturnsNeedsAuthForLoggedOutClaude(t *testing.T) {
@@ -485,8 +551,9 @@ printf '%s\n' '{"loggedIn":false,"authMethod":"claude.ai","apiProvider":"firstPa
 		providerProbeCommandContext = originalCommandContext
 	}()
 
-	srv := New(newFakeState(t))
-	assertProviderStatus(t, srv, "/v0/provider-readiness?providers=claude&fresh=1", "claude", probeStatusNeedsAuth)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertProviderStatus(t, h, state, "/provider-readiness?providers=claude&fresh=1", "claude", probeStatusNeedsAuth)
 }
 
 func TestHandleProviderReadinessReturnsProbeErrorForClaudeInvalidJSON(t *testing.T) {
@@ -509,8 +576,48 @@ printf '%s\n' 'not-json'
 		providerProbeCommandContext = originalCommandContext
 	}()
 
-	srv := New(newFakeState(t))
-	assertProviderStatus(t, srv, "/v0/provider-readiness?providers=claude&fresh=1", "claude", probeStatusProbeError)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertProviderStatus(t, h, state, "/provider-readiness?providers=claude&fresh=1", "claude", probeStatusProbeError)
+}
+
+func TestHandleProviderReadinessIncludesProbeErrorDetailForClaudeInvalidJSON(t *testing.T) {
+	homeDir := t.TempDir()
+	binDir := filepath.Join(homeDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	writeExecutable(t, binDir, "claude", `#!/bin/sh
+printf '%s\n' 'not-json'
+`)
+
+	t.Setenv("HOME", homeDir)
+	originalPathEnv := providerProbePathEnv
+	originalCommandContext := providerProbeCommandContext
+	providerProbePathEnv = binDir
+	providerProbeCommandContext = exec.CommandContext
+	defer func() {
+		providerProbePathEnv = originalPathEnv
+		providerProbeCommandContext = originalCommandContext
+	}()
+
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	req := httptest.NewRequest(http.MethodGet, cityURL(state, "/provider-readiness?providers=claude&fresh=1"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp providerReadinessResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if detail := resp.Providers["claude"].Detail; !strings.Contains(detail, "invalid") {
+		t.Fatalf("claude detail = %q, want invalid-json detail", detail)
+	}
 }
 
 func TestHandleProviderReadinessReturnsNotInstalledWhenBinaryMissing(t *testing.T) {
@@ -518,15 +625,19 @@ func TestHandleProviderReadinessReturnsNotInstalledWhenBinaryMissing(t *testing.
 	t.Setenv("HOME", homeDir)
 
 	originalPathEnv := providerProbePathEnv
+	originalGOOS := providerProbeGOOS
 	providerProbePathEnv = filepath.Join(homeDir, "bin")
 	defer func() {
 		providerProbePathEnv = originalPathEnv
+		providerProbeGOOS = originalGOOS
 	}()
+	providerProbeGOOS = "test"
 
-	srv := New(newFakeState(t))
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
 	req := httptest.NewRequest(http.MethodGet, "/v0/provider-readiness?providers=claude,codex,gemini", nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
@@ -581,10 +692,11 @@ func TestHandleProviderReadinessReturnsInvalidConfigurationForUnsupportedAuthMod
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
 	req := httptest.NewRequest(http.MethodGet, "/v0/provider-readiness?providers=codex,gemini", nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
@@ -599,6 +711,51 @@ func TestHandleProviderReadinessReturnsInvalidConfigurationForUnsupportedAuthMod
 	}
 	if got := resp.Providers["gemini"].Status; got != probeStatusInvalidConfiguration {
 		t.Errorf("gemini status = %q, want %q", got, probeStatusInvalidConfiguration)
+	}
+}
+
+func TestHandleProviderReadinessIncludesInvalidConfigurationDetail(t *testing.T) {
+	homeDir := t.TempDir()
+	binDir := filepath.Join(homeDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	writeExecutable(t, binDir, "codex", "#!/bin/sh\nexit 0\n")
+
+	if err := os.MkdirAll(filepath.Join(homeDir, ".codex"), 0o755); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(homeDir, ".codex", "auth.json"),
+		[]byte(`{"auth_mode":"api_key","tokens":{"access_token":"token"}}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("write codex auth: %v", err)
+	}
+
+	t.Setenv("HOME", homeDir)
+	originalPathEnv := providerProbePathEnv
+	providerProbePathEnv = binDir
+	defer func() {
+		providerProbePathEnv = originalPathEnv
+	}()
+
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	req := httptest.NewRequest(http.MethodGet, cityURL(state, "/provider-readiness?providers=codex&fresh=1"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp providerReadinessResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if detail := resp.Providers["codex"].Detail; !strings.Contains(detail, "ChatGPT auth") {
+		t.Fatalf("codex detail = %q, want unsupported-auth detail", detail)
 	}
 }
 
@@ -628,8 +785,9 @@ func TestHandleProviderReadinessReturnsNeedsAuthForGeminiWithoutSelectedType(t *
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	assertProviderStatus(t, srv, "/v0/provider-readiness?providers=gemini&fresh=1", "gemini", probeStatusNeedsAuth)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertProviderStatus(t, h, state, "/provider-readiness?providers=gemini&fresh=1", "gemini", probeStatusNeedsAuth)
 }
 
 func TestHandleProviderReadinessReturnsNeedsAuthForGeminiWithoutRefreshToken(t *testing.T) {
@@ -665,8 +823,9 @@ func TestHandleProviderReadinessReturnsNeedsAuthForGeminiWithoutRefreshToken(t *
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	assertProviderStatus(t, srv, "/v0/provider-readiness?providers=gemini&fresh=1", "gemini", probeStatusNeedsAuth)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertProviderStatus(t, h, state, "/provider-readiness?providers=gemini&fresh=1", "gemini", probeStatusNeedsAuth)
 }
 
 func TestHandleReadinessReturnsNeedsAuthForGitHubCLIWithoutHostsFile(t *testing.T) {
@@ -685,10 +844,11 @@ func TestHandleReadinessReturnsNeedsAuthForGitHubCLIWithoutHostsFile(t *testing.
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	req := httptest.NewRequest(http.MethodGet, "/v0/readiness?items=github_cli&fresh=1", nil)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	req := httptest.NewRequest(http.MethodGet, cityURL(state, "/readiness?items=github_cli&fresh=1"), nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
@@ -720,8 +880,9 @@ func TestHandleReadinessReturnsConfiguredForGitHubCLIEnvToken(t *testing.T) {
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	assertGitHubCLIReadinessStatus(t, srv, probeStatusConfigured)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertGitHubCLIReadinessStatus(t, h, state, probeStatusConfigured)
 }
 
 func TestHandleReadinessReturnsConfiguredForGitHubCLICustomConfigDir(t *testing.T) {
@@ -752,8 +913,9 @@ func TestHandleReadinessReturnsConfiguredForGitHubCLICustomConfigDir(t *testing.
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	assertGitHubCLIReadinessStatus(t, srv, probeStatusConfigured)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertGitHubCLIReadinessStatus(t, h, state, probeStatusConfigured)
 }
 
 func TestHandleReadinessReturnsNotInstalledForGitHubCLIWithoutBinary(t *testing.T) {
@@ -762,13 +924,17 @@ func TestHandleReadinessReturnsNotInstalledForGitHubCLIWithoutBinary(t *testing.
 	t.Setenv("HOME", homeDir)
 
 	originalPathEnv := providerProbePathEnv
+	originalGOOS := providerProbeGOOS
 	providerProbePathEnv = filepath.Join(homeDir, "bin")
 	defer func() {
 		providerProbePathEnv = originalPathEnv
+		providerProbeGOOS = originalGOOS
 	}()
+	providerProbeGOOS = "linux"
 
-	srv := New(newFakeState(t))
-	assertGitHubCLIReadinessStatus(t, srv, probeStatusNotInstalled)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertGitHubCLIReadinessStatus(t, h, state, probeStatusNotInstalled)
 }
 
 func TestHandleReadinessReturnsNeedsAuthForGitHubCLIWithoutStoredTokens(t *testing.T) {
@@ -797,8 +963,9 @@ func TestHandleReadinessReturnsNeedsAuthForGitHubCLIWithoutStoredTokens(t *testi
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	assertGitHubCLIReadinessStatus(t, srv, probeStatusNeedsAuth)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertGitHubCLIReadinessStatus(t, h, state, probeStatusNeedsAuth)
 }
 
 func TestHandleReadinessReturnsConfiguredForGitHubCLIAuthStatusFallback(t *testing.T) {
@@ -827,8 +994,9 @@ func TestHandleReadinessReturnsConfiguredForGitHubCLIAuthStatusFallback(t *testi
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	assertGitHubCLIReadinessStatus(t, srv, probeStatusConfigured)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertGitHubCLIReadinessStatus(t, h, state, probeStatusConfigured)
 }
 
 func TestHandleReadinessReturnsProbeErrorForGitHubCLIMalformedHostsFile(t *testing.T) {
@@ -857,8 +1025,9 @@ func TestHandleReadinessReturnsProbeErrorForGitHubCLIMalformedHostsFile(t *testi
 		providerProbePathEnv = originalPathEnv
 	}()
 
-	srv := New(newFakeState(t))
-	assertGitHubCLIReadinessStatus(t, srv, probeStatusProbeError)
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	assertGitHubCLIReadinessStatus(t, h, state, probeStatusProbeError)
 }
 
 func writeExecutable(t *testing.T, dir, name, body string) {
@@ -884,11 +1053,11 @@ exit 2
 `, exitCode, exitCode))
 }
 
-func assertProviderStatus(t *testing.T, srv *Server, path, provider, want string) {
+func assertProviderStatus(t *testing.T, h http.Handler, state State, path, provider, want string) {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req := httptest.NewRequest(http.MethodGet, cityURL(state, path), nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
@@ -903,11 +1072,11 @@ func assertProviderStatus(t *testing.T, srv *Server, path, provider, want string
 	}
 }
 
-func assertGitHubCLIReadinessStatus(t *testing.T, srv *Server, want string) {
+func assertGitHubCLIReadinessStatus(t *testing.T, h http.Handler, state State, want string) {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/v0/readiness?items=github_cli&fresh=1", nil)
+	req := httptest.NewRequest(http.MethodGet, cityURL(state, "/readiness?items=github_cli&fresh=1"), nil)
 	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())

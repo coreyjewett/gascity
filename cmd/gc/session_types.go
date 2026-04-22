@@ -3,6 +3,8 @@ package main
 import (
 	"sync"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/config"
 )
 
 // WakeReason describes why a session should be awake.
@@ -29,6 +31,8 @@ const (
 	WakeWork WakeReason = "work"
 	// WakePending means the session is blocked on a structured interaction.
 	WakePending WakeReason = "pending"
+	// WakePin means pin_awake is set as a durable explicit wake reason.
+	WakePin WakeReason = "pin"
 	// WakeDependency means another awake session depends on this template.
 	WakeDependency WakeReason = "dependency"
 )
@@ -54,6 +58,7 @@ type drainState struct {
 	reason     string // "idle", "pool-excess", "config-drift", "user"
 	generation int    // generation at drain start — fence for Stop
 	ackSet     bool   // true after GC_DRAIN_ACK has been set by the reconciler
+	followUp   bool   // true when the controller should trigger one more immediate tick
 }
 
 // idleProbeState tracks an async WaitForIdle probe for interactive idle sleep.
@@ -70,7 +75,6 @@ type drainTracker struct {
 	drains          map[string]*drainState     // session bead ID -> drain state
 	idleProbes      map[string]*idleProbeState // session bead ID -> async idle probe
 	idleProbeCursor int
-	idleProbeWG     sync.WaitGroup
 }
 
 func newDrainTracker() *drainTracker {
@@ -106,6 +110,24 @@ func (dt *drainTracker) all() map[string]*drainState {
 		cp[k] = v
 	}
 	return cp
+}
+
+func (dt *drainTracker) consumeFollowUpTick() bool {
+	if dt == nil {
+		return false
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+
+	needed := false
+	for _, ds := range dt.drains {
+		if ds == nil || !ds.followUp {
+			continue
+		}
+		ds.followUp = false
+		needed = true
+	}
+	return needed
 }
 
 func (dt *drainTracker) idleProbe(beadID string) (idleProbeState, bool) {
@@ -159,36 +181,17 @@ func (dt *drainTracker) clearIdleProbe(beadID string) {
 	delete(dt.idleProbes, beadID)
 }
 
-func (dt *drainTracker) beginIdleProbe() {
-	if dt == nil {
-		return
-	}
-	dt.idleProbeWG.Add(1)
-}
-
-func (dt *drainTracker) doneIdleProbe() {
-	if dt == nil {
-		return
-	}
-	dt.idleProbeWG.Done()
-}
-
-func (dt *drainTracker) waitIdleProbes() {
-	if dt == nil {
-		return
-	}
-	dt.idleProbeWG.Wait()
-}
-
 // Reconciler tuning defaults.
 const (
 	// stabilityThreshold is how long a session must survive after wake
 	// before it's considered stable (not a rapid exit / crash).
 	stabilityThreshold = 30 * time.Second
 
-	// maxWakesPerTick limits how many sessions can be woken per reconciler
-	// tick to prevent thundering herd after controller restart.
-	defaultMaxWakesPerTick = 5
+	// defaultMaxWakesPerTick mirrors config.DefaultMaxWakesPerTick (kept
+	// here so tests and non-config call sites don't need to take a
+	// dependency on internal/config just for the default). Configurable
+	// per city via [daemon].max_wakes_per_tick; see issue #772.
+	defaultMaxWakesPerTick = config.DefaultMaxWakesPerTick
 
 	// defaultTickBudget is the wall-clock budget per reconciler tick.
 	// Remaining work is deferred to the next tick.

@@ -3,6 +3,7 @@ package configedit_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
@@ -54,6 +55,40 @@ func readTOML(t *testing.T, path string) *config.City {
 	return cfg
 }
 
+func readEffectiveTOML(t *testing.T, path string) *config.City {
+	t.Helper()
+	cfg := readTOML(t, path)
+	if _, err := config.ApplySiteBindings(fsys.OSFS{}, filepath.Dir(path), cfg); err != nil {
+		t.Fatalf("ApplySiteBindings: %v", err)
+	}
+	return cfg
+}
+
+// readExpandedTOML loads the city config with full pack expansion via
+// LoadWithIncludes. Use this when a test needs to observe the merged
+// state of pack-discovered or convention-discovered agents (e.g. that
+// suspended state set in agents/<name>/agent.toml propagates back into
+// the expanded config). Tests that only need the raw city.toml should
+// use readTOML; tests verifying site-binding rig paths should use
+// readEffectiveTOML.
+func readExpandedTOML(t *testing.T, path string) *config.City {
+	t.Helper()
+	cfg, _, err := config.LoadWithIncludes(fsys.OSFS{}, path)
+	if err != nil {
+		t.Fatalf("reloading expanded config: %v", err)
+	}
+	return cfg
+}
+
+func readSiteBinding(t *testing.T, dir string) *config.SiteBinding {
+	t.Helper()
+	binding, err := config.LoadSiteBinding(fsys.OSFS{}, dir)
+	if err != nil {
+		t.Fatalf("LoadSiteBinding: %v", err)
+	}
+	return binding
+}
+
 func TestEdit_SetsAgentSuspended(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, minimalCity())
@@ -90,6 +125,64 @@ func TestEdit_ValidationFailure(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected validation error, got nil")
+	}
+}
+
+func TestEdit_ValidatesRigsAgainstEffectiveHQPrefix(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+provider = "claude"
+
+[[agent]]
+name = "mayor"
+provider = "claude"
+
+[[rigs]]
+name = "big-lane"
+path = "/tmp/my-rig"
+`)
+	if err := config.PersistWorkspaceSiteBinding(fsys.OSFS{}, dir, "bright-lights", ""); err != nil {
+		t.Fatalf("PersistWorkspaceSiteBinding: %v", err)
+	}
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	err := ed.Edit(func(_ *config.City) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), `rig "big-lane": prefix "bl" collides with HQ`) {
+		t.Fatalf("Edit error = %v, want HQ prefix collision", err)
+	}
+}
+
+func TestEditExpanded_ValidatesRigsAgainstEffectiveHQPrefix(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+provider = "claude"
+
+[[agent]]
+name = "mayor"
+provider = "claude"
+
+[[rigs]]
+name = "big-lane"
+path = "/tmp/my-rig"
+`)
+	if err := config.PersistWorkspaceSiteBinding(fsys.OSFS{}, dir, "bright-lights", ""); err != nil {
+		t.Fatalf("PersistWorkspaceSiteBinding: %v", err)
+	}
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	err := ed.EditExpanded(func(_, _ *config.City) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), `rig "big-lane": prefix "bl" collides with HQ`) {
+		t.Fatalf("EditExpanded error = %v, want HQ prefix collision", err)
 	}
 }
 
@@ -311,6 +404,313 @@ suspended = true
 	}
 }
 
+func TestSuspendAgent_LocalDiscovered(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+name = "test-city"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte(`[pack]
+name = "test-city"
+schema = 2
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(dir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the worker.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+	if err := ed.SuspendAgent("worker"); err != nil {
+		t.Fatalf("SuspendAgent: %v", err)
+	}
+
+	raw := string(mustReadFile(t, path))
+	if strings.Contains(raw, "[[patches.agent]]") {
+		t.Fatalf("city.toml should not gain agent patch:\n%s", raw)
+	}
+	agentToml := string(mustReadFile(t, filepath.Join(agentDir, "agent.toml")))
+	if !strings.Contains(agentToml, "suspended = true") {
+		t.Fatalf("agent.toml = %q, want suspended = true", agentToml)
+	}
+
+	cfg := readExpandedTOML(t, path)
+	if !findAgent(t, cfg, "worker").Suspended {
+		t.Fatal("worker should be suspended in expanded config")
+	}
+}
+
+func TestResumeAgent_LocalDiscovered(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+name = "test-city"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte(`[pack]
+name = "test-city"
+schema = 2
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(dir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the worker.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "agent.toml"), []byte("provider = \"codex\"\nsuspended = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+	if err := ed.ResumeAgent("worker"); err != nil {
+		t.Fatalf("ResumeAgent: %v", err)
+	}
+
+	raw := string(mustReadFile(t, path))
+	if strings.Contains(raw, "[[patches.agent]]") {
+		t.Fatalf("city.toml should not gain agent patch:\n%s", raw)
+	}
+	agentToml := string(mustReadFile(t, filepath.Join(agentDir, "agent.toml")))
+	if !strings.Contains(agentToml, "provider = \"codex\"") {
+		t.Fatalf("agent.toml = %q, want provider preserved", agentToml)
+	}
+	if strings.Contains(agentToml, "suspended") {
+		t.Fatalf("agent.toml = %q, want suspended cleared", agentToml)
+	}
+
+	cfg := readExpandedTOML(t, path)
+	worker := findAgent(t, cfg, "worker")
+	if worker.Suspended {
+		t.Fatal("worker should not be suspended in expanded config")
+	}
+	if worker.Provider != "codex" {
+		t.Fatalf("worker.Provider = %q, want codex", worker.Provider)
+	}
+}
+
+// TestSuspendAgent_PackDeclaredAgentUsesPatch ensures that an [[agent]]
+// explicitly declared in the city's pack.toml is suspended via
+// [[patches.agent]] in city.toml — not via agents/<name>/agent.toml,
+// which would be silently shadowed by the pack.toml declaration during
+// composition. Regression for the SourceDir == cityRoot heuristic that
+// also matched pack-declared agents.
+func TestSuspendAgent_PackDeclaredAgentUsesPatch(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+name = "test-city"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte(`[pack]
+name = "test-city"
+schema = 2
+
+[[agent]]
+name = "worker"
+provider = "claude"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A conventional prompt template at the discovery location must NOT
+	// trigger the agent.toml write path when an [[agent]] entry exists.
+	agentDir := filepath.Join(dir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the worker.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+	if err := ed.SuspendAgent("worker"); err != nil {
+		t.Fatalf("SuspendAgent: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(agentDir, "agent.toml")); err == nil {
+		t.Fatalf("agent.toml must not be created for pack-declared agent")
+	}
+
+	raw := string(mustReadFile(t, path))
+	if !strings.Contains(raw, "[[patches.agent]]") {
+		t.Fatalf("city.toml should gain agent patch:\n%s", raw)
+	}
+
+	cfg := readExpandedTOML(t, path)
+	if !findAgent(t, cfg, "worker").Suspended {
+		t.Fatal("worker should be suspended in expanded config")
+	}
+}
+
+// TestResumeAgent_StripsLegacyPatchSuspended covers the migration case
+// where a city.toml has a stale [[patches.agent]] suspended override
+// from older code. Resuming a convention-discovered agent must strip
+// that patch override so it doesn't continue to shadow agent.toml.
+func TestResumeAgent_StripsLegacyPatchSuspended(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+name = "test-city"
+
+[[patches.agent]]
+dir = ""
+name = "worker"
+suspended = true
+`)
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte(`[pack]
+name = "test-city"
+schema = 2
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(dir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the worker.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "agent.toml"), []byte("suspended = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+	if err := ed.ResumeAgent("worker"); err != nil {
+		t.Fatalf("ResumeAgent: %v", err)
+	}
+
+	raw := string(mustReadFile(t, path))
+	if strings.Contains(raw, "[[patches.agent]]") {
+		t.Fatalf("legacy patch should be stripped:\n%s", raw)
+	}
+
+	cfg := readExpandedTOML(t, path)
+	if findAgent(t, cfg, "worker").Suspended {
+		t.Fatal("worker should not be suspended in expanded config after resume")
+	}
+}
+
+// TestSuspendAgent_StripsLegacyPatchSuspendedKeepsOtherFields ensures
+// that an existing patch with overrides beyond Suspended keeps the
+// non-Suspended fields intact when the Suspended override is stripped.
+func TestSuspendAgent_StripsLegacyPatchSuspendedKeepsOtherFields(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+name = "test-city"
+
+[[patches.agent]]
+dir = ""
+name = "worker"
+suspended = false
+provider = "codex"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte(`[pack]
+name = "test-city"
+schema = 2
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(dir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the worker.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+	if err := ed.SuspendAgent("worker"); err != nil {
+		t.Fatalf("SuspendAgent: %v", err)
+	}
+
+	raw := string(mustReadFile(t, path))
+	if !strings.Contains(raw, `provider = "codex"`) {
+		t.Fatalf("non-Suspended patch fields should be preserved:\n%s", raw)
+	}
+	if strings.Contains(raw, "suspended =") {
+		t.Fatalf("Suspended override should be removed from patch:\n%s", raw)
+	}
+}
+
+// TestStripAgentPatchSuspended_OnlyMatchingIdentity unit-tests the
+// patch-stripping helper directly. Iteration-2 fix: callers must thread
+// the resolved (Dir, Name) qualified identity so a same-bare-name patch
+// targeting a different rig is never accidentally cleared.
+func TestStripAgentPatchSuspended_OnlyMatchingIdentity(t *testing.T) {
+	cfg := &config.City{
+		Patches: config.Patches{
+			Agents: []config.AgentPatch{
+				{Dir: "rigA", Name: "worker", Suspended: boolPtrTest(true)},
+				{Dir: "rigB", Name: "worker", Suspended: boolPtrTest(true)},
+				{Dir: "", Name: "worker", Suspended: boolPtrTest(true)},
+			},
+		},
+	}
+	// Strip city-scoped (dir="") only.
+	if !configedit.StripAgentPatchSuspended(cfg, "worker") {
+		t.Fatal("StripAgentPatchSuspended should report a change")
+	}
+	if got := len(cfg.Patches.Agents); got != 2 {
+		t.Fatalf("Patches.Agents len = %d, want 2; got %#v", got, cfg.Patches.Agents)
+	}
+	for _, p := range cfg.Patches.Agents {
+		if p.Dir == "" {
+			t.Errorf("city-scoped patch should be removed; remaining: %#v", p)
+		}
+	}
+
+	// Strip rigA-scoped via qualified identity.
+	if !configedit.StripAgentPatchSuspended(cfg, "rigA/worker") {
+		t.Fatal("StripAgentPatchSuspended should report a change for rigA")
+	}
+	if got := len(cfg.Patches.Agents); got != 1 || cfg.Patches.Agents[0].Dir != "rigB" {
+		t.Fatalf("after stripping rigA, expected only rigB patch, got %#v", cfg.Patches.Agents)
+	}
+
+	// Stripping a non-matching identity is a no-op.
+	if configedit.StripAgentPatchSuspended(cfg, "rigC/worker") {
+		t.Fatal("StripAgentPatchSuspended should be a no-op for non-matching identity")
+	}
+}
+
+func boolPtrTest(b bool) *bool { return &b }
+
+// TestLocalDiscoveredAgent_RejectsRigScopedAgentWithCityPromptPath
+// guards against the iteration-3 Major finding (Gemini): a rig-scoped
+// agent whose prompt_template happens to point at the city's
+// <cityRoot>/agents/<name>/ template must NOT be classified as local
+// discovered. Writing agent.toml for it would corrupt the city agent's
+// durable state instead of producing the correct [[patches.agent]].
+func TestLocalDiscoveredAgent_RejectsRigScopedAgentWithCityPromptPath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "agents", "worker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte(`[pack]
+name = "test-city"
+schema = 2
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rigAgent := config.Agent{
+		Dir:            "myrig",
+		Name:           "worker",
+		PromptTemplate: filepath.Join(dir, "agents", "worker", "prompt.template.md"),
+	}
+	if configedit.LocalDiscoveredAgent(fsys.OSFS{}, dir, rigAgent) {
+		t.Fatal("rig-scoped agent must not be classified as local-discovered even when prompt_template points at the city's agents/<name>/ tree")
+	}
+
+	cityAgent := config.Agent{
+		Dir:            "",
+		Name:           "worker",
+		PromptTemplate: filepath.Join(dir, "agents", "worker", "prompt.template.md"),
+	}
+	if !configedit.LocalDiscoveredAgent(fsys.OSFS{}, dir, cityAgent) {
+		t.Fatal("city-scoped scaffolded agent should be classified as local-discovered")
+	}
+}
+
 func TestSuspendAgent_NotFound(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, minimalCity())
@@ -357,6 +757,26 @@ suspended = true
 	if cfg.Rigs[0].Suspended {
 		t.Error("expected my-rig to not be suspended")
 	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", path, err)
+	}
+	return data
+}
+
+func findAgent(t *testing.T, cfg *config.City, name string) config.Agent { //nolint:unparam // helper kept generic for future tests
+	t.Helper()
+	for _, a := range cfg.Agents {
+		if a.Name == name {
+			return a
+		}
+	}
+	t.Fatalf("agent %q not found in %#v", name, cfg.Agents)
+	return config.Agent{}
 }
 
 func TestSuspendCity(t *testing.T) {
@@ -551,9 +971,17 @@ func TestUpdateRig(t *testing.T) {
 		t.Fatalf("UpdateRig: %v", err)
 	}
 
-	cfg := readTOML(t, path)
+	raw := readTOML(t, path)
+	if raw.Rigs[0].Path != "" {
+		t.Errorf("raw path = %q, want empty city.toml binding", raw.Rigs[0].Path)
+	}
+	cfg := readEffectiveTOML(t, path)
 	if cfg.Rigs[0].Path != "/tmp/updated" {
-		t.Errorf("path = %q, want %q", cfg.Rigs[0].Path, "/tmp/updated")
+		t.Errorf("effective path = %q, want %q", cfg.Rigs[0].Path, "/tmp/updated")
+	}
+	binding := readSiteBinding(t, dir)
+	if len(binding.Rigs) != 1 || binding.Rigs[0].Path != "/tmp/updated" {
+		t.Errorf("site binding = %+v, want updated path", binding.Rigs)
 	}
 }
 
@@ -576,9 +1004,13 @@ suspended = true
 		t.Fatalf("UpdateRig: %v", err)
 	}
 
-	cfg := readTOML(t, path)
+	raw := readTOML(t, path)
+	if raw.Rigs[0].Path != "" {
+		t.Errorf("raw path = %q, want empty city.toml binding", raw.Rigs[0].Path)
+	}
+	cfg := readEffectiveTOML(t, path)
 	if cfg.Rigs[0].Path != "/tmp/updated" {
-		t.Errorf("path = %q, want %q", cfg.Rigs[0].Path, "/tmp/updated")
+		t.Errorf("effective path = %q, want %q", cfg.Rigs[0].Path, "/tmp/updated")
 	}
 	if !cfg.Rigs[0].Suspended {
 		t.Error("suspended was reset to false — zero-value bug")
@@ -683,6 +1115,69 @@ func TestCreateProvider(t *testing.T) {
 	}
 	if got.DisplayName != "My Provider" {
 		t.Errorf("display_name = %q, want %q", got.DisplayName, "My Provider")
+	}
+}
+
+// TestCreateProvider_BaseOnlyNoCommand verifies the relaxed validation:
+// a provider with only `base` set is valid — the chain walk inherits
+// the command from the ancestor.
+func TestCreateProvider_BaseOnlyNoCommand(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	base := "builtin:codex"
+	spec := config.ProviderSpec{Base: &base}
+	if err := ed.CreateProvider("codex-max", spec); err != nil {
+		t.Fatalf("CreateProvider with base and no command: %v", err)
+	}
+
+	cfg := readTOML(t, path)
+	got, ok := cfg.Providers["codex-max"]
+	if !ok {
+		t.Fatal("provider 'codex-max' not found after create")
+	}
+	if got.Base == nil {
+		t.Fatal("Base pointer is nil after round-trip")
+	}
+	if *got.Base != "builtin:codex" {
+		t.Errorf("*Base = %q, want builtin:codex", *got.Base)
+	}
+	if got.Command != "" {
+		t.Errorf("Command = %q, want empty (inherited)", got.Command)
+	}
+}
+
+// TestCreateProvider_NoBaseNoCommandRejected ensures that a provider
+// that declares neither command nor base is still rejected by
+// validateProviders.
+func TestCreateProvider_NoBaseNoCommandRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	err := ed.CreateProvider("nothing", config.ProviderSpec{})
+	if err == nil {
+		t.Fatal("expected error for provider without command or base")
+	}
+}
+
+func TestCreateProvider_RejectsInvalidLegacyBuiltinOptionDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	err := ed.CreateProvider("codex-fast", config.ProviderSpec{
+		Command: "codex",
+		OptionDefaults: map[string]string{
+			"permission_mode": "typo",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected invalid option_defaults to be rejected")
+	}
+	if !strings.Contains(err.Error(), `option_defaults key "permission_mode"`) {
+		t.Fatalf("error = %v, want option_defaults validation detail", err)
 	}
 }
 
@@ -931,12 +1426,25 @@ func TestSetOrderOverride(t *testing.T) {
 	ed := configedit.NewEditor(fsys.OSFS{}, path)
 
 	enabled := false
+	trigger := "cooldown"
 	err := ed.SetOrderOverride(config.OrderOverride{
 		Name:    "health-check",
 		Enabled: &enabled,
+		Trigger: &trigger,
 	})
 	if err != nil {
 		t.Fatalf("SetOrderOverride: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if got := string(raw); got != "" && strings.Contains(got, "gate =") {
+		t.Fatalf("city.toml still contains legacy gate key:\n%s", got)
+	}
+	if !strings.Contains(string(raw), `trigger = "cooldown"`) {
+		t.Fatalf("city.toml missing canonical trigger key:\n%s", string(raw))
 	}
 
 	cfg := readTOML(t, path)
@@ -950,6 +1458,9 @@ func TestSetOrderOverride(t *testing.T) {
 	if ov.Enabled == nil || *ov.Enabled {
 		t.Error("expected enabled=false")
 	}
+	if ov.Trigger == nil || *ov.Trigger != "cooldown" {
+		t.Fatalf("override trigger = %#v, want cooldown", ov.Trigger)
+	}
 }
 
 func TestSetOrderOverride_UpdateExisting(t *testing.T) {
@@ -958,9 +1469,11 @@ func TestSetOrderOverride_UpdateExisting(t *testing.T) {
 	ed := configedit.NewEditor(fsys.OSFS{}, path)
 
 	disabled := false
+	trigger := "cooldown"
 	_ = ed.SetOrderOverride(config.OrderOverride{
 		Name:    "health-check",
 		Enabled: &disabled,
+		Trigger: &trigger,
 	})
 
 	enabled := true
@@ -976,8 +1489,47 @@ func TestSetOrderOverride_UpdateExisting(t *testing.T) {
 	if len(cfg.Orders.Overrides) != 1 {
 		t.Fatalf("expected 1 override, got %d", len(cfg.Orders.Overrides))
 	}
-	if cfg.Orders.Overrides[0].Enabled == nil || !*cfg.Orders.Overrides[0].Enabled {
+	ov := cfg.Orders.Overrides[0]
+	if ov.Enabled == nil || !*ov.Enabled {
 		t.Error("expected enabled=true after update")
+	}
+	if ov.Trigger != nil {
+		t.Fatalf("expected trigger to be replaced away, got %#v", ov.Trigger)
+	}
+}
+
+func TestMergeOrderOverridePreservesExistingTriggerOnPartialUpdate(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	disabled := false
+	trigger := "cooldown"
+	_ = ed.SetOrderOverride(config.OrderOverride{
+		Name:    "health-check",
+		Enabled: &disabled,
+		Trigger: &trigger,
+	})
+
+	enabled := true
+	err := ed.MergeOrderOverride(config.OrderOverride{
+		Name:    "health-check",
+		Enabled: &enabled,
+	})
+	if err != nil {
+		t.Fatalf("MergeOrderOverride (partial update): %v", err)
+	}
+
+	cfg := readTOML(t, path)
+	if len(cfg.Orders.Overrides) != 1 {
+		t.Fatalf("expected 1 override, got %d", len(cfg.Orders.Overrides))
+	}
+	ov := cfg.Orders.Overrides[0]
+	if ov.Enabled == nil || !*ov.Enabled {
+		t.Fatal("expected enabled=true after partial update")
+	}
+	if ov.Trigger == nil || *ov.Trigger != "cooldown" {
+		t.Fatalf("trigger = %#v, want cooldown", ov.Trigger)
 	}
 }
 
@@ -1010,5 +1562,38 @@ func TestDeleteOrderOverride_NotFound(t *testing.T) {
 	err := ed.DeleteOrderOverride("nonexistent", "")
 	if err == nil {
 		t.Fatal("expected error for deleting nonexistent override")
+	}
+}
+
+func TestMergeOrderOverrideNormalizesLegacyGateToTriggerOnWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity()+`
+[orders]
+
+[[orders.overrides]]
+name = "health-check"
+gate = "cooldown"
+`)
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	enabled := true
+	err := ed.MergeOrderOverride(config.OrderOverride{
+		Name:    "health-check",
+		Enabled: &enabled,
+	})
+	if err != nil {
+		t.Fatalf("MergeOrderOverride: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	got := string(raw)
+	if strings.Contains(got, "gate =") {
+		t.Fatalf("city.toml still contains legacy gate key:\n%s", got)
+	}
+	if !strings.Contains(got, `trigger = "cooldown"`) {
+		t.Fatalf("city.toml missing canonical trigger after enabled-only update:\n%s", got)
 	}
 }

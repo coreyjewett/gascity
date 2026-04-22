@@ -1,65 +1,30 @@
 package dashboard
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
-	"time"
 )
 
-// Serve starts the dashboard HTTP server. It creates an APIFetcher, builds
-// the dashboard mux, and listens on the given port. This is the entry point
-// called by the "gc dashboard serve" cobra command.
-func Serve(port int, cityPath, cityName, apiURL string) error {
-	log.Printf("dashboard: using API server at %s", apiURL)
-
-	isSupervisor := detectSupervisor(apiURL)
-	if isSupervisor {
-		log.Printf("dashboard: supervisor mode detected, city selector enabled")
+// Serve starts the dashboard HTTP server. The dashboard is a static
+// TypeScript SPA that calls the supervisor's typed OpenAPI endpoints
+// directly from the browser — there is no proxy layer anymore. This
+// function's only job is to embed + serve the compiled bundle and
+// inject `supervisorURL` into the page so the SPA knows where to
+// reach the supervisor.
+func Serve(port int, supervisorURL string) error {
+	supervisorURL = strings.TrimRight(strings.TrimSpace(supervisorURL), "/")
+	if supervisorURL == "" {
+		return fmt.Errorf("dashboard: supervisor URL is empty; pass --api")
 	}
 
-	fetcher := NewAPIFetcher(apiURL, cityPath, cityName)
-
-	mux, err := NewDashboardMux(
-		fetcher,
-		cityPath,
-		cityName,
-		apiURL,
-		isSupervisor,
-		8*time.Second,  // fetchTimeout
-		30*time.Second, // defaultRunTimeout
-		60*time.Second, // maxRunTimeout
-	)
+	handler, err := NewStaticHandler(supervisorURL)
 	if err != nil {
-		return fmt.Errorf("dashboard: failed to create handler: %w", err)
+		return err
 	}
 
 	addr := fmt.Sprintf(":%d", port)
-	log.Printf("dashboard: listening on http://localhost%s", addr)
-	return http.ListenAndServe(addr, mux)
-}
-
-// detectSupervisor probes the API server for supervisor mode by checking
-// whether /v0/cities responds successfully.
-func detectSupervisor(apiURL string) bool {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(strings.TrimRight(apiURL, "/") + "/v0/cities")
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-
-	// Any valid JSON response from /v0/cities means supervisor mode. We
-	// don't require items to be non-empty since the supervisor may have
-	// zero cities registered at startup.
-	var list struct {
-		Items json.RawMessage `json:"items"`
-	}
-	return json.NewDecoder(resp.Body).Decode(&list) == nil && list.Items != nil
+	log.Printf("dashboard: listening on http://localhost%s (supervisor=%s)", addr, supervisorURL)
+	return http.ListenAndServe(addr, logRequest(handler))
 }

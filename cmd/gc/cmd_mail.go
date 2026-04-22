@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -21,9 +20,20 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// nudgeFunc is an optional callback for nudging an agent after sending mail.
-// When non-nil, it is called with the recipient name. Errors are non-fatal.
+// nudgeFunc is an optional callback for nudging an agent after sending or
+// replying to mail. When non-nil, it is called with the recipient name.
+// Errors are non-fatal.
 type nudgeFunc func(recipient string) error
+
+func newMailNudgeFunc(sender string) nudgeFunc {
+	return func(recipient string) error {
+		target, err := resolveNudgeTarget(recipient, io.Discard)
+		if err != nil {
+			return err
+		}
+		return sendMailNotify(target, sender)
+	}
+}
 
 func newMailCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
@@ -120,6 +130,7 @@ func doMailArchive(mp mail.Provider, rec events.Recorder, args []string, stdout,
 
 func newMailCheckCmd(stdout, stderr io.Writer) *cobra.Command {
 	var inject bool
+	var hookFormat string
 	cmd := &cobra.Command{
 		Use:   "check [session]",
 		Short: "Check for unread mail (use --inject for hook output)",
@@ -127,28 +138,28 @@ func newMailCheckCmd(stdout, stderr io.Writer) *cobra.Command {
 
 Without --inject: prints the count and exits 0 if mail exists, 1 if
 empty. With --inject: outputs a <system-reminder> block suitable for
-hook injection (always exits 0). The recipient defaults to $GC_ALIAS,
-$GC_SESSION_ID, or "human".`,
+hook injection (always exits 0). The recipient defaults to $GC_SESSION_ID,
+$GC_ALIAS, $GC_AGENT, or "human".`,
 		Example: `  gc mail check
   gc mail check --inject
   gc mail check mayor`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdMailCheck(args, inject, stdout, stderr) != 0 {
+			if cmdMailCheckWithFormat(args, inject, hookFormat, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&inject, "inject", false, "output <system-reminder> block for hook injection")
+	cmd.Flags().StringVar(&hookFormat, "hook-format", "", "format hook output for a provider")
 	return cmd
 }
 
-// cmdMailCheck is the CLI entry point for checking mail.
-func cmdMailCheck(args []string, inject bool, stdout, stderr io.Writer) int {
+func cmdMailCheckWithFormat(args []string, inject bool, hookFormat string, stdout, stderr io.Writer) int {
 	// Check city-level suspension before opening the store.
 	if cityPath, err := resolveCity(); err == nil {
-		if cfg, err := loadCityConfig(cityPath); err == nil {
+		if cfg, err := loadCityConfig(cityPath, stderr); err == nil {
 			if citySuspended(cfg) {
 				if inject {
 					return 0
@@ -167,11 +178,7 @@ func cmdMailCheck(args []string, inject bool, stdout, stderr io.Writer) int {
 		return code
 	}
 
-	recipient := defaultMailIdentity()
-	if len(args) > 0 {
-		recipient = args[0]
-	}
-	target, ok := resolveMailTargetsForCommand(recipient, stderr, "gc mail check")
+	target, ok := resolveMailTargetFromArgs(args, stderr, "gc mail check")
 	if !ok {
 		if inject {
 			return 0
@@ -179,7 +186,7 @@ func cmdMailCheck(args []string, inject bool, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	return doMailCheckTarget(mp, target, inject, stdout, stderr)
+	return doMailCheckTargetWithFormat(mp, target, inject, hookFormat, stdout, stderr)
 }
 
 // doMailCheck checks for unread messages. Without --inject, prints the count
@@ -190,6 +197,10 @@ func doMailCheck(mp mail.Provider, recipient string, inject bool, stdout, stderr
 }
 
 func doMailCheckTarget(mp mail.Provider, target resolvedMailTarget, inject bool, stdout, stderr io.Writer) int {
+	return doMailCheckTargetWithFormat(mp, target, inject, "", stdout, stderr)
+}
+
+func doMailCheckTargetWithFormat(mp mail.Provider, target resolvedMailTarget, inject bool, hookFormat string, stdout, stderr io.Writer) int {
 	messages, err := collectMailMessages(mp.Check, target.recipients)
 	if err != nil {
 		if inject {
@@ -202,7 +213,7 @@ func doMailCheckTarget(mp mail.Provider, target resolvedMailTarget, inject bool,
 
 	if inject {
 		if len(messages) > 0 {
-			fmt.Fprint(stdout, formatInjectOutput(messages)) //nolint:errcheck // best-effort stdout
+			_ = writeProviderHookContext(stdout, hookFormat, formatInjectOutput(messages))
 		}
 		return 0 // --inject always exits 0
 	}
@@ -236,16 +247,38 @@ func formatInjectOutput(messages []mail.Message) string {
 }
 
 func defaultMailIdentity() string {
-	if alias := strings.TrimSpace(os.Getenv("GC_ALIAS")); alias != "" {
-		return alias
+	return defaultMailIdentityCandidates()[0]
+}
+
+// defaultMailIdentityCandidates returns ordered non-empty identity candidates
+// (GC_SESSION_ID, GC_ALIAS, GC_AGENT), falling back to ["human"] when all are
+// unset. Multiple candidates preserve compatibility for sessions whose concrete
+// ID is unavailable while still preferring the concrete mailbox when it exists.
+func defaultMailIdentityCandidates() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		out = append(out, v)
 	}
-	if sessionID := strings.TrimSpace(os.Getenv("GC_SESSION_ID")); sessionID != "" {
-		return sessionID
+	add(os.Getenv("GC_SESSION_ID"))
+	add(os.Getenv("GC_ALIAS"))
+	add(os.Getenv("GC_AGENT"))
+	if len(out) == 0 {
+		out = append(out, "human")
 	}
-	if agent := strings.TrimSpace(os.Getenv("GC_AGENT")); agent != "" {
-		return agent
-	}
-	return "human"
+	return out
+}
+
+// isStorelessMailProvider reports whether the configured mail provider
+// bypasses the city bead store (exec scripts and test doubles).
+func isStorelessMailProvider() bool {
+	v := mailProviderName()
+	return strings.HasPrefix(v, "exec:") || v == "fake" || v == "fail"
 }
 
 func sessionMailboxAddress(b beads.Bead) string {
@@ -287,6 +320,11 @@ func resolveMailIdentity(store beads.Store, identifier string) (string, error) {
 	sessionID, err := resolveSessionID(store, identifier)
 	if err != nil {
 		if errors.Is(err, session.ErrSessionNotFound) {
+			if target, matched, targetErr := resolveLiveConfiguredNamedMailTarget(store, identifier); targetErr != nil {
+				return "", targetErr
+			} else if matched {
+				return target.display, nil
+			}
 			if address, ok := configuredMailboxAddress(identifier); ok {
 				return address, nil
 			}
@@ -325,6 +363,11 @@ func resolveMailIdentityWithConfig(cityPath string, cfg *config.City, store bead
 			return "", err
 		}
 	}
+	if target, matched, targetErr := resolveLiveConfiguredNamedMailTarget(store, identifier); targetErr != nil {
+		return "", targetErr
+	} else if matched {
+		return target.display, nil
+	}
 	if address, ok := configuredMailboxAddressWithConfig(cityPath, cfg, identifier); ok {
 		return address, nil
 	}
@@ -335,22 +378,10 @@ func resolveMailRecipientIdentity(cityPath string, cfg *config.City, store beads
 	if identifier == "" || identifier == "human" {
 		return "human", nil
 	}
-	if store != nil && cfg != nil {
-		sessionID, err := resolveSessionIDMaterializingNamed(cityPath, cfg, store, identifier)
-		if err == nil {
-			b, err := store.Get(sessionID)
-			if err != nil {
-				return "", err
-			}
-			address := sessionMailboxAddress(b)
-			if address == "" {
-				return "", fmt.Errorf("session %q has no mailbox identity", identifier)
-			}
-			return address, nil
-		}
-		if !errors.Is(err, session.ErrSessionNotFound) {
-			return "", err
-		}
+	if target, matched, targetErr := resolveLiveConfiguredNamedMailTarget(store, identifier); targetErr != nil {
+		return "", targetErr
+	} else if matched {
+		return target.display, nil
 	}
 	return resolveMailIdentityWithConfig(cityPath, cfg, store, identifier)
 }
@@ -364,7 +395,7 @@ func configuredMailboxAddress(identifier string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	cfg, err := loadCityConfig(cityPath)
+	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		return "", false
 	}
@@ -376,11 +407,8 @@ func configuredMailboxAddressWithConfig(cityPath string, cfg *config.City, ident
 	if identifier == "" || identifier == "human" || cfg == nil {
 		return "", false
 	}
-	cityName := cfg.Workspace.Name
-	if cityName == "" {
-		cityName = filepath.Base(cityPath)
-	}
-	spec, ok, err := findNamedSessionSpecForTarget(cfg, cityName, nil, identifier)
+	cityName := loadedCityName(cfg, cityPath)
+	spec, ok, err := findNamedSessionSpecForTarget(cfg, cityName, identifier)
 	if err != nil || !ok {
 		return "", false
 	}
@@ -414,6 +442,57 @@ type resolvedMailTarget struct {
 	recipients []string
 }
 
+func resolveLiveConfiguredNamedMailTarget(store beads.Store, identifier string) (resolvedMailTarget, bool, error) {
+	identifier = normalizeNamedSessionTarget(identifier)
+	if store == nil || identifier == "" || identifier == "human" || strings.Contains(identifier, "/") {
+		return resolvedMailTarget{}, false, nil
+	}
+	all, err := store.List(beads.ListQuery{
+		Label: session.LabelSession,
+	})
+	if err != nil {
+		return resolvedMailTarget{}, false, err
+	}
+
+	matches := make(map[string]resolvedMailTarget)
+	order := make([]string, 0, 2)
+	for _, b := range all {
+		if !session.IsSessionBeadOrRepairable(b) || b.Status == "closed" {
+			continue
+		}
+		identity := strings.TrimSpace(b.Metadata[namedSessionIdentityMetadata])
+		if identity == "" || targetBasename(identity) != identifier {
+			continue
+		}
+		addresses := sessionMailboxAddresses(b)
+		if len(addresses) == 0 {
+			continue
+		}
+		display := sessionMailboxAddress(b)
+		if display == "" {
+			display = addresses[0]
+		}
+		if _, ok := matches[display]; ok {
+			continue
+		}
+		matches[display] = resolvedMailTarget{
+			display:    display,
+			recipients: addresses,
+		}
+		order = append(order, display)
+	}
+
+	switch len(order) {
+	case 0:
+		return resolvedMailTarget{}, false, nil
+	case 1:
+		return matches[order[0]], true, nil
+	default:
+		return resolvedMailTarget{}, true, fmt.Errorf("%w: %q matches %d live configured named sessions: %s",
+			session.ErrAmbiguous, identifier, len(order), strings.Join(order, ", "))
+	}
+}
+
 func resolveMailTargets(store beads.Store, identifier string) (resolvedMailTarget, error) {
 	if identifier == "" || identifier == "human" {
 		return resolvedMailTarget{display: "human", recipients: []string{"human"}}, nil
@@ -421,6 +500,11 @@ func resolveMailTargets(store beads.Store, identifier string) (resolvedMailTarge
 	sessionID, err := resolveSessionID(store, identifier)
 	if err != nil {
 		if errors.Is(err, session.ErrSessionNotFound) {
+			if target, matched, targetErr := resolveLiveConfiguredNamedMailTarget(store, identifier); targetErr != nil {
+				return resolvedMailTarget{}, targetErr
+			} else if matched {
+				return target, nil
+			}
 			if address, ok := configuredMailboxAddress(identifier); ok {
 				return resolvedMailTarget{display: address, recipients: []string{address}}, nil
 			}
@@ -461,9 +545,59 @@ func resolveMailTargetsForCommand(identifier string, stderr io.Writer, cmdName s
 	return target, true
 }
 
+// resolveDefaultMailTargetsForCommand tries each default identity candidate
+// against the city's bead store and returns the first that resolves. A
+// stale GC_ALIAS on a pool worker would otherwise block inbox access when
+// GC_SESSION_ID still matches the bead via session_name.
+func resolveDefaultMailTargetsForCommand(stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
+	candidates := defaultMailIdentityCandidates()
+	if len(candidates) == 1 || isStorelessMailProvider() {
+		return resolveMailTargetsForCommand(candidates[0], stderr, cmdName)
+	}
+	store, code := openCityStore(stderr, cmdName)
+	if store == nil {
+		_ = code
+		return resolvedMailTarget{}, false
+	}
+	for _, c := range candidates {
+		target, err := resolveMailTargets(store, c)
+		if err == nil {
+			return target, true
+		}
+		if !errors.Is(err, session.ErrSessionNotFound) {
+			fmt.Fprintf(stderr, "%s: %v\n", cmdName, err) //nolint:errcheck // best-effort stderr
+			return resolvedMailTarget{}, false
+		}
+	}
+	fmt.Fprintf(stderr, "%s: no mail identity resolved (tried %v)\n", cmdName, candidates) //nolint:errcheck // best-effort stderr
+	return resolvedMailTarget{}, false
+}
+
+func resolveDefaultMailSenderForCommand(cityPath string, cfg *config.City, store beads.Store, stderr io.Writer, cmdName string) (string, bool) {
+	candidates := defaultMailIdentityCandidates()
+	for _, c := range candidates {
+		sender, err := resolveMailIdentityWithConfig(cityPath, cfg, store, c)
+		if err == nil {
+			return sender, true
+		}
+		if !errors.Is(err, session.ErrSessionNotFound) {
+			fmt.Fprintf(stderr, "%s: invalid sender %q: %v\n", cmdName, c, err) //nolint:errcheck // best-effort stderr
+			return "", false
+		}
+	}
+	fmt.Fprintf(stderr, "%s: no sender identity resolved (tried %v)\n", cmdName, candidates) //nolint:errcheck // best-effort stderr
+	return "", false
+}
+
+func resolveMailTargetFromArgs(args []string, stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
+	if len(args) > 0 {
+		return resolveMailTargetsForCommand(args[0], stderr, cmdName)
+	}
+	return resolveDefaultMailTargetsForCommand(stderr, cmdName)
+}
+
 func resolveRawMailTargetForStorelessProvider(identifier string, stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
-	v := mailProviderName()
-	if !strings.HasPrefix(v, "exec:") && v != "fake" && v != "fail" {
+	if !isStorelessMailProvider() {
 		return resolvedMailTarget{}, false
 	}
 	store, err := openMailTargetStore()
@@ -502,7 +636,6 @@ func tryOpenCityStore() (beads.Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	readDoltPort(cityPath)
 	return openCityStoreAt(cityPath)
 }
 
@@ -569,7 +702,7 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_ALIAS or $GC_SESSION_ID (in sessions) or "human". Use --notify to nudge
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to nudge
 the recipient after sending. Use --from to override the sender identity.
 Use --to as an alternative to the positional <to> argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
@@ -591,7 +724,7 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 	}
 	cmd.Flags().BoolVar(&notify, "notify", false, "nudge the recipient after sending")
 	cmd.Flags().BoolVar(&all, "all", false, "broadcast to all live sessions (excludes sender and human)")
-	cmd.Flags().StringVar(&from, "from", "", "sender identity (default: $GC_ALIAS, $GC_SESSION_ID, or \"human\")")
+	cmd.Flags().StringVar(&from, "from", "", "sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or \"human\")")
 	cmd.Flags().StringVar(&to, "to", "", "recipient address (alternative to positional argument)")
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
@@ -606,7 +739,7 @@ func newMailInboxCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `List all unread messages for a session alias or human.
 
 Shows message ID, sender, subject, and body in a table. The recipient defaults
-to $GC_ALIAS, $GC_SESSION_ID, or "human". Pass a session alias to view another inbox.`,
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Pass a session alias to view another inbox.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if cmdMailInbox(args, stdout, stderr) != 0 {
@@ -743,7 +876,7 @@ func newMailCountCmd(stdout, stderr io.Writer) *cobra.Command {
 		Use:   "count [session]",
 		Short: "Show total/unread message count",
 		Long: `Show total and unread message counts for a session alias or human.
-The recipient defaults to $GC_ALIAS, $GC_SESSION_ID, or "human".`,
+The recipient defaults to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human".`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if cmdMailCount(args, stdout, stderr) != 0 {
@@ -770,9 +903,12 @@ func cmdMailSend(args []string, notify bool, all bool, from string, to string, s
 	)
 	cityPath, err := resolveCity()
 	if err == nil {
-		cfg, _ = loadCityConfig(cityPath)
+		cfg, _ = loadCityConfig(cityPath, stderr)
 		store, err = openCityStoreAt(cityPath)
 	}
+	// Narrower than isStorelessMailProvider: exec: providers can legitimately
+	// run without a city store, but fake/fail still require one for alias
+	// resolution in tests. Do not unify with isStorelessMailProvider.
 	if err != nil && !strings.HasPrefix(mailProviderName(), "exec:") {
 		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -787,9 +923,16 @@ func cmdMailSend(args []string, notify bool, all bool, from string, to string, s
 
 	sender := from
 	if sender == "" {
-		sender = defaultMailIdentity()
-	}
-	if sender != "human" && store != nil {
+		if store != nil {
+			var ok bool
+			sender, ok = resolveDefaultMailSenderForCommand(cityPath, cfg, store, stderr, "gc mail send")
+			if !ok {
+				return 1
+			}
+		} else {
+			sender = defaultMailIdentity()
+		}
+	} else if sender != "human" && store != nil {
 		sender, err = resolveMailIdentityWithConfig(cityPath, cfg, store, sender)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
@@ -799,13 +942,7 @@ func cmdMailSend(args []string, notify bool, all bool, from string, to string, s
 
 	var nf nudgeFunc
 	if notify && store != nil {
-		nf = func(recipient string) error {
-			target, err := resolveNudgeTarget(recipient)
-			if err != nil {
-				return err
-			}
-			return sendMailNotify(target, sender)
-		}
+		nf = newMailNudgeFunc(sender)
 	}
 
 	// When --to is set, prepend it to args so doMailSend sees [to, body].
@@ -957,11 +1094,7 @@ func cmdMailInbox(args []string, stdout, stderr io.Writer) int {
 		return code
 	}
 
-	recipient := defaultMailIdentity()
-	if len(args) > 0 {
-		recipient = args[0]
-	}
-	target, ok := resolveMailTargetsForCommand(recipient, stderr, "gc mail inbox")
+	target, ok := resolveMailTargetFromArgs(args, stderr, "gc mail inbox")
 	if !ok {
 		return 1
 	}
@@ -1073,9 +1206,10 @@ func cmdMailReply(args []string, subject, message string, notify bool, stdout, s
 	rec := openCityRecorder(stderr)
 
 	sender := defaultMailIdentity()
+	var hasStore bool
 	if sender != "human" {
-		v := mailProviderName()
-		if !strings.HasPrefix(v, "exec:") && v != "fake" && v != "fail" {
+		if !isStorelessMailProvider() {
+			hasStore = true
 			store, storeCode := openCityStore(stderr, "gc mail reply")
 			if store == nil {
 				return storeCode
@@ -1085,10 +1219,9 @@ func cmdMailReply(args []string, subject, message string, notify bool, stdout, s
 				fmt.Fprintf(stderr, "gc mail reply: %v\n", err) //nolint:errcheck // best-effort stderr
 				return 1
 			}
-			cfg, _ := loadCityConfig(cityPath)
-			resolved, err := resolveMailIdentityWithConfig(cityPath, cfg, store, sender)
-			if err != nil {
-				fmt.Fprintf(stderr, "gc mail reply: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
+			cfg, _ := loadCityConfig(cityPath, stderr)
+			resolved, ok := resolveDefaultMailSenderForCommand(cityPath, cfg, store, stderr, "gc mail reply")
+			if !ok {
 				return 1
 			}
 			sender = resolved
@@ -1101,11 +1234,16 @@ func cmdMailReply(args []string, subject, message string, notify bool, stdout, s
 		body = strings.Join(args[1:], " ")
 	}
 
-	return doMailReply(mp, rec, args[0], sender, subject, body, notify, stdout, stderr)
+	var nf nudgeFunc
+	if notify && hasStore {
+		nf = newMailNudgeFunc(sender)
+	}
+
+	return doMailReply(mp, rec, args[0], sender, subject, body, nf, stdout, stderr)
 }
 
 // doMailReply creates a reply to an existing message.
-func doMailReply(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, _ bool, stdout, stderr io.Writer) int {
+func doMailReply(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, stdout, stderr io.Writer) int {
 	reply, err := mp.Reply(id, sender, subject, body)
 	telemetry.RecordMailOp(context.Background(), "reply", err)
 	if err != nil {
@@ -1120,6 +1258,12 @@ func doMailReply(mp mail.Provider, rec events.Recorder, id, sender, subject, bod
 		Payload: mailEventPayload(&reply),
 	})
 	fmt.Fprintf(stdout, "Replied to %s — sent message %s to %s\n", id, reply.ID, reply.To) //nolint:errcheck // best-effort stdout
+
+	if nudgeFn != nil && reply.To != "human" {
+		if err := nudgeFn(reply.To); err != nil {
+			fmt.Fprintf(stderr, "gc mail reply: nudge failed: %v\n", err) //nolint:errcheck // best-effort stderr
+		}
+	}
 	return 0
 }
 
@@ -1275,11 +1419,7 @@ func cmdMailCount(args []string, stdout, stderr io.Writer) int {
 		return code
 	}
 
-	recipient := defaultMailIdentity()
-	if len(args) > 0 {
-		recipient = args[0]
-	}
-	target, ok := resolveMailTargetsForCommand(recipient, stderr, "gc mail count")
+	target, ok := resolveMailTargetFromArgs(args, stderr, "gc mail count")
 	if !ok {
 		return 1
 	}
@@ -1332,7 +1472,7 @@ func mailEventRig() string {
 }
 
 // mailEventPayload builds a JSON payload for mail events so SSE consumers
-// (Mission Control) can route updates to the correct rig.
+// (e.g. dashboard clients) can route updates to the correct rig.
 // For sent/replied events, pass the full message; for state changes pass nil.
 func mailEventPayload(msg *mail.Message) json.RawMessage {
 	m := map[string]any{"rig": mailEventRig()}

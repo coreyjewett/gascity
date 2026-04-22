@@ -3,7 +3,9 @@ package formula
 import (
 	"context"
 	"fmt"
-	"log"
+	"maps"
+	"strings"
+	"sync/atomic"
 )
 
 // Compile loads a formula by name and runs the full compilation pipeline.
@@ -12,7 +14,7 @@ import (
 //
 // vars is used only for compile-time step condition filtering: steps whose
 // condition field evaluates to false given vars are excluded. Pass nil to
-// include all steps.
+// use formula-defined variable defaults for condition evaluation.
 //
 // The pipeline stages are:
 //  1. LoadByName — load formula TOML from search paths
@@ -41,6 +43,16 @@ func Compile(_ context.Context, name string, searchPaths []string, vars map[stri
 		return nil, fmt.Errorf("resolving formula %q: %w", name, err)
 	}
 
+	// Validate required vars only when the caller explicitly provided them.
+	// nil = include-all-steps mode (order dispatch); empty = read-only display
+	// (formula show). Both skip validation. Non-empty = user-supplied vars from
+	// sling, cook, or API — validate.
+	if len(vars) > 0 {
+		if err := ValidateVars(resolved, vars); err != nil {
+			return nil, fmt.Errorf("formula %q: %w", name, err)
+		}
+	}
+
 	compileVars := make(map[string]string)
 	for vname, def := range resolved.Vars {
 		if def != nil && def.Default != nil {
@@ -64,7 +76,7 @@ func Compile(_ context.Context, name string, searchPaths []string, vars map[stri
 	}
 
 	// Stage 5: Apply inline step expansions
-	inlineExpandedSteps, err := ApplyInlineExpansions(resolved.Steps, parser)
+	inlineExpandedSteps, err := ApplyInlineExpansionsWithVars(resolved.Steps, parser, compileVars)
 	if err != nil {
 		return nil, fmt.Errorf("applying inline expansions to %q: %w", name, err)
 	}
@@ -95,14 +107,12 @@ func Compile(_ context.Context, name string, searchPaths []string, vars map[stri
 		}
 	}
 
-	// Stage 8: Apply step condition filtering if vars provided
-	if vars != nil {
-		filteredSteps, err := FilterStepsByCondition(resolved.Steps, compileVars)
-		if err != nil {
-			return nil, fmt.Errorf("filtering steps by condition: %w", err)
-		}
-		resolved.Steps = filteredSteps
+	// Stage 8: Apply step condition filtering
+	filteredSteps, err := FilterStepsByCondition(resolved.Steps, compileVars)
+	if err != nil {
+		return nil, fmt.Errorf("filtering steps by condition: %w", err)
 	}
+	resolved.Steps = filteredSteps
 
 	// Stage 9: Handle standalone expansion formulas
 	if resolved.Type == TypeExpansion && len(resolved.Template) > 0 {
@@ -118,6 +128,11 @@ func Compile(_ context.Context, name string, searchPaths []string, vars map[stri
 		if err := MaterializeExpansion(resolved, "main", expansionVars); err != nil {
 			return nil, fmt.Errorf("standalone expansion %q: %w", name, err)
 		}
+		filteredSteps, err := FilterStepsByCondition(resolved.Steps, expansionVars)
+		if err != nil {
+			return nil, fmt.Errorf("filtering conditioned steps in standalone expansion %q: %w", name, err)
+		}
+		resolved.Steps = filteredSteps
 	}
 
 	// Stage 10: Expand inline retry-managed steps.
@@ -134,16 +149,20 @@ func Compile(_ context.Context, name string, searchPaths []string, vars map[stri
 	}
 	resolved.Steps = ralphSteps
 
-	// Stage 12: Add graph-first control beads for v2 workflow formulas.
-	ApplyGraphControls(resolved)
+	graphWorkflow, err := isGraphWorkflow(resolved, IsFormulaV2Enabled())
+	if err != nil {
+		return nil, err
+	}
+	if graphWorkflow {
+		// Stage 12: Add graph-first control beads for graph workflow formulas.
+		ApplyGraphControls(resolved)
+	}
 
 	// Stage 13: Flatten to Recipe
-	return toRecipe(resolved)
+	return toRecipeWithGraph(resolved, graphWorkflow)
 }
 
-// toRecipe converts a resolved Formula into a Recipe by flattening the
-// step tree into an ordered list with namespaced IDs and dependency edges.
-func toRecipe(f *Formula) (*Recipe, error) {
+func toRecipeWithGraph(f *Formula, graphWorkflow bool) (*Recipe, error) {
 	r := &Recipe{
 		Name:        f.Formula,
 		Description: f.Description,
@@ -151,8 +170,6 @@ func toRecipe(f *Formula) (*Recipe, error) {
 		Phase:       f.Phase,
 		Pour:        f.Pour,
 	}
-
-	graphWorkflow := isGraphWorkflow(f)
 
 	// Determine root title: use {{title}} placeholder if the variable
 	// is defined, otherwise fall back to formula name.
@@ -180,9 +197,7 @@ func toRecipe(f *Formula) (*Recipe, error) {
 	}
 	if graphWorkflow {
 		rootStep.Metadata = map[string]string{"gc.kind": "workflow"}
-		if f.Version >= 2 {
-			rootStep.Metadata["gc.formula_contract"] = "graph.v2"
-		}
+		rootStep.Metadata["gc.formula_contract"] = "graph.v2"
 	}
 	defPriority := 2
 	rootStep.Priority = &defPriority
@@ -202,13 +217,11 @@ func toRecipe(f *Formula) (*Recipe, error) {
 	collectRecipeDeps(f.Steps, idMapping, &r.Deps)
 	if graphWorkflow {
 		addWorkflowRootDeps(f.Formula, f.Steps, idMapping, &r.Deps)
-		if f.Version >= 2 {
-			orderedSteps, err := orderGraphRecipeSteps(f.Formula, r.Steps, r.Deps)
-			if err != nil {
-				return nil, err
-			}
-			r.Steps = orderedSteps
+		orderedSteps, err := orderGraphRecipeSteps(f.Formula, r.Steps, r.Deps)
+		if err != nil {
+			return nil, err
 		}
+		r.Steps = orderedSteps
 	}
 
 	return r, nil
@@ -301,6 +314,16 @@ func flattenSteps(steps []*Step, parentID string, idMapping map[string]string, o
 			stepType = "epic"
 		}
 
+		metadata := step.Metadata
+		if isSourceSpecStep(step) {
+			metadata = maps.Clone(step.Metadata)
+			if specForRef := metadata["gc.spec_for_ref"]; specForRef != "" {
+				if mapped, ok := idMapping[specForRef]; ok {
+					metadata["gc.spec_for_ref"] = mapped
+				}
+			}
+		}
+
 		rs := RecipeStep{
 			ID:          issueID,
 			Title:       step.Title,
@@ -310,7 +333,7 @@ func flattenSteps(steps []*Step, parentID string, idMapping map[string]string, o
 			Priority:    step.Priority,
 			Labels:      step.Labels,
 			Assignee:    step.Assignee,
-			Metadata:    step.Metadata,
+			Metadata:    metadata,
 		}
 
 		// Add gate label for waits_for field
@@ -378,26 +401,46 @@ func flattenSteps(steps []*Step, parentID string, idMapping map[string]string, o
 	}
 }
 
-// FormulaV2Enabled controls whether graph.v2 formula compilation is
-// allowed. When false, isGraphWorkflow always returns false regardless of
-// the formula's Version field, causing v2 formulas to compile as v1.
+// formulaV2Enabled controls whether graph.v2 formula compilation is allowed.
+// When false, isGraphWorkflow returns an error for formulas that explicitly
+// declare the graph.v2 contract.
 // Set by the daemon config loader from [daemon] formula_v2.
-var FormulaV2Enabled bool
+//
+// Stored as atomic.Bool so config reload can race safely with in-flight
+// compilation without flipping a compile into the hard formula_v2 error.
+// Each compile snapshots the value once via IsFormulaV2Enabled at the top
+// of toRecipe.
+var formulaV2Enabled atomic.Bool
 
-func isGraphWorkflow(f *Formula) bool {
+// SetFormulaV2Enabled sets the graph.v2 formula compilation flag. Safe for
+// concurrent use with IsFormulaV2Enabled; intended for the daemon config
+// loader and tests.
+func SetFormulaV2Enabled(v bool) {
+	formulaV2Enabled.Store(v)
+}
+
+// IsFormulaV2Enabled reports whether graph.v2 formula compilation is
+// allowed. Safe for concurrent use.
+func IsFormulaV2Enabled() bool {
+	return formulaV2Enabled.Load()
+}
+
+func isGraphWorkflow(f *Formula, v2Enabled bool) (bool, error) {
 	if f == nil {
-		return false
+		return false, nil
 	}
-	if !FormulaV2Enabled {
-		if f.Version >= 2 {
-			log.Printf("formula declares version %d but formula_v2 is disabled; compiling as v1", f.Version)
-		}
-		return false
+	graphWorkflow := declaresGraphV2Contract(f)
+	if !graphWorkflow {
+		return false, nil
 	}
-	if f.Version >= 2 {
-		return true
+	if !v2Enabled {
+		return false, fmt.Errorf("formula %q declares contract graph.v2 but formula_v2 is disabled; enable [daemon] formula_v2 or remove the graph.v2 contract", f.Formula)
 	}
-	return hasDetachedGraphSteps(f.Steps)
+	return true, nil
+}
+
+func declaresGraphV2Contract(f *Formula) bool {
+	return f != nil && strings.EqualFold(strings.TrimSpace(f.Contract), "graph.v2")
 }
 
 func isDetachedGraphStep(step *Step) bool {
@@ -410,18 +453,6 @@ func isDetachedGraphStep(step *Step) bool {
 	default:
 		return false
 	}
-}
-
-func hasDetachedGraphSteps(steps []*Step) bool {
-	for _, step := range steps {
-		if isDetachedGraphStep(step) {
-			return true
-		}
-		if hasDetachedGraphSteps(step.Children) {
-			return true
-		}
-	}
-	return false
 }
 
 func addWorkflowRootDeps(rootID string, steps []*Step, idMapping map[string]string, deps *[]RecipeDep) {
@@ -458,7 +489,7 @@ func isWorkflowRootBlocker(step *Step) bool {
 		return false
 	}
 	switch step.Metadata["gc.kind"] {
-	case "run", "check", "retry-run", "retry-eval":
+	case "run", "check", "retry-run", "retry-eval", "spec":
 		return false
 	default:
 		return true

@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -197,6 +200,352 @@ func TestDefaultMailIdentityPrefersSessionIDOverGCAgentFallback(t *testing.T) {
 	}
 }
 
+func TestDefaultMailIdentityCandidates_OrdersSessionIDFirstThenAliasThenAgent(t *testing.T) {
+	t.Setenv("GC_ALIAS", "codeprobe-worker-1")
+	t.Setenv("GC_SESSION_ID", "codeprobe-worker-gc-1941")
+	t.Setenv("GC_AGENT", "codeprobe-worker")
+
+	got := defaultMailIdentityCandidates()
+	want := []string{"codeprobe-worker-gc-1941", "codeprobe-worker-1", "codeprobe-worker"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("defaultMailIdentityCandidates() = %#v, want %#v", got, want)
+	}
+}
+
+func TestDefaultMailIdentityPrefersSessionIDOverAlias(t *testing.T) {
+	t.Setenv("GC_ALIAS", "public-alias")
+	t.Setenv("GC_AGENT", "worker")
+	t.Setenv("GC_SESSION_ID", "session-123")
+
+	if got := defaultMailIdentity(); got != "session-123" {
+		t.Fatalf("defaultMailIdentity() = %q, want session-123", got)
+	}
+}
+
+func TestDefaultMailIdentityCandidates_DedupesAndSkipsEmpty(t *testing.T) {
+	t.Setenv("GC_ALIAS", "mayor")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "mayor")
+
+	got := defaultMailIdentityCandidates()
+	want := []string{"mayor"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("defaultMailIdentityCandidates() = %#v, want %#v", got, want)
+	}
+}
+
+func TestDefaultMailIdentityCandidates_FallsBackToHumanWhenAllEmpty(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	_ = os.Unsetenv("GC_SESSION_ID")
+	_ = os.Unsetenv("GC_AGENT")
+
+	got := defaultMailIdentityCandidates()
+	want := []string{"human"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("defaultMailIdentityCandidates() = %#v, want %#v", got, want)
+	}
+}
+
+// TestResolveDefaultMailTargetsForCommand_UsesGCSessionIDBeforeAlias
+// sets up two possible matches: GC_SESSION_ID points at the concrete worker,
+// while GC_ALIAS points at another session. Default mail resolution must choose
+// the concrete session identity first.
+func TestResolveDefaultMailTargetsForCommand_UsesGCSessionIDBeforeAlias(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	b, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "",
+			"session_name": "codeprobe-worker-gc-1941",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create concrete session: %v", err)
+	}
+	aliasOnly, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "codeprobe-worker-1",
+			"session_name": "stale-alias-session",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create alias session: %v", err)
+	}
+
+	t.Setenv("GC_ALIAS", "codeprobe-worker-1")
+	t.Setenv("GC_SESSION_ID", "codeprobe-worker-gc-1941")
+	t.Setenv("GC_AGENT", "codeprobe-worker")
+
+	var stderr bytes.Buffer
+	target, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	if !ok {
+		t.Fatalf("resolveDefaultMailTargetsForCommand() = not ok; stderr=%q", stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want empty", stderr.String())
+	}
+	foundConcrete := false
+	foundAliasOnly := false
+	for _, r := range target.recipients {
+		if r == b.ID {
+			foundConcrete = true
+		}
+		if r == aliasOnly.ID {
+			foundAliasOnly = true
+		}
+	}
+	if !foundConcrete || foundAliasOnly {
+		t.Fatalf("target.recipients = %#v, want concrete bead %q and not alias bead %q", target.recipients, b.ID, aliasOnly.ID)
+	}
+}
+
+func TestResolveDefaultMailTargetsForCommand_FallsBackToGCAliasWhenSessionIDMissing(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "sky",
+			"session_name": "sky-gc-42",
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	t.Setenv("GC_ALIAS", "sky")
+	t.Setenv("GC_SESSION_ID", "gc-does-not-match")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stderr bytes.Buffer
+	target, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	if !ok {
+		t.Fatalf("resolveDefaultMailTargetsForCommand() = not ok; stderr=%q", stderr.String())
+	}
+	if target.display != "sky" {
+		t.Fatalf("target.display = %q, want sky", target.display)
+	}
+}
+
+func TestResolveDefaultMailSenderForCommand_FallsBackToGCAliasWhenSessionIDMissing(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "sky",
+			"session_name": "sky-gc-42",
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cfg, _ := loadCityConfig(cityPath)
+
+	t.Setenv("GC_SESSION_ID", "gc-does-not-match")
+	t.Setenv("GC_ALIAS", "sky")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stderr bytes.Buffer
+	sender, ok := resolveDefaultMailSenderForCommand(cityPath, cfg, store, &stderr, "gc mail send")
+	if !ok {
+		t.Fatalf("resolveDefaultMailSenderForCommand() = not ok; stderr=%q", stderr.String())
+	}
+	if sender != "sky" {
+		t.Fatalf("sender = %q, want sky", sender)
+	}
+}
+
+func TestCmdMailSendDefaultSenderFallsBackToGCAliasWhenSessionIDMissing(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "sender",
+			"session_name": "sender-gc-42",
+		},
+	}); err != nil {
+		t.Fatalf("Create sender: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "recipient",
+			"session_name": "recipient-gc-42",
+		},
+	}); err != nil {
+		t.Fatalf("Create recipient: %v", err)
+	}
+
+	t.Setenv("GC_SESSION_ID", "gc-does-not-match")
+	t.Setenv("GC_ALIAS", "sender")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"recipient", "hello"}, false, false, "", "", "", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	storeAfter, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := storeAfter.ListOpen()
+	if err != nil {
+		t.Fatalf("ListOpen: %v", err)
+	}
+	var msg beads.Bead
+	found := false
+	for _, b := range all {
+		if b.Type == "message" {
+			msg = b
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("message bead not found; beads=%#v", all)
+	}
+	if msg.From != "sender" {
+		t.Fatalf("message From = %q, want sender", msg.From)
+	}
+	if msg.Assignee != "recipient" {
+		t.Fatalf("message Assignee = %q, want recipient", msg.Assignee)
+	}
+}
+
+func TestResolveDefaultMailTargetsForCommand_HumanDefaultWhenNoEnv(t *testing.T) {
+	t.Setenv("GC_MAIL", "fake")
+	_ = os.Unsetenv("GC_ALIAS")
+	_ = os.Unsetenv("GC_SESSION_ID")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stderr bytes.Buffer
+	target, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	if !ok {
+		t.Fatalf("resolveDefaultMailTargetsForCommand() = not ok; stderr=%q", stderr.String())
+	}
+	if target.display != "human" {
+		t.Fatalf("target.display = %q, want human", target.display)
+	}
+}
+
+// TestResolveDefaultMailTargetsForCommand_StorelessProviderUsesFirstCandidate
+// confirms the storeless-provider shortcut forwards only candidates[0] —
+// the same identity defaultMailIdentity() returns — rather than iterating.
+func TestResolveDefaultMailTargetsForCommand_StorelessProviderUsesFirstCandidate(t *testing.T) {
+	t.Setenv("GC_MAIL", "fake")
+	t.Setenv("GC_ALIAS", "codeprobe-worker-1")
+	t.Setenv("GC_SESSION_ID", "codeprobe-worker-gc-1941")
+	t.Setenv("GC_AGENT", "codeprobe-worker")
+
+	var stderr bytes.Buffer
+	target, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	if !ok {
+		t.Fatalf("resolveDefaultMailTargetsForCommand() = not ok; stderr=%q", stderr.String())
+	}
+	if target.display != "codeprobe-worker-gc-1941" {
+		t.Fatalf("target.display = %q, want codeprobe-worker-gc-1941", target.display)
+	}
+	if len(target.recipients) != 1 || target.recipients[0] != "codeprobe-worker-gc-1941" {
+		t.Fatalf("target.recipients = %#v, want [codeprobe-worker-gc-1941]", target.recipients)
+	}
+}
+
+// TestResolveDefaultMailTargetsForCommand_SurfacesAmbiguousError_AndStops
+// confirms that when a candidate produces a non-ErrSessionNotFound error
+// (here: ErrAmbiguous from two beads sharing the same session_name), the
+// loop surfaces it to stderr and stops iterating rather than falling
+// through to the next candidate.
+func TestResolveDefaultMailTargetsForCommand_SurfacesAmbiguousError_AndStops(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := store.Create(beads.Bead{
+			Type:     session.BeadType,
+			Labels:   []string{session.LabelSession},
+			Metadata: map[string]string{"session_name": "ambiguous-target"},
+		}); err != nil {
+			t.Fatalf("Create(%d): %v", i, err)
+		}
+	}
+
+	t.Setenv("GC_SESSION_ID", "ambiguous-target")
+	t.Setenv("GC_ALIAS", "would-resolve-if-reached")
+	_ = os.Unsetenv("GC_AGENT")
+
+	var stderr bytes.Buffer
+	_, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	if ok {
+		t.Fatalf("resolveDefaultMailTargetsForCommand() ok = true, want false")
+	}
+	if !strings.Contains(stderr.String(), "ambiguous") {
+		t.Fatalf("stderr = %q, want to contain ambiguous", stderr.String())
+	}
+}
+
 func TestDefaultMailIdentityFallsBackToGCAgentWithoutAliasOrSession(t *testing.T) {
 	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "mayor")
@@ -260,7 +609,38 @@ func TestResolveMailTargetsIncludesAliasHistoryAndSessionID(t *testing.T) {
 	}
 }
 
-func TestResolveMailTargetsForCommand_UsesStoreForFakeProviderHistoricalAlias(t *testing.T) {
+func TestResolveMailTargets_BareRigScopedNamedUsesUniqueLiveConfiguredNamedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":                     "frontend/rig-worker",
+			"alias_history":             "old-frontend-worker",
+			"session_name":              "frontend--rig-worker",
+			"configured_named_session":  "true",
+			"configured_named_identity": "frontend/rig-worker",
+			"configured_named_mode":     "always",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	target, err := resolveMailTargets(store, "rig-worker")
+	if err != nil {
+		t.Fatalf("resolveMailTargets: %v", err)
+	}
+	if target.display != "frontend/rig-worker" {
+		t.Fatalf("display = %q, want frontend/rig-worker", target.display)
+	}
+	want := []string{"frontend/rig-worker", b.ID, "old-frontend-worker"}
+	if strings.Join(target.recipients, ",") != strings.Join(want, ",") {
+		t.Fatalf("recipients = %#v, want %#v", target.recipients, want)
+	}
+}
+
+func TestResolveMailTargetsForCommand_FakeProviderDoesNotResolveHistoricalAlias(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_MAIL", "fake")
 
@@ -274,15 +654,14 @@ func TestResolveMailTargetsForCommand_UsesStoreForFakeProviderHistoricalAlias(t 
 	if err != nil {
 		t.Fatalf("openCityStoreAt: %v", err)
 	}
-	b, err := store.Create(beads.Bead{
+	if _, err := store.Create(beads.Bead{
 		Type:   session.BeadType,
 		Labels: []string{session.LabelSession},
 		Metadata: map[string]string{
 			"alias":         "sky",
 			"alias_history": "mayor",
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("Create(session): %v", err)
 	}
 
@@ -294,10 +673,10 @@ func TestResolveMailTargetsForCommand_UsesStoreForFakeProviderHistoricalAlias(t 
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
-	if target.display != "sky" {
-		t.Fatalf("display = %q, want sky", target.display)
+	if target.display != "mayor" {
+		t.Fatalf("display = %q, want mayor", target.display)
 	}
-	want := []string{"sky", b.ID, "mayor"}
+	want := []string{"mayor"}
 	if strings.Join(target.recipients, ",") != strings.Join(want, ",") {
 		t.Fatalf("recipients = %#v, want %#v", target.recipients, want)
 	}
@@ -371,7 +750,7 @@ template = "mayor"
 	}
 }
 
-func TestConfiguredMailboxAddressResolvesCityUniqueBareNamedSession(t *testing.T) {
+func TestConfiguredMailboxAddressResolvesQualifiedNamedSession(t *testing.T) {
 	cityPath := t.TempDir()
 	cityToml := `[workspace]
 name = "test-city"
@@ -390,7 +769,7 @@ dir = "demo"
 	}
 	t.Setenv("GC_CITY", cityPath)
 
-	address, ok := configuredMailboxAddress("witness")
+	address, ok := configuredMailboxAddress("demo/witness")
 	if !ok {
 		t.Fatal("configuredMailboxAddress() = not ok, want ok")
 	}
@@ -399,7 +778,7 @@ dir = "demo"
 	}
 }
 
-func TestResolveMailRecipientIdentity_TemplatePrefixCreatesFreshSession(t *testing.T) {
+func TestResolveMailRecipientIdentity_RejectsTemplatePrefixOnSessionSurface(t *testing.T) {
 	t.Setenv("GC_SESSION", "fake")
 
 	store := beads.NewMemStore()
@@ -414,12 +793,87 @@ func TestResolveMailRecipientIdentity_TemplatePrefixCreatesFreshSession(t *testi
 		}},
 	}
 
-	address, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "template:mayor")
-	if err != nil {
-		t.Fatalf("resolveMailRecipientIdentity(template:mayor): %v", err)
+	_, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "template:mayor")
+	if !errors.Is(err, session.ErrSessionNotFound) {
+		t.Fatalf("resolveMailRecipientIdentity(template:mayor) = %v, want ErrSessionNotFound", err)
 	}
-	if address == "mayor" {
-		t.Fatalf("address = %q, want fresh session mailbox identity", address)
+
+	all, err := store.ListByLabel(session.LabelSession, 0)
+	if err != nil {
+		t.Fatalf("ListByLabel: %v", err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("session bead count = %d, want 0", len(all))
+	}
+}
+
+func TestResolveMailRecipientIdentity_BareNamedSessionUsesConfiguredMailboxWithoutMaterializing(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "mayor",
+			StartCommand: "true",
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "mayor",
+			Mode:     "always",
+		}},
+	}
+
+	address, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "mayor")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(mayor): %v", err)
+	}
+	if address != "mayor" {
+		t.Fatalf("address = %q, want configured mailbox mayor", address)
+	}
+
+	all, err := store.ListByLabel(session.LabelSession, 0)
+	if err != nil {
+		t.Fatalf("ListByLabel: %v", err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("session bead count = %d, want 0", len(all))
+	}
+}
+
+func TestResolveMailRecipientIdentity_BareNamedSessionUsesExistingLiveMailboxWithoutMaterializing(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "mayor",
+			StartCommand: "true",
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "mayor",
+			Mode:     "always",
+		}},
+	}
+	existing, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "mayor",
+			"template":     "mayor",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(existing session): %v", err)
+	}
+
+	address, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "mayor")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(mayor): %v", err)
+	}
+	if address != "mayor" {
+		t.Fatalf("address = %q, want existing live mailbox mayor", address)
 	}
 
 	all, err := store.ListByLabel(session.LabelSession, 0)
@@ -429,12 +883,199 @@ func TestResolveMailRecipientIdentity_TemplatePrefixCreatesFreshSession(t *testi
 	if len(all) != 1 {
 		t.Fatalf("session bead count = %d, want 1", len(all))
 	}
-	if all[0].Metadata["alias"] != "" {
-		t.Fatalf("fresh template mailbox alias = %q, want empty", all[0].Metadata["alias"])
+	if all[0].ID != existing.ID {
+		t.Fatalf("session bead ID = %q, want existing %q", all[0].ID, existing.ID)
+	}
+}
+
+func TestResolveMailRecipientIdentity_BareRigScopedNamedUsesUniqueLiveConfiguredNamedSession(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "rig-worker",
+			Dir:          "frontend",
+			StartCommand: "true",
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "rig-worker",
+			Dir:      "frontend",
+			Mode:     "always",
+		}},
+	}
+
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":                     "frontend/rig-worker",
+			"session_name":              "frontend--rig-worker",
+			"configured_named_session":  "true",
+			"configured_named_identity": "frontend/rig-worker",
+			"configured_named_mode":     "always",
+		},
+	}); err != nil {
+		t.Fatalf("Create(session): %v", err)
+	}
+
+	address, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "rig-worker")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(rig-worker): %v", err)
+	}
+	if address != "frontend/rig-worker" {
+		t.Fatalf("address = %q, want frontend/rig-worker", address)
+	}
+
+	all, err := store.ListByLabel(session.LabelSession, 0)
+	if err != nil {
+		t.Fatalf("ListByLabel: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("session bead count = %d, want 1", len(all))
+	}
+}
+
+func TestResolveMailRecipientIdentity_BareRigScopedNamedRejectsAmbiguousLiveConfiguredNamedSessions(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+
+	store := beads.NewMemStore()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+
+	for _, identity := range []string{"frontend/rig-worker", "backend/rig-worker"} {
+		if _, err := store.Create(beads.Bead{
+			Type:   session.BeadType,
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"alias":                     identity,
+				"session_name":              strings.ReplaceAll(identity, "/", "--"),
+				"configured_named_session":  "true",
+				"configured_named_identity": identity,
+				"configured_named_mode":     "always",
+			},
+		}); err != nil {
+			t.Fatalf("Create(%s): %v", identity, err)
+		}
+	}
+
+	_, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "rig-worker")
+	if !errors.Is(err, session.ErrAmbiguous) {
+		t.Fatalf("resolveMailRecipientIdentity(rig-worker) = %v, want ErrAmbiguous", err)
 	}
 }
 
 // --- gc mail inbox ---
+
+func TestCmdMailInbox_ManagedExecLifecycleProviderReadsInbox(t *testing.T) {
+	cityDir, _ := setupManagedBdWaitTestCity(t)
+
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt(%q): %v", cityDir, err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "managed exec session",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "mayor",
+			"alias":        "mayor",
+			"template":     "worker",
+			"state":        "asleep",
+		},
+	}); err != nil {
+		t.Fatalf("store.Create(session bead): %v", err)
+	}
+	mp := beadmail.New(store)
+	if _, err := mp.Send("human", "mayor", "status", "hello from exec provider"); err != nil {
+		t.Fatalf("mp.Send(): %v", err)
+	}
+
+	t.Setenv("GC_BEADS", "exec:"+gcBeadsBdScriptPath(cityDir))
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailInbox([]string{"mayor"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdMailInbox() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"FROM", "SUBJECT", "BODY", "human", "status", "hello from exec provider"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCmdMailInbox_ManagedExecLifecycleProviderRecoversAfterHardKillPortRebind(t *testing.T) {
+	cityDir, _ := setupManagedBdWaitTestCity(t)
+
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt(%q): %v", cityDir, err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "managed exec session",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "city-worker",
+			"alias":        "city-worker",
+			"template":     "worker",
+			"state":        "asleep",
+		},
+	}); err != nil {
+		t.Fatalf("store.Create(session bead): %v", err)
+	}
+	mp := beadmail.New(store)
+	if _, err := mp.Send("human", "city-worker", "status", "hello after managed rebind"); err != nil {
+		t.Fatalf("mp.Send(): %v", err)
+	}
+
+	before, err := readDoltRuntimeStateFile(managedDoltStatePath(cityDir))
+	if err != nil {
+		t.Fatalf("readDoltRuntimeStateFile(before): %v", err)
+	}
+	if before.PID <= 0 || before.Port <= 0 {
+		t.Fatalf("unexpected managed runtime before fault: %+v", before)
+	}
+	if err := syscall.Kill(before.PID, syscall.SIGKILL); err != nil {
+		t.Fatalf("Kill(%d): %v", before.PID, err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for pidAlive(before.PID) && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	occupyManagedDoltPort(t, before.Port)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailInbox([]string{"city-worker"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdMailInbox() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if out := stdout.String(); !strings.Contains(out, "hello after managed rebind") {
+		t.Fatalf("stdout missing recovered mail:\n%s", out)
+	}
+
+	var after doltRuntimeState
+	deadline = time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		state, err := readDoltRuntimeStateFile(managedDoltStatePath(cityDir))
+		if err == nil && state.Running && state.Port > 0 && state.Port != before.Port && state.PID > 0 && pidAlive(state.PID) {
+			after = state
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if after.Port == 0 {
+		after, err = readDoltRuntimeStateFile(managedDoltStatePath(cityDir))
+		if err != nil {
+			t.Fatalf("readDoltRuntimeStateFile(after): %v", err)
+		}
+		t.Fatalf("managed Dolt did not rebind after gc mail inbox recovery; before=%+v after=%+v", before, after)
+	}
+}
 
 func TestMailInboxEmpty(t *testing.T) {
 	store := beads.NewMemStore()
@@ -647,7 +1288,7 @@ func TestMailReplySuccess(t *testing.T) {
 	mp.Send("alice", "bob", "Hello", "first") //nolint:errcheck
 
 	var stdout, stderr bytes.Buffer
-	code := doMailReply(mp, events.Discard, "gc-1", "bob", "RE: Hello", "reply body", false, &stdout, &stderr)
+	code := doMailReply(mp, events.Discard, "gc-1", "bob", "RE: Hello", "reply body", nil, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doMailReply = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -656,6 +1297,100 @@ func TestMailReplySuccess(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "to alice") {
 		t.Errorf("stdout = %q, want reply addressed to alice", stdout.String())
+	}
+}
+
+func TestMailReplyNotifySuccess(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	mp.Send("alice", "bob", "Hello", "first") //nolint:errcheck
+
+	var nudged string
+	nf := func(recipient string) error {
+		nudged = recipient
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailReply(mp, events.Discard, "gc-1", "bob", "RE: Hello", "reply body", nf, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailReply = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Replied to gc-1") {
+		t.Errorf("stdout = %q, want reply confirmation", stdout.String())
+	}
+	if nudged != "alice" {
+		t.Errorf("nudgeFn called with %q, want %q", nudged, "alice")
+	}
+}
+
+func TestMailReplyNotifyNudgeError(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	mp.Send("alice", "bob", "Hello", "first") //nolint:errcheck
+
+	nf := func(_ string) error {
+		return fmt.Errorf("session not found")
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailReply(mp, events.Discard, "gc-1", "bob", "RE: Hello", "reply body", nf, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailReply = %d, want 0 (nudge failure is non-fatal); stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Replied to gc-1") {
+		t.Errorf("stdout = %q, want reply confirmation", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "nudge failed") {
+		t.Errorf("stderr = %q, want nudge failure warning", stderr.String())
+	}
+}
+
+func TestCmdMailReply_FallsBackToGCSessionIDWhenAliasMissing(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	sessionBead, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "",
+			"session_name": "codeprobe-worker-gc-1941",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session): %v", err)
+	}
+
+	mp := beadmail.New(store)
+	if _, err := mp.Send("alice", sessionBead.ID, "Hello", "first"); err != nil {
+		t.Fatalf("mp.Send(): %v", err)
+	}
+
+	t.Setenv("GC_ALIAS", "codeprobe-worker-1")
+	t.Setenv("GC_SESSION_ID", "codeprobe-worker-gc-1941")
+	t.Setenv("GC_AGENT", "codeprobe-worker")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{"gc-2", "reply body"}, "", "", false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailReply() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Replied to gc-2") {
+		t.Fatalf("stdout = %q, want reply confirmation", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "to alice") {
+		t.Fatalf("stdout = %q, want reply addressed to alice", stdout.String())
 	}
 }
 

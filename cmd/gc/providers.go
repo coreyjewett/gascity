@@ -44,20 +44,28 @@ func loadSessionProviderContext() sessionProviderContext {
 		providerName: os.Getenv("GC_SESSION"),
 	}
 	if cp, err := resolveCity(); err == nil {
-		ctx.cityPath = cp
-		if cfg, err := loadCityConfig(cp); err == nil {
-			ctx.cfg = cfg
-			ctx.sc = cfg.Session
-			ctx.cityName = cfg.Workspace.Name
-			if ctx.cityName == "" {
-				ctx.cityName = filepath.Base(cp)
-			}
-			ctx.agents = cfg.Agents
-			ctx.sessionTemplate = cfg.Workspace.SessionTemplate
-			if ctx.providerName == "" {
-				ctx.providerName = cfg.Session.Provider
-			}
+		if cfg, err := loadCityConfig(cp, io.Discard); err == nil {
+			return sessionProviderContextForCity(cfg, cp, ctx.providerName)
 		}
+	}
+	return ctx
+}
+
+func sessionProviderContextForCity(cfg *config.City, cityPath, providerOverride string) sessionProviderContext {
+	ctx := sessionProviderContext{
+		providerName: providerOverride,
+		cfg:          cfg,
+		cityPath:     cityPath,
+	}
+	if cfg == nil {
+		return ctx
+	}
+	ctx.sc = cfg.Session
+	ctx.cityName = loadedCityName(cfg, cityPath)
+	ctx.agents = cfg.Agents
+	ctx.sessionTemplate = cfg.Workspace.SessionTemplate
+	if ctx.providerName == "" {
+		ctx.providerName = cfg.Session.Provider
 	}
 	return ctx
 }
@@ -146,6 +154,12 @@ func newSessionProvider() runtime.Provider {
 	return newSessionProviderFromContext(ctx, sessionBeads)
 }
 
+func newSessionProviderForCity(cfg *config.City, cityPath string) runtime.Provider {
+	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
+	sessionBeads := loadProviderSessionSnapshot(ctx)
+	return newSessionProviderFromContext(ctx, sessionBeads)
+}
+
 func loadProviderSessionSnapshot(ctx sessionProviderContext) *sessionBeadSnapshot {
 	if ctx.cityPath == "" || ctx.providerName == "acp" || !hasACPAgents(ctx.agents) {
 		return nil
@@ -224,25 +238,151 @@ func displayProviderName(name string) string {
 	return name
 }
 
-// rawBeadsProvider returns the raw bead store provider name from config.
-// Priority: GC_BEADS env var → city.toml [beads].provider → "bd" default.
-// This is the unmodified config value; use beadsProvider() for lifecycle
-// routing which remaps "bd" → exec:.
-func rawBeadsProvider(cityPath string) string {
-	if v := os.Getenv("GC_BEADS"); v != "" {
+func configuredBeadsProviderValue(cityPath string) string {
+	if v := strings.TrimSpace(os.Getenv("GC_BEADS")); v != "" {
 		return v
 	}
-	// Try to read provider from city.toml.
-	cfg, err := loadCityConfig(cityPath)
-	if err == nil && cfg.Beads.Provider != "" {
-		return cfg.Beads.Provider
+	return strings.TrimSpace(peekBeadsProvider(filepath.Join(cityPath, "city.toml")))
+}
+
+func scopedBeadsProviderOverride(cityPath, scopeRoot string) (string, bool) {
+	provider := strings.TrimSpace(os.Getenv("GC_BEADS"))
+	if provider == "" {
+		return "", false
+	}
+	scopedRoot := strings.TrimSpace(os.Getenv("GC_BEADS_SCOPE_ROOT"))
+	if scopedRoot == "" {
+		return provider, true
+	}
+	if samePath(resolveStoreScopeRoot(cityPath, scopedRoot), scopeRoot) {
+		return provider, true
+	}
+	return "", false
+}
+
+// normalizeRawBeadsProvider maps the city-managed gc-beads-bd wrapper back to
+// the logical "bd" provider for command-time store selection. Managed sessions
+// set GC_BEADS=exec:<cityPath>/.gc/system/packs/bd/assets/scripts/gc-beads-bd.sh
+// so lifecycle operations stay pinned to the city's Dolt server, but general
+// gc commands still need a CRUD-capable store.
+func normalizeRawBeadsProvider(cityPath, provider string) string {
+	provider = strings.TrimSpace(provider)
+	if provider == "" || !strings.HasPrefix(provider, "exec:") || execProviderBase(provider) != "gc-beads-bd" || cityPath == "" {
+		return provider
+	}
+	script := strings.TrimSpace(strings.TrimPrefix(provider, "exec:"))
+	if samePath(script, gcBeadsBdScriptPath(cityPath)) {
+		return "bd"
+	}
+	return provider
+}
+
+// rawBeadsProvider returns the raw bead store provider name from config.
+// Priority: GC_BEADS env var → city.toml [beads].provider → "bd" default.
+// The city-managed lifecycle wrapper normalizes back to "bd" so nested agent
+// sessions do not re-inherit exec:gc-beads-bd for raw data operations.
+func rawBeadsProvider(cityPath string) string {
+	if provider := configuredBeadsProviderValue(cityPath); provider != "" {
+		return normalizeRawBeadsProvider(cityPath, provider)
 	}
 	return "bd"
 }
 
+func rawBeadsProviderFromConfig(cityPath string) string {
+	if provider := strings.TrimSpace(peekBeadsProvider(filepath.Join(cityPath, "city.toml"))); provider != "" {
+		return normalizeRawBeadsProvider(cityPath, provider)
+	}
+	return "bd"
+}
+
+func providerUsesBdStoreContract(provider string) bool {
+	provider = strings.TrimSpace(provider)
+	if provider == "" || provider == "bd" {
+		return true
+	}
+	if strings.HasPrefix(provider, "exec:") && execProviderBase(provider) == "gc-beads-bd" {
+		return true
+	}
+	return false
+}
+
+func cityUsesBdStoreContract(cityPath string) bool {
+	return providerUsesBdStoreContract(rawBeadsProvider(cityPath))
+}
+
+func rawBeadsProviderForScope(scopeRoot, cityPath string) string {
+	runtimeCityPath := cityPath
+	if runtimeCityPath == "" {
+		runtimeCityPath = cityForStoreDir(scopeRoot)
+	}
+	resolvedScopeRoot := resolveStoreScopeRoot(runtimeCityPath, scopeRoot)
+	if explicit, ok := scopedBeadsProviderOverride(runtimeCityPath, resolvedScopeRoot); ok {
+		return normalizeRawBeadsProvider(runtimeCityPath, explicit)
+	}
+	provider := rawBeadsProvider(runtimeCityPath)
+	if strings.TrimSpace(os.Getenv("GC_BEADS_SCOPE_ROOT")) != "" {
+		provider = rawBeadsProviderFromConfig(runtimeCityPath)
+	}
+	if samePath(resolvedScopeRoot, runtimeCityPath) {
+		return provider
+	}
+	if strings.HasPrefix(provider, "exec:") && !providerUsesBdStoreContract(provider) {
+		return provider
+	}
+	// Mixed-provider workspaces can keep legacy bd-backed rigs under a
+	// file-backed city (and vice versa). Prefer explicit scope-local store
+	// markers over the city default so scoped commands keep talking to the
+	// rig's actual beads backend. The bd routing identity is metadata.json;
+	// config.yaml is a compatibility mirror and can survive migrations.
+	if scopeUsesBdStoreContract(resolvedScopeRoot) {
+		return "bd"
+	}
+	if scopeUsesFileStoreContract(resolvedScopeRoot) {
+		return "file"
+	}
+	return provider
+}
+
+func scopeUsesManagedBdStoreContract(cityPath, scopeRoot string) bool {
+	return providerUsesBdStoreContract(rawBeadsProviderForScope(scopeRoot, cityPath))
+}
+
+func rigUsesManagedBdStoreContract(cityPath string, rig config.Rig) bool {
+	if strings.TrimSpace(rig.Path) == "" {
+		return false
+	}
+	return scopeUsesManagedBdStoreContract(cityPath, rig.Path)
+}
+
+func workspaceUsesManagedBdStoreContract(cityPath string, rigs []config.Rig) bool {
+	if scopeUsesManagedBdStoreContract(cityPath, cityPath) {
+		return true
+	}
+	for _, rig := range rigs {
+		if rigUsesManagedBdStoreContract(cityPath, rig) {
+			return true
+		}
+	}
+	return false
+}
+
+func scopeUsesBdStoreContract(scopeRoot string) bool {
+	_, err := os.Stat(filepath.Join(scopeRoot, ".beads", "metadata.json"))
+	return err == nil
+}
+
+func scopeUsesFileStoreContract(scopeRoot string) bool {
+	if scopeUsesBdStoreContract(scopeRoot) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(scopeRoot, ".gc", "beads.json"))
+	return err == nil
+}
+
 // beadsProvider returns the bead store provider name for lifecycle operations.
-// Maps "bd" → "exec:<cityPath>/.gc/system/bin/gc-beads-bd" so all lifecycle operations
-// route through the exec: protocol. Other providers pass through unchanged.
+// Maps "bd" → "exec:<cityPath>/.gc/system/packs/bd/assets/scripts/gc-beads-bd.sh"
+// so all lifecycle operations route through the exec: protocol. Other providers
+// pass through unchanged.
 //
 // Related env vars:
 //   - GC_DOLT=skip — the gc-beads-bd script checks this and exits 2 for all
@@ -250,9 +390,15 @@ func rawBeadsProvider(cityPath string) string {
 func beadsProvider(cityPath string) string {
 	raw := rawBeadsProvider(cityPath)
 	if raw == "bd" {
-		return "exec:" + filepath.Join(cityPath, citylayout.SystemBinRoot, "gc-beads-bd")
+		return "exec:" + gcBeadsBdScriptPath(cityPath)
 	}
 	return raw
+}
+
+// gcBeadsBdScriptPath returns the absolute path to the gc-beads-bd script
+// inside the materialized bd pack (.gc/system/packs/bd/assets/scripts/).
+func gcBeadsBdScriptPath(cityPath string) string {
+	return filepath.Join(cityPath, citylayout.SystemPacksRoot, "bd", "assets", "scripts", "gc-beads-bd.sh")
 }
 
 // mailProviderName returns the mail provider name.
@@ -262,7 +408,7 @@ func mailProviderName() string {
 		return v
 	}
 	if cp, err := resolveCity(); err == nil {
-		if cfg, err := loadCityConfig(cp); err == nil && cfg.Mail.Provider != "" {
+		if cfg, err := loadCityConfig(cp, io.Discard); err == nil && cfg.Mail.Provider != "" {
 			return cfg.Mail.Provider
 		}
 	}
@@ -315,7 +461,7 @@ func eventsProviderName() string {
 		return v
 	}
 	if cp, err := resolveCity(); err == nil {
-		if cfg, err := loadCityConfig(cp); err == nil && cfg.Events.Provider != "" {
+		if cfg, err := loadCityConfig(cp, io.Discard); err == nil && cfg.Events.Provider != "" {
 			return cfg.Events.Provider
 		}
 	}

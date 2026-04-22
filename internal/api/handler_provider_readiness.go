@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/searchpath"
 	"gopkg.in/yaml.v3"
 )
 
@@ -101,6 +101,7 @@ type readinessResponse struct {
 type providerReadiness struct {
 	DisplayName string `json:"display_name"`
 	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
 }
 
 // ReadinessItem is the normalized readiness result for one probed item.
@@ -109,6 +110,7 @@ type ReadinessItem struct {
 	Kind        string `json:"kind"`
 	DisplayName string `json:"display_name"`
 	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
 }
 
 type claudeAuthStatus struct {
@@ -137,6 +139,7 @@ type githubAuthHost struct {
 
 type providerProbeResult struct {
 	status string
+	detail string
 }
 
 type readinessItemSet map[string]struct{}
@@ -155,43 +158,6 @@ type cachedProviderProbe struct {
 type cachedProviderProbeStore struct {
 	mu      sync.Mutex
 	entries map[string]cachedProviderProbe
-}
-
-func handleProviderReadiness(w http.ResponseWriter, r *http.Request) {
-	providers, err := parseRequestedReadinessItems(
-		r.URL.Query().Get("providers"),
-		"providers",
-		defaultProviderReadinessItems,
-		supportedProviderReadiness,
-	)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-		return
-	}
-	fresh, err := parseFreshParam(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-		return
-	}
-
-	resp, err := buildReadinessResponse(r.Context(), providers, fresh)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-
-	providerResp := providerReadinessResponse{
-		Providers: make(map[string]providerReadiness, len(providers)),
-	}
-	for _, provider := range providers {
-		item := resp.Items[provider]
-		providerResp.Providers[provider] = providerReadiness{
-			DisplayName: item.DisplayName,
-			Status:      item.Status,
-		}
-	}
-
-	writeJSON(w, http.StatusOK, providerResp)
 }
 
 // SupportsProviderReadiness reports whether the named provider has a built-in
@@ -217,31 +183,6 @@ func ProbeProviders(ctx context.Context, providers []string, fresh bool) (map[st
 		out[provider] = resp.Items[provider]
 	}
 	return out, nil
-}
-
-func handleReadiness(w http.ResponseWriter, r *http.Request) {
-	items, err := parseRequestedReadinessItems(
-		r.URL.Query().Get("items"),
-		"items",
-		defaultReadinessItems,
-		supportedReadiness,
-	)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-		return
-	}
-	fresh, err := parseFreshParam(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid", err.Error())
-		return
-	}
-
-	resp, err := buildReadinessResponse(r.Context(), items, fresh)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, resp)
 }
 
 func parseRequestedReadinessItems(
@@ -297,21 +238,6 @@ func validateRequestedReadinessItems(items []string, allowed readinessItemSet, l
 	return out, nil
 }
 
-func parseFreshParam(r *http.Request) (bool, error) {
-	fresh := strings.TrimSpace(r.URL.Query().Get("fresh"))
-	if fresh == "" {
-		return false, nil
-	}
-	switch fresh {
-	case "0":
-		return false, nil
-	case "1":
-		return true, nil
-	default:
-		return false, errors.New("fresh must be 0 or 1")
-	}
-}
-
 func workspaceHomeDir() (string, error) {
 	if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
 		return home, nil
@@ -343,6 +269,7 @@ func buildReadinessResponse(
 			Kind:        spec.kind,
 			DisplayName: spec.displayName,
 			Status:      result.status,
+			Detail:      result.detail,
 		}
 	}
 	return resp, nil
@@ -403,112 +330,112 @@ func (s *cachedProviderProbeStore) store(key string, result providerProbeResult)
 func probeClaude(ctx context.Context, homeDir string) providerProbeResult {
 	path, ok := findProbeBinary("claude", homeDir)
 	if !ok {
-		return providerProbeResult{status: probeStatusNotInstalled}
+		return providerProbeResult{status: probeStatusNotInstalled, detail: "claude executable not found in probe PATH"}
 	}
 
 	stdout, _, err := runProbeCommand(ctx, homeDir, 5*time.Second, path, "auth", "status", "--json")
 	if err != nil && strings.TrimSpace(stdout) == "" {
-		return providerProbeResult{status: probeStatusProbeError}
+		return providerProbeResult{status: probeStatusProbeError, detail: "claude auth status failed before returning JSON"}
 	}
 
 	var status claudeAuthStatus
 	if decodeErr := json.Unmarshal([]byte(stdout), &status); decodeErr != nil {
-		return providerProbeResult{status: probeStatusProbeError}
+		return providerProbeResult{status: probeStatusProbeError, detail: "invalid JSON from claude auth status"}
 	}
 	if !status.LoggedIn {
-		return providerProbeResult{status: probeStatusNeedsAuth}
+		return providerProbeResult{status: probeStatusNeedsAuth, detail: "claude is installed but not logged in"}
 	}
 	// Onboarding only supports the first-party claude.ai OAuth flow. API-key
 	// or alternate providers are intentionally treated as unsupported.
 	if status.AuthMethod == "claude.ai" && status.APIProvider == "firstParty" {
 		return providerProbeResult{status: probeStatusConfigured}
 	}
-	return providerProbeResult{status: probeStatusInvalidConfiguration}
+	return providerProbeResult{status: probeStatusInvalidConfiguration, detail: "claude must use claude.ai first-party auth"}
 }
 
 func probeCodex(homeDir string) providerProbeResult {
 	if _, ok := findProbeBinary("codex", homeDir); !ok {
-		return providerProbeResult{status: probeStatusNotInstalled}
+		return providerProbeResult{status: probeStatusNotInstalled, detail: "codex executable not found in probe PATH"}
 	}
 
 	data, err := os.ReadFile(filepath.Join(homeDir, ".codex", "auth.json"))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return providerProbeResult{status: probeStatusNeedsAuth}
+			return providerProbeResult{status: probeStatusNeedsAuth, detail: "missing ~/.codex/auth.json"}
 		}
-		return providerProbeResult{status: probeStatusProbeError}
+		return providerProbeResult{status: probeStatusProbeError, detail: "failed to read ~/.codex/auth.json"}
 	}
 
 	var auth codexAuthFile
 	if err := json.Unmarshal(data, &auth); err != nil {
-		return providerProbeResult{status: probeStatusProbeError}
+		return providerProbeResult{status: probeStatusProbeError, detail: "invalid JSON in ~/.codex/auth.json"}
 	}
 
 	switch strings.ToLower(strings.TrimSpace(auth.AuthMode)) {
 	case "chatgpt":
 		if !codexTokensConfigured(auth.Tokens) {
-			return providerProbeResult{status: probeStatusNeedsAuth}
+			return providerProbeResult{status: probeStatusNeedsAuth, detail: "ChatGPT auth mode is selected but no Codex tokens are stored"}
 		}
 		return providerProbeResult{status: probeStatusConfigured}
 	case "", "none":
-		return providerProbeResult{status: probeStatusNeedsAuth}
+		return providerProbeResult{status: probeStatusNeedsAuth, detail: "Codex auth mode is unset"}
 	case "api_key", "api-key", "apikey":
-		return providerProbeResult{status: probeStatusInvalidConfiguration}
+		return providerProbeResult{status: probeStatusInvalidConfiguration, detail: "ChatGPT auth is required; API key auth is unsupported for onboarding"}
 	default:
-		return providerProbeResult{status: probeStatusInvalidConfiguration}
+		return providerProbeResult{status: probeStatusInvalidConfiguration, detail: fmt.Sprintf("unsupported Codex auth mode %q", auth.AuthMode)}
 	}
 }
 
 func probeGemini(homeDir string) providerProbeResult {
 	if _, ok := findProbeBinary("gemini", homeDir); !ok {
-		return providerProbeResult{status: probeStatusNotInstalled}
+		return providerProbeResult{status: probeStatusNotInstalled, detail: "gemini executable not found in probe PATH"}
 	}
 
 	settingsPath := filepath.Join(homeDir, ".gemini", "settings.json")
 	data, err := os.ReadFile(settingsPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return providerProbeResult{status: probeStatusNeedsAuth}
+			return providerProbeResult{status: probeStatusNeedsAuth, detail: "missing ~/.gemini/settings.json"}
 		}
-		return providerProbeResult{status: probeStatusProbeError}
+		return providerProbeResult{status: probeStatusProbeError, detail: "failed to read ~/.gemini/settings.json"}
 	}
 
 	var settings geminiSettings
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return providerProbeResult{status: probeStatusProbeError}
+		return providerProbeResult{status: probeStatusProbeError, detail: "invalid JSON in ~/.gemini/settings.json"}
 	}
 
 	selectedType := strings.TrimSpace(settings.Security.Auth.SelectedType)
 	switch selectedType {
 	case "":
-		return providerProbeResult{status: probeStatusNeedsAuth}
+		return providerProbeResult{status: probeStatusNeedsAuth, detail: "Gemini selected auth type is unset"}
 	case "oauth-personal":
 		credData, err := os.ReadFile(filepath.Join(homeDir, ".gemini", "oauth_creds.json"))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return providerProbeResult{status: probeStatusNeedsAuth}
+				return providerProbeResult{status: probeStatusNeedsAuth, detail: "missing ~/.gemini/oauth_creds.json"}
 			}
-			return providerProbeResult{status: probeStatusProbeError}
+			return providerProbeResult{status: probeStatusProbeError, detail: "failed to read ~/.gemini/oauth_creds.json"}
 		}
 		var payload map[string]any
 		if err := json.Unmarshal(credData, &payload); err != nil {
-			return providerProbeResult{status: probeStatusProbeError}
+			return providerProbeResult{status: probeStatusProbeError, detail: "invalid JSON in ~/.gemini/oauth_creds.json"}
 		}
 		if !geminiOAuthCredsConfigured(payload) {
-			return providerProbeResult{status: probeStatusNeedsAuth}
+			return providerProbeResult{status: probeStatusNeedsAuth, detail: "Gemini OAuth credentials are missing a refresh token"}
 		}
 		return providerProbeResult{status: probeStatusConfigured}
 	case "gemini-api-key", "vertex-ai", "compute-default-credentials":
-		return providerProbeResult{status: probeStatusInvalidConfiguration}
+		return providerProbeResult{status: probeStatusInvalidConfiguration, detail: fmt.Sprintf("unsupported Gemini auth type %q", selectedType)}
 	default:
-		return providerProbeResult{status: probeStatusInvalidConfiguration}
+		return providerProbeResult{status: probeStatusInvalidConfiguration, detail: fmt.Sprintf("unknown Gemini auth type %q", selectedType)}
 	}
 }
 
 func probeGitHubCLI(ctx context.Context, homeDir string) providerProbeResult {
 	ghPath, ok := findProbeBinary("gh", homeDir)
 	if !ok {
-		return providerProbeResult{status: probeStatusNotInstalled}
+		return providerProbeResult{status: probeStatusNotInstalled, detail: "gh executable not found in probe PATH"}
 	}
 	if githubCLITokenConfigured() {
 		return providerProbeResult{status: probeStatusConfigured}
@@ -518,7 +445,7 @@ func probeGitHubCLI(ctx context.Context, homeDir string) providerProbeResult {
 	if err == nil {
 		var hosts map[string]githubAuthHost
 		if err := yaml.Unmarshal(data, &hosts); err != nil {
-			return providerProbeResult{status: probeStatusProbeError}
+			return providerProbeResult{status: probeStatusProbeError, detail: "invalid YAML in GitHub CLI hosts file"}
 		}
 
 		for _, host := range hosts {
@@ -527,7 +454,7 @@ func probeGitHubCLI(ctx context.Context, homeDir string) providerProbeResult {
 			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return providerProbeResult{status: probeStatusProbeError}
+		return providerProbeResult{status: probeStatusProbeError, detail: "failed to read GitHub CLI hosts file"}
 	}
 
 	return probeGitHubCLIAuthStatus(ctx, homeDir, ghPath)
@@ -566,14 +493,14 @@ func probeGitHubCLIAuthStatus(ctx context.Context, homeDir, ghPath string) provi
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		if strings.TrimSpace(stdout) != "" || strings.TrimSpace(stderr) != "" {
-			return providerProbeResult{status: probeStatusNeedsAuth}
+			return providerProbeResult{status: probeStatusNeedsAuth, detail: "gh auth status reports no stored login"}
 		}
 	}
-	return providerProbeResult{status: probeStatusProbeError}
+	return providerProbeResult{status: probeStatusProbeError, detail: "gh auth status failed without diagnostic output"}
 }
 
 func findProbeBinary(name, homeDir string) (string, bool) {
-	// Readiness probes use a curated, deterministic path rather than the
+	// Readiness probes use a deterministic, user-aware path rather than the
 	// ambient process PATH so API calls do not depend on shell-specific edits.
 	for _, dir := range providerProbeSearchDirs(homeDir, providerProbeGOOS, providerProbePathEnv) {
 		dir = strings.TrimSpace(dir)
@@ -594,51 +521,11 @@ func findProbeBinary(name, homeDir string) (string, bool) {
 }
 
 func providerProbeSearchDirs(homeDir, goos, basePath string) []string {
-	var dirs []string
-	if homeDir != "" {
-		dirs = append(dirs,
-			filepath.Join(homeDir, ".local", "bin"),
-			filepath.Join(homeDir, "bin"),
-		)
-	}
-	dirs = append(dirs, strings.Split(basePath, string(os.PathListSeparator))...)
-	switch goos {
-	case "darwin":
-		dirs = append(dirs,
-			"/opt/homebrew/bin",
-			"/opt/homebrew/sbin",
-			"/opt/local/bin",
-			"/opt/local/sbin",
-		)
-	case "linux":
-		dirs = append(dirs,
-			"/snap/bin",
-			"/home/linuxbrew/.linuxbrew/bin",
-			"/home/linuxbrew/.linuxbrew/sbin",
-		)
-	}
-	return dedupeProbeSearchDirs(dirs)
-}
-
-func dedupeProbeSearchDirs(dirs []string) []string {
-	seen := make(map[string]struct{}, len(dirs))
-	out := make([]string, 0, len(dirs))
-	for _, dir := range dirs {
-		dir = strings.TrimSpace(dir)
-		if dir == "" {
-			continue
-		}
-		if _, ok := seen[dir]; ok {
-			continue
-		}
-		seen[dir] = struct{}{}
-		out = append(out, dir)
-	}
-	return out
+	return searchpath.Expand(homeDir, goos, basePath)
 }
 
 func providerProbeSearchPath(homeDir string) string {
-	return strings.Join(providerProbeSearchDirs(homeDir, providerProbeGOOS, providerProbePathEnv), string(os.PathListSeparator))
+	return searchpath.ExpandPath(homeDir, providerProbeGOOS, providerProbePathEnv)
 }
 
 func runProbeCommand(

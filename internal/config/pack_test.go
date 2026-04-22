@@ -382,6 +382,90 @@ version = "1.0.0"
 	}
 }
 
+func TestExpandPacks_RejectsUnknownPackTomlFields(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/bad/pack.toml", `
+[pack]
+name = "bad"
+schema = 1
+scheam = 1
+`)
+
+	cfg := &City{
+		Rigs: []Rig{
+			{Name: "hw", Path: "/hw", Includes: []string{"packs/bad"}},
+		},
+	}
+
+	err := ExpandPacks(cfg, fsys.OSFS{}, dir, nil)
+	if err == nil {
+		t.Fatal("expected error for unknown pack.toml field")
+	}
+	if !strings.Contains(err.Error(), `unknown field "pack.scheam"`) {
+		t.Fatalf("error should mention unknown pack field, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), `did you mean "schema"`) {
+		t.Fatalf("error should suggest schema, got: %v", err)
+	}
+}
+
+func TestExpandPacks_AcceptsPackDescription(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/described/pack.toml", `
+[pack]
+name = "described"
+schema = 2
+description = "Human-readable pack summary"
+
+[[agent]]
+name = "worker"
+`)
+
+	cfg := &City{
+		Rigs: []Rig{
+			{Name: "hw", Path: "/hw", Includes: []string{"packs/described"}},
+		},
+	}
+
+	if err := ExpandPacks(cfg, fsys.OSFS{}, dir, nil); err != nil {
+		t.Fatalf("ExpandPacks rejected [pack].description: %v", err)
+	}
+}
+
+func TestExpandPacks_RejectsUnknownPackImportFields(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/helper/pack.toml", `
+[pack]
+name = "helper"
+schema = 1
+`)
+	writeFile(t, dir, "packs/bad/pack.toml", `
+[pack]
+name = "bad"
+schema = 2
+
+[imports.helper]
+sorce = "../helper"
+`)
+
+	cfg := &City{
+		Rigs: []Rig{
+			{Name: "hw", Path: "/hw", Includes: []string{"packs/bad"}},
+		},
+	}
+
+	err := ExpandPacks(cfg, fsys.OSFS{}, dir, nil)
+	if err == nil {
+		t.Fatal("expected error for unknown import field")
+	}
+	if !strings.Contains(err.Error(), `unknown field "imports.helper.sorce"`) {
+		t.Fatalf("error should mention unknown import field, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), `did you mean "source"`) {
+		t.Fatalf("error should suggest source, got: %v", err)
+	}
+}
+
 func TestExpandPacks_PromptPathResolution(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/gt/pack.toml", `
@@ -812,7 +896,7 @@ name = "agent-b"
 		Agents: []Agent{{Name: "existing"}},
 	}
 
-	dirs, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	dirs, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -870,7 +954,7 @@ name = "agent-b"
 		}},
 	}
 
-	dirs, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	dirs, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -891,7 +975,7 @@ func TestExpandCityPacks_Empty(t *testing.T) {
 		Agents: []Agent{{Name: "mayor"}},
 	}
 
-	dirs, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, "/tmp")
+	dirs, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -918,7 +1002,7 @@ name = "mayor"
 		Workspace: Workspace{Includes: []string{"packs/gt"}},
 	}
 
-	dirs, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	dirs, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -968,7 +1052,7 @@ name = "agent-b"
 		},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -1206,7 +1290,7 @@ name = "deacon"
 		Agents:    []Agent{{Name: "existing"}},
 	}
 
-	formulaDirs, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	formulaDirs, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -1252,13 +1336,13 @@ dir = "formulas"
 [[agent]]
 name = "mayor"
 `)
-	writeFile(t, dir, "packs/gastown/formulas/mol-a.formula.toml", "test formula")
+	writeFile(t, dir, "packs/gastown/formulas/mol-a.toml", "test formula")
 
 	cfg := &City{
 		Workspace: Workspace{Includes: []string{"packs/gastown"}},
 	}
 
-	formulaDirs, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	formulaDirs, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -1274,7 +1358,7 @@ func TestExpandCityPack_NoPack(t *testing.T) {
 		Agents: []Agent{{Name: "mayor"}},
 	}
 
-	formulaDirs, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, "/tmp")
+	formulaDirs, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, "/tmp")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1308,7 +1392,7 @@ name = "mayor"
 		},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -1427,7 +1511,7 @@ dir = "formulas"
 [[agent]]
 name = "witness"
 `)
-	writeFile(t, dir, "packs/gt/formulas/mol-a.formula.toml", "test")
+	writeFile(t, dir, "packs/gt/formulas/mol-a.toml", "test")
 
 	cfg := &City{
 		Rigs: []Rig{
@@ -1474,7 +1558,7 @@ name = "witness"
 	}
 }
 
-func TestExpandPacks_SessionSetupScriptAdjusted(t *testing.T) {
+func TestExpandPacks_SessionSetupScriptPreserved(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/gt/pack.toml", `
 [pack]
@@ -1497,8 +1581,8 @@ session_setup_script = "scripts/setup.sh"
 		t.Fatalf("ExpandPacks: %v", err)
 	}
 
-	// session_setup_script should be adjusted relative to pack dir → city root.
-	want := "packs/gt/scripts/setup.sh"
+	// session_setup_script stays pack-local and resolves later via SourceDir.
+	want := "scripts/setup.sh"
 	if cfg.Agents[0].SessionSetupScript != want {
 		t.Errorf("SessionSetupScript = %q, want %q", cfg.Agents[0].SessionSetupScript, want)
 	}
@@ -1520,7 +1604,7 @@ name = "mayor"
 		Workspace: Workspace{Includes: []string{"packs/gastown"}},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -1591,7 +1675,7 @@ scope = "rig"
 		Workspace: Workspace{Includes: []string{"packs/combined"}},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -1688,7 +1772,7 @@ name = "beta"
 		Workspace: Workspace{Includes: []string{"packs/simple"}},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -1773,7 +1857,7 @@ name = "overseer"
 		},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err == nil {
 		t.Fatal("expected error for duplicate agent across city packs")
 	}
@@ -1988,7 +2072,7 @@ scope = "rig"
 			Includes: []string{"packs/gastown"},
 		},
 	}
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 
@@ -2243,7 +2327,7 @@ scope = "rig"
 	cfg := &City{
 		Workspace: Workspace{Includes: []string{"packs/gastown"}},
 	}
-	formulaDirs, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	formulaDirs, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -2281,10 +2365,10 @@ schema = 1
 
 [[agent]]
 name = "worker"
-prompt_template = "prompts/worker.md.tmpl"
+prompt_template = "prompts/worker.template.md"
 `)
-	writeFile(t, filepath.Join(topoDir, "prompts"), "worker.md.tmpl", "Worker prompt")
-	writeFile(t, filepath.Join(topoDir, "prompts", "shared"), "common.md.tmpl",
+	writeFile(t, filepath.Join(topoDir, "prompts"), "worker.template.md", "Worker prompt")
+	writeFile(t, filepath.Join(topoDir, "prompts", "shared"), "common.template.md",
 		`{{ define "common" }}shared content{{ end }}`)
 
 	writeFile(t, tmp, "city.toml", `
@@ -2383,7 +2467,7 @@ scope = "rig"
 		},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -2462,7 +2546,7 @@ name = "mayor"
 		},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -2537,7 +2621,7 @@ scope = "city"
 		Workspace: Workspace{Includes: []string{"packs/consumer"}},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -2682,7 +2766,7 @@ agent = "dog"
 		Workspace: Workspace{Includes: []string{"packs/bad"}},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err == nil {
 		t.Fatal("expected error for invalid scope, got nil")
 	}
@@ -2708,7 +2792,7 @@ agent = ""
 		Workspace: Workspace{Includes: []string{"packs/bad"}},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err == nil {
 		t.Fatal("expected error for empty agent, got nil")
 	}
@@ -2753,7 +2837,7 @@ nudge = "fallback dog"
 		},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -2805,7 +2889,7 @@ nudge = "beta dog"
 		},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -2852,7 +2936,7 @@ scope = "city"
 		},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err == nil {
 		t.Fatal("expected collision error for two non-fallback dogs")
 	}
@@ -2880,7 +2964,7 @@ nudge = "standalone fallback"
 		Workspace: Workspace{Includes: []string{"packs/health"}},
 	}
 
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -3036,7 +3120,7 @@ session_setup_script = "scripts/theme.sh"
 	cfg := &City{
 		Workspace: Workspace{Includes: []string{"packs/overlay"}},
 	}
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -3047,12 +3131,14 @@ session_setup_script = "scripts/theme.sh"
 	if a.Name != "worker" {
 		t.Errorf("name = %q, want worker", a.Name)
 	}
-	// session_setup_script should be set (resolved path).
+	// session_setup_script should be resolved against the patch pack since
+	// patches do not retain their own SourceDir at runtime.
 	if a.SessionSetupScript == "" {
 		t.Fatal("SessionSetupScript not set by patch")
 	}
-	if !strings.Contains(a.SessionSetupScript, "scripts/theme.sh") {
-		t.Errorf("SessionSetupScript = %q, want to contain scripts/theme.sh", a.SessionSetupScript)
+	wantScript := filepath.Join(dir, "packs/overlay/scripts/theme.sh")
+	if a.SessionSetupScript != wantScript {
+		t.Errorf("SessionSetupScript = %q, want %q", a.SessionSetupScript, wantScript)
 	}
 	// Nudge should be inherited from base (not cleared by patch).
 	if a.Nudge != "do work" {
@@ -3087,13 +3173,13 @@ overlay_dir = "overlays/custom"
 	cfg := &City{
 		Workspace: Workspace{Includes: []string{"packs/overlay"}},
 	}
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 	a := cfg.Agents[0]
 	// Paths should be resolved relative to the overlay pack dir.
-	wantScript := "packs/overlay/scripts/neon.sh"
+	wantScript := filepath.Join(dir, "packs/overlay/scripts/neon.sh")
 	if a.SessionSetupScript != wantScript {
 		t.Errorf("SessionSetupScript = %q, want %q", a.SessionSetupScript, wantScript)
 	}
@@ -3132,7 +3218,7 @@ nudge = "boo"
 	cfg := &City{
 		Workspace: Workspace{Includes: []string{"packs/overlay"}},
 	}
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err == nil {
 		t.Fatal("expected error for patch targeting nonexistent agent")
 	}
@@ -3172,7 +3258,7 @@ pre_start_append = ["extra.sh"]
 	cfg := &City{
 		Workspace: Workspace{Includes: []string{"packs/overlay"}},
 	}
-	_, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
+	_, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir)
 	if err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
@@ -3184,6 +3270,65 @@ pre_start_append = ["extra.sh"]
 	wantPreStart := []string{"init.sh", "extra.sh"}
 	if !sliceEqual(a.PreStart, wantPreStart) {
 		t.Errorf("PreStart = %v, want %v", a.PreStart, wantPreStart)
+	}
+}
+
+func TestPackLevelPatches_RigScoped(t *testing.T) {
+	dir := t.TempDir()
+	// Base pack with a rig-scoped agent.
+	writeFile(t, dir, "packs/base/pack.toml", `
+[pack]
+name = "base"
+schema = 1
+
+[[agent]]
+name = "witness"
+scope = "rig"
+nudge = "patrol"
+start_command = "claude --model opus"
+`)
+	// Overlay pack includes base and patches the agent's start_command.
+	// This is the rig-scoped case: agents get dir-stamped during recursive
+	// loadPack, so the patch must match by name alone (dir = "").
+	writeFile(t, dir, "packs/overlay/pack.toml", `
+[pack]
+name = "overlay"
+schema = 1
+includes = ["../base"]
+
+[[patches.agent]]
+name = "witness"
+start_command = "claude --model sonnet"
+`)
+
+	cfg := &City{
+		Rigs: []Rig{{
+			Name:     "myrig",
+			Path:     dir,
+			Includes: []string{"packs/overlay"},
+		}},
+	}
+	err := ExpandPacks(cfg, fsys.OSFS{}, dir, nil)
+	if err != nil {
+		t.Fatalf("ExpandPacks: %v", err)
+	}
+	// Find the witness agent for myrig.
+	var found *Agent
+	for i := range cfg.Agents {
+		if cfg.Agents[i].Name == "witness" && cfg.Agents[i].Dir == "myrig" {
+			found = &cfg.Agents[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("witness agent not found for myrig")
+	}
+	if found.StartCommand != "claude --model sonnet" {
+		t.Errorf("StartCommand = %q, want %q", found.StartCommand, "claude --model sonnet")
+	}
+	// Nudge should be inherited from base (not cleared by patch).
+	if found.Nudge != "patrol" {
+		t.Errorf("Nudge = %q, want %q (inherited from base)", found.Nudge, "patrol")
 	}
 }
 
@@ -3234,6 +3379,88 @@ name = "worker"
 	}
 	if entries[1].Entry.Description != "" {
 		t.Errorf("second Entry.Description = %q, want empty", entries[1].Entry.Description)
+	}
+
+	// Fix field defaults to empty when not declared (diagnostic-only check).
+	if entries[0].Entry.Fix != "" {
+		t.Errorf("Entry.Fix = %q, want empty when not declared", entries[0].Entry.Fix)
+	}
+}
+
+func TestPackDoctorEntriesParsesFixField(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "pack.toml", `
+[pack]
+name = "fixable"
+schema = 1
+
+[[doctor]]
+name = "check-with-fix"
+script = "doctor/check.sh"
+fix = "doctor/fix.sh"
+description = "Check that opts into auto-remediation"
+
+[[doctor]]
+name = "check-no-fix"
+script = "doctor/check2.sh"
+`)
+
+	entries := LoadPackDoctorEntries(fsys.OSFS{}, []string{dir})
+	if len(entries) != 2 {
+		t.Fatalf("got %d entries, want 2", len(entries))
+	}
+
+	if entries[0].Entry.Fix != "doctor/fix.sh" {
+		t.Errorf("Entry.Fix = %q, want %q", entries[0].Entry.Fix, "doctor/fix.sh")
+	}
+	if entries[1].Entry.Fix != "" {
+		t.Errorf("Entry.Fix without fix field = %q, want empty", entries[1].Entry.Fix)
+	}
+}
+
+func TestLegacyPackDoctorsRejectsEscapingFixPaths(t *testing.T) {
+	dir := t.TempDir()
+	tests := []struct {
+		name string
+		fix  string
+	}{
+		{name: "absolute", fix: filepath.Join(dir, "outside.sh")},
+		{name: "relative escape", fix: "../../../outside.sh"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := legacyPackDoctors(fsys.OSFS{}, []PackDoctorEntry{{
+				Name:   "check",
+				Script: "doctor/check.sh",
+				Fix:    tt.fix,
+			}}, filepath.Join(dir, "pack"), "pack")
+			if err == nil {
+				t.Fatal("legacyPackDoctors error = nil, want containment error")
+			}
+			if !strings.Contains(err.Error(), "doctor check fix") {
+				t.Fatalf("legacyPackDoctors error = %v, want check fix context", err)
+			}
+		})
+	}
+}
+
+func TestLegacyPackDoctorsRejectsMissingFixScript(t *testing.T) {
+	packDir := filepath.Join(t.TempDir(), "pack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := legacyPackDoctors(fsys.OSFS{}, []PackDoctorEntry{{
+		Name:   "check",
+		Script: "doctor/check.sh",
+		Fix:    "doctor/missing-fix.sh",
+	}}, packDir, "pack")
+	if err == nil {
+		t.Fatal("legacyPackDoctors error = nil, want missing fix script error")
+	}
+	if !strings.Contains(err.Error(), "doctor check fix") {
+		t.Fatalf("legacyPackDoctors error = %v, want check fix context", err)
 	}
 }
 
@@ -3351,7 +3578,7 @@ name = "worker"
 		Workspace: Workspace{Includes: []string{"packs/skills"}},
 	}
 
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 
@@ -3378,7 +3605,7 @@ name = "worker"
 		Workspace: Workspace{Includes: []string{"packs/bare"}},
 	}
 
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 
@@ -3413,7 +3640,7 @@ schema = 1
 		Workspace: Workspace{Includes: []string{"packs/alpha", "packs/beta"}},
 	}
 
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 
@@ -3516,7 +3743,7 @@ includes = ["../child"]
 		Workspace: Workspace{Includes: []string{"packs/parent"}},
 	}
 
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 
@@ -3553,7 +3780,7 @@ session_live = ["echo theme applied"]
 			{Name: "beta"},
 		},
 	}
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 	applyPackGlobals(cfg)
@@ -3624,7 +3851,7 @@ session_live = [
 		Workspace: Workspace{Includes: []string{"packs/scripts"}},
 		Agents:    []Agent{{Name: "test-agent"}},
 	}
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 	applyPackGlobals(cfg)
@@ -3665,7 +3892,7 @@ session_live = ["echo B"]
 		Workspace: Workspace{Includes: []string{"packs/theme-a", "packs/theme-b"}},
 		Agents:    []Agent{{Name: "solo"}},
 	}
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 	applyPackGlobals(cfg)
@@ -3696,7 +3923,7 @@ session_live = []
 		Workspace: Workspace{Includes: []string{"packs/empty"}},
 		Agents:    []Agent{{Name: "untouched", SessionLive: []string{"existing"}}},
 	}
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 	applyPackGlobals(cfg)
@@ -3730,7 +3957,7 @@ session_live = ["echo global"]
 	cfg := &City{
 		Workspace: Workspace{Includes: []string{"packs/full"}},
 	}
-	if _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
+	if _, _, _, err := ExpandCityPacks(cfg, fsys.OSFS{}, dir); err != nil {
 		t.Fatalf("ExpandCityPacks: %v", err)
 	}
 	applyPackGlobals(cfg)

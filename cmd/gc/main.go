@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	beadsexec "github.com/gastownhall/gascity/internal/beads/exec"
 	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/supervisor"
@@ -30,6 +32,48 @@ func main() {
 // errExit is a sentinel error returned by cobra RunE functions to signal
 // non-zero exit. The command has already written its own error to stderr.
 var errExit = errors.New("exit")
+
+type commandExitError struct {
+	code int
+}
+
+func (e *commandExitError) Error() string {
+	if e == nil {
+		return "exit"
+	}
+	return fmt.Sprintf("exit %d", e.code)
+}
+
+func (e *commandExitError) ExitCode() int {
+	if e == nil || e.code == 0 {
+		return 1
+	}
+	return e.code
+}
+
+func exitForCode(code int) error {
+	if code == 0 {
+		return nil
+	}
+	if code == 1 {
+		return errExit
+	}
+	return &commandExitError{code: code}
+}
+
+func commandExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr interface{ ExitCode() int }
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	if errors.Is(err, errExit) {
+		return 1
+	}
+	return 1
+}
 
 // cityFlag holds the value of the --city persistent flag.
 // Empty means "discover from cwd."
@@ -64,7 +108,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	if err := root.Execute(); err != nil {
-		return 1
+		return commandExitCode(err)
 	}
 	return 0
 }
@@ -86,18 +130,23 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 			if tryPackCommandFallback(args, stdout, stderr) {
 				return nil
 			}
-			fmt.Fprintf(stderr, "gc: unknown command %q\n", args[0]) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc: unknown command %q\n\n", args[0]) //nolint:errcheck // best-effort stderr
+			printCommandUsage(stderr, cmd)
 			return errExit
 		},
 	}
+	root.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
+		printCommandUsageError(stderr, cmd, err)
+		return errExit
+	})
 	root.PersistentFlags().StringVar(&cityFlag, "city", "",
 		"path to the city directory (default: walk up from cwd)")
 	root.PersistentFlags().StringVar(&rigFlag, "rig", "",
 		"rig name or path (default: discover from cwd)")
-	root.CompletionOptions.DisableDefaultCmd = true
 	root.AddCommand(
 		newStartCmd(stdout, stderr),
 		newInitCmd(stdout, stderr),
+		newReloadCmd(stdout, stderr),
 		newStopCmd(stdout, stderr),
 		newRestartCmd(stdout, stderr),
 		newStatusCmd(stdout, stderr),
@@ -113,6 +162,7 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		newEventsCmd(stdout, stderr),
 		newTraceCmd(stdout, stderr),
 		newOrderCmd(stdout, stderr),
+		newImportCmd(stdout, stderr),
 		newConfigCmd(stdout, stderr),
 		newPackCmd(stdout, stderr),
 		newDoctorCmd(stdout, stderr),
@@ -125,6 +175,8 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		newBeadsCmd(stdout, stderr),
 		newBuildImageCmd(stdout, stderr),
 		newSkillCmd(stdout, stderr),
+		newMcpCmd(stdout, stderr),
+		newInternalCmd(stdout, stderr),
 		newVersionCmd(stdout),
 		newDashboardCmd(stdout, stderr),
 		newGraphCmd(stdout, stderr),
@@ -138,6 +190,10 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		newRuntimeCmd(stdout, stderr),
 		newFormulaCmd(stdout, stderr),
 		newBdCmd(stdout, stderr),
+		newBdStoreBridgeCmd(stdout, stderr),
+		newDoltConfigCmd(stdout, stderr),
+		newDoltStateCmd(stdout, stderr),
+		newShellCmd(stdout, stderr),
 	)
 	// gen-doc needs the root command to walk the tree; add after construction.
 	root.AddCommand(newGenDocCmd(stdout, stderr, root))
@@ -145,7 +201,43 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 	// Best-effort: discover pack CLI commands if we're inside a city.
 	registerPackCommands(root, stdout, stderr)
 
+	installArgUsageErrors(root, stderr)
+
 	return root
+}
+
+func installArgUsageErrors(cmd *cobra.Command, stderr io.Writer) {
+	if cmd.Args != nil {
+		argsValidator := cmd.Args
+		cmd.Args = func(cmd *cobra.Command, args []string) error {
+			if err := argsValidator(cmd, args); err != nil {
+				printCommandUsageError(stderr, cmd, err)
+				return errExit
+			}
+			return nil
+		}
+	}
+	for _, child := range cmd.Commands() {
+		installArgUsageErrors(child, stderr)
+	}
+}
+
+func printCommandUsageError(stderr io.Writer, cmd *cobra.Command, err error) {
+	if err != nil {
+		fmt.Fprintf(stderr, "gc: %v\n\n", err) //nolint:errcheck // best-effort stderr
+	}
+	printCommandUsage(stderr, cmd)
+}
+
+func printCommandUsage(stderr io.Writer, cmd *cobra.Command) {
+	if cmd == nil {
+		return
+	}
+	usage := strings.TrimRight(cmd.UsageString(), "\n")
+	if usage == "" {
+		return
+	}
+	fmt.Fprintln(stderr, usage) //nolint:errcheck // best-effort stderr
 }
 
 // sessionName returns the session name for a city agent.
@@ -193,53 +285,47 @@ func cliSessionName(cityPath, cityName, agentName, sessionTemplate string) strin
 	return sessionName(store, cityName, agentName, sessionTemplate)
 }
 
-// findCity walks dir upward looking for a directory containing city.toml.
-// Falls back to legacy .gc/ markers for compatibility.
-func findCity(dir string) (string, error) {
-	dir, err := filepath.Abs(dir)
-	if err != nil {
-		return "", err
-	}
-	var legacy string
-	for {
-		if citylayout.HasCityConfig(dir) {
-			return dir, nil
-		}
-		if legacy == "" && citylayout.HasRuntimeRoot(dir) {
-			legacy = dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			if legacy != "" {
-				return legacy, nil
-			}
-			return "", fmt.Errorf("not in a city directory (no city.toml or .gc/ found)")
-		}
-		dir = parent
-	}
-}
-
 // resolvedContext holds the result of city+rig resolution.
 type resolvedContext struct {
 	CityPath string // absolute path to city root
 	RigName  string // rig name (empty if not in a rig context)
 }
 
+// resolveCommandContext resolves city+rig context for commands that accept an
+// optional path argument. With no args, it uses the full flag/env/cwd resolver.
+// With a path arg, it treats that path as either a city path or a rig path and
+// resolves the containing city via the rig registry before falling back to
+// walking up for city.toml.
+func resolveCommandContext(args []string) (resolvedContext, error) {
+	if len(args) == 0 {
+		return resolveContext()
+	}
+	return resolveContextFromPath(args[0])
+}
+
+func resolveCommandCity(args []string) (string, error) {
+	ctx, err := resolveCommandContext(args)
+	if err != nil {
+		return "", err
+	}
+	return ctx.CityPath, nil
+}
+
 // resolveContext resolves the city and optional rig context using the
 // following priority chain:
 //  1. --city + --rig flags (explicit both, validated)
 //  2. --city only (explicit city, rig from cwd if applicable)
-//  3. --rig only (rig from cities.toml, city from default_city)
-//  4. GC_CITY + GC_RIG env vars
-//  5. GC_CITY only (city set, rig from cwd if applicable)
-//  6. GC_RIG only (rig from cities.toml, city from default_city)
-//  7. Rig index lookup (cwd prefix match in cities.toml)
-//  8. Walk up from cwd looking for city.toml
-//  9. Fail
+//  3. --rig only (rig from registered city site bindings)
+//  4. Explicit city env (GC_CITY / GC_CITY_PATH / GC_CITY_ROOT) + GC_RIG
+//  5. Explicit city env only (city set, rig from GC_DIR/cwd if applicable)
+//  6. GC_RIG only (rig from registered city site bindings)
+//  7. GC_DIR-derived city path
+//  8. Registered rig binding lookup (cwd prefix match)
+//  9. Walk up from cwd looking for city.toml
+//  10. Fail
 func resolveContext() (resolvedContext, error) {
 	city := cityFlag
 	rig := rigFlag
-	gcCity := os.Getenv("GC_CITY")
 	gcRig := os.Getenv("GC_RIG")
 
 	// Step 1: --city + --rig
@@ -270,30 +356,33 @@ func resolveContext() (resolvedContext, error) {
 		return ctx, nil
 	}
 
-	// Step 4: GC_CITY + GC_RIG
-	if gcCity != "" && gcRig != "" {
-		if cp, err := validateCityPath(gcCity); err == nil {
-			return resolvedContext{CityPath: cp, RigName: gcRig}, nil
-		}
+	// Step 4: explicit city env + GC_RIG
+	if gcCity, ok := resolveExplicitCityPathEnv(); ok && gcRig != "" {
+		return resolvedContext{CityPath: gcCity, RigName: gcRig}, nil
 	}
 
-	// Step 5: GC_CITY only
-	if gcCity != "" {
-		if cp, err := validateCityPath(gcCity); err == nil {
-			rn := rigFromCwd(cp)
-			return resolvedContext{CityPath: cp, RigName: rn}, nil
-		}
+	// Step 5: explicit city env only
+	if gcCity, ok := resolveExplicitCityPathEnv(); ok {
+		rn := rigFromGCDirOrCwd(gcCity)
+		return resolvedContext{CityPath: gcCity, RigName: rn}, nil
 	}
 
 	// Step 6: GC_RIG only
 	if gcRig != "" {
 		ctx, err := resolveRigToContext(gcRig)
-		if err == nil {
-			return ctx, nil
+		if err != nil {
+			return resolvedContext{}, err
 		}
+		return ctx, nil
 	}
 
-	// Step 7: Rig index lookup (cwd prefix match in cities.toml).
+	// Step 7: GC_DIR-derived city path.
+	if gcDirCity, ok := resolveCityPathFromGCDir(); ok {
+		rn := rigFromCwdDir(gcDirCity, strings.TrimSpace(os.Getenv("GC_DIR")))
+		return resolvedContext{CityPath: gcDirCity, RigName: rn}, nil
+	}
+
+	// Step 8: Registered rig binding lookup (cwd prefix match).
 	cwd, err := os.Getwd()
 	if err != nil {
 		return resolvedContext{}, err
@@ -302,7 +391,7 @@ func resolveContext() (resolvedContext, error) {
 		return ctx, nil
 	}
 
-	// Step 8: Walk up from cwd looking for city.toml.
+	// Step 9: Walk up from cwd looking for city.toml.
 	cityPath, err := findCity(cwd)
 	if err != nil {
 		return resolvedContext{}, err
@@ -314,11 +403,35 @@ func resolveContext() (resolvedContext, error) {
 // resolveCity returns the city root path. Thin wrapper over resolveContext
 // for the many callers that only need the city path.
 func resolveCity() (string, error) {
-	ctx, err := resolveContext()
+	return resolveCommandCity(nil)
+}
+
+func resolveContextFromPath(path string) (resolvedContext, error) {
+	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", err
+		return resolvedContext{}, err
 	}
-	return ctx.CityPath, nil
+	ctx, ok, err := resolveRigPathToContext(abs)
+	if err != nil {
+		return resolvedContext{}, err
+	}
+	if ok {
+		return ctx, nil
+	}
+	if cityPath, err := validateCityPath(abs); err == nil {
+		return resolvedContext{
+			CityPath: cityPath,
+			RigName:  rigFromCwdDir(cityPath, abs),
+		}, nil
+	}
+	cityPath, err := findCity(abs)
+	if err != nil {
+		return resolvedContext{}, err
+	}
+	return resolvedContext{
+		CityPath: cityPath,
+		RigName:  rigFromCwdDir(cityPath, abs),
+	}, nil
 }
 
 // validateCityPath resolves and validates a path as a city directory.
@@ -333,69 +446,51 @@ func validateCityPath(p string) (string, error) {
 	return "", fmt.Errorf("not a city directory: %s (no city.toml or .gc/ found)", abs)
 }
 
-// resolveRigToContext resolves a rig name or path to a full context via
-// the global registry in cities.toml.
+// resolveRigToContext resolves a rig name or path to a full context by scanning
+// registered cities and their machine-local .gc/site.toml rig bindings.
 func resolveRigToContext(nameOrPath string) (resolvedContext, error) {
-	reg := supervisor.NewRegistry(supervisor.RegistryPath())
-
-	// Try by name first.
-	if entry, ok := reg.LookupRigByName(nameOrPath); ok {
-		ctx, err := resolveRigEntryCity(reg, entry)
-		if err != nil {
-			return resolvedContext{}, err
-		}
-		return ctx, nil
+	if matches, err := registeredRigBindingsByName(nameOrPath, true); err != nil {
+		return resolvedContext{}, err
+	} else if len(matches) > 0 {
+		return resolveRigBindingMatches(nameOrPath, matches)
 	}
 
-	// Try by path.
 	abs, err := filepath.Abs(nameOrPath)
 	if err != nil {
 		return resolvedContext{}, fmt.Errorf("rig %q: %w", nameOrPath, err)
 	}
-	if entry, ok := reg.LookupRigByPath(abs); ok {
-		ctx, err := resolveRigEntryCity(reg, entry)
-		if err != nil {
-			return resolvedContext{}, err
-		}
-		return ctx, nil
+	if matches, err := registeredRigBindingsByPath(abs, true); err != nil {
+		return resolvedContext{}, err
+	} else if len(matches) > 0 {
+		return resolveRigBindingMatches(abs, matches)
 	}
 
 	return resolvedContext{}, fmt.Errorf("rig %q is not registered in any city", nameOrPath)
 }
 
-// resolveRigEntryCity resolves a rig entry to a city. Uses default_city if
-// set, otherwise auto-resolves if exactly one city contains the rig.
-func resolveRigEntryCity(reg *supervisor.Registry, entry supervisor.RigEntry) (resolvedContext, error) {
-	if entry.DefaultCity != "" {
-		return resolvedContext{CityPath: entry.DefaultCity, RigName: entry.Name}, nil
+func resolveRigPathToContext(dir string) (resolvedContext, bool, error) {
+	matches, err := registeredRigBindingsByPath(dir, true)
+	if err != nil {
+		return resolvedContext{}, false, err
 	}
-	// No default — check how many cities actually contain this rig.
-	paths := rigCityPaths(reg, entry.Path)
-	switch len(paths) {
-	case 1:
-		return resolvedContext{CityPath: paths[0], RigName: entry.Name}, nil
-	case 0:
-		return resolvedContext{}, fmt.Errorf("rig %q is registered but not found in any city", entry.Name)
-	default:
-		cities := rigCityList(reg, entry.Path)
-		return resolvedContext{}, fmt.Errorf(
-			"rig %q is registered in multiple cities: %s\n  Set a default:  gc rig default %s --city <name>\n  Or specify now:  gc --city <name> <command>",
-			entry.Name, strings.Join(cities, ", "), entry.Name)
+	if len(matches) == 0 {
+		return resolvedContext{}, false, nil
 	}
+	ctx, err := resolveRigBindingMatches(dir, matches)
+	if err != nil {
+		return resolvedContext{}, true, err
+	}
+	return ctx, true, nil
 }
 
-// lookupRigFromCwd checks the global registry for a rig matching the cwd.
+// lookupRigFromCwd checks registered city site bindings for a rig matching cwd.
+// Ambiguous bindings deliberately fall through to the city walk-up fallback.
 func lookupRigFromCwd(cwd string) (resolvedContext, bool) {
-	reg := supervisor.NewRegistry(supervisor.RegistryPath())
-	entry, ok := reg.LookupRigByPath(cwd)
-	if !ok {
+	matches, err := registeredRigBindingsByPath(cwd, false)
+	if err != nil || len(matches) != 1 {
 		return resolvedContext{}, false
 	}
-	if entry.DefaultCity == "" {
-		// Ambiguous — can't auto-resolve. Fall through to walk-up.
-		return resolvedContext{}, false
-	}
-	return resolvedContext{CityPath: entry.DefaultCity, RigName: entry.Name}, true
+	return resolvedContext{CityPath: matches[0].City.Path, RigName: matches[0].Rig.Name}, true
 }
 
 // rigFromCwd attempts to derive a rig name from cwd when the city is known.
@@ -409,69 +504,144 @@ func rigFromCwd(cityPath string) string {
 
 // rigFromCwdDir matches cwd against registered rigs in a city's config.
 func rigFromCwdDir(cityPath, cwd string) string {
-	cfg, err := loadCityConfig(cityPath)
+	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		return ""
 	}
-	for _, rig := range cfg.Rigs {
-		rigPath := rig.Path
-		if !filepath.IsAbs(rigPath) {
-			rigPath = filepath.Join(cityPath, rigPath)
-		}
-		rigPath = filepath.Clean(rigPath)
-		if cwd == rigPath || (len(cwd) > len(rigPath) && cwd[len(rigPath)] == '/' && cwd[:len(rigPath)] == rigPath) {
-			return rig.Name
-		}
+	rig, ok := rigForDir(cfg, cityPath, cwd)
+	if !ok {
+		return ""
 	}
-	return ""
+	return rig.Name
 }
 
-// rigCityList scans all registered cities to find which ones contain a rig.
-// Returns display names for error messages.
-func rigCityList(reg *supervisor.Registry, rigPath string) []string {
-	var names []string
-	for _, c := range rigCityEntries(reg, rigPath) {
-		name := c.EffectiveName()
-		if name == "" {
-			name = c.Path
+type registeredRigBinding struct {
+	City supervisor.CityEntry
+	Rig  config.Rig
+	Path string
+}
+
+func registeredRigBindingsByName(name string, failOnLoadError bool) ([]registeredRigBinding, error) {
+	return registeredRigBindings(failOnLoadError, func(binding registeredRigBinding) bool {
+		return binding.Rig.Name == name
+	})
+}
+
+func registeredRigBindingsByPath(dir string, failOnLoadError bool) ([]registeredRigBinding, error) {
+	dir = normalizePathForCompare(dir)
+	matches, err := registeredRigBindings(failOnLoadError, func(binding registeredRigBinding) bool {
+		rigPath := normalizePathForCompare(binding.Path)
+		return pathWithinScope(dir, rigPath)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return keepDeepestRigBindings(matches), nil
+}
+
+func registeredRigBindings(failOnLoadError bool, match func(registeredRigBinding) bool) ([]registeredRigBinding, error) {
+	reg := supervisor.NewRegistry(supervisor.RegistryPath())
+	cities, err := reg.List()
+	if err != nil {
+		return nil, err
+	}
+	var matched []registeredRigBinding
+	var loadErrors []string
+	for _, c := range cities {
+		cfg, err := loadCityConfigSuppressDeprecatedOrderWarnings(c.Path, io.Discard)
+		if err != nil {
+			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", registeredCityLabel(c), err))
+			continue
 		}
+		siteBinding, err := config.LoadSiteBinding(fsys.OSFS{}, c.Path)
+		if err != nil {
+			loadErrors = append(loadErrors, fmt.Sprintf("%s: %v", registeredCityLabel(c), err))
+			continue
+		}
+		siteRigPaths := make(map[string]string, len(siteBinding.Rigs))
+		for _, siteRig := range siteBinding.Rigs {
+			name := strings.TrimSpace(siteRig.Name)
+			path := strings.TrimSpace(siteRig.Path)
+			if name == "" || path == "" {
+				continue
+			}
+			siteRigPaths[name] = path
+		}
+		for _, rig := range cfg.Rigs {
+			if strings.TrimSpace(rig.Name) == "" {
+				continue
+			}
+			sitePath := strings.TrimSpace(siteRigPaths[rig.Name])
+			if sitePath == "" {
+				continue
+			}
+			rig.Path = sitePath
+			binding := registeredRigBinding{
+				City: c,
+				Rig:  rig,
+				Path: resolveStoreScopeRoot(c.Path, sitePath),
+			}
+			if match(binding) {
+				matched = append(matched, binding)
+			}
+		}
+	}
+	if len(loadErrors) > 0 && (failOnLoadError || len(matched) > 0) {
+		return nil, fmt.Errorf("loading registered city rig bindings: %s", strings.Join(loadErrors, "; "))
+	}
+	return matched, nil
+}
+
+func keepDeepestRigBindings(matches []registeredRigBinding) []registeredRigBinding {
+	var bestLen int
+	for _, binding := range matches {
+		if l := len(normalizePathForCompare(binding.Path)); l > bestLen {
+			bestLen = l
+		}
+	}
+	if bestLen == 0 {
+		return matches
+	}
+	filtered := matches[:0]
+	for _, binding := range matches {
+		if len(normalizePathForCompare(binding.Path)) == bestLen {
+			filtered = append(filtered, binding)
+		}
+	}
+	return filtered
+}
+
+func resolveRigBindingMatches(value string, matches []registeredRigBinding) (resolvedContext, error) {
+	if len(matches) == 1 {
+		return resolvedContext{CityPath: matches[0].City.Path, RigName: matches[0].Rig.Name}, nil
+	}
+	return resolvedContext{}, fmt.Errorf(
+		"rig %q is registered in multiple cities: %s\n  Specify now:  gc --city <name> <command>",
+		value,
+		strings.Join(registeredRigBindingCityNames(matches), ", "))
+}
+
+func registeredRigBindingCityNames(matches []registeredRigBinding) []string {
+	seen := make(map[string]struct{}, len(matches))
+	var names []string
+	for _, binding := range matches {
+		name := registeredCityLabel(binding.City)
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
 		names = append(names, name)
 	}
+	sort.Strings(names)
 	return names
 }
 
-// rigCityPaths returns the paths of cities that contain the given rig.
-func rigCityPaths(reg *supervisor.Registry, rigPath string) []string {
-	var paths []string
-	for _, c := range rigCityEntries(reg, rigPath) {
-		paths = append(paths, c.Path)
+func registeredCityLabel(city supervisor.CityEntry) string {
+	name := strings.TrimSpace(city.EffectiveName())
+	if name == "" {
+		name = city.Path
 	}
-	return paths
-}
-
-// rigCityEntries returns CityEntry values for all cities that contain the given rig.
-func rigCityEntries(reg *supervisor.Registry, rigPath string) []supervisor.CityEntry {
-	cities, err := reg.List()
-	if err != nil {
-		return nil
-	}
-	var matched []supervisor.CityEntry
-	for _, c := range cities {
-		cfg, err := loadCityConfig(c.Path)
-		if err != nil {
-			continue
-		}
-		for _, rig := range cfg.Rigs {
-			rp := rig.Path
-			if !filepath.IsAbs(rp) {
-				rp = filepath.Join(c.Path, rp)
-			}
-			if filepath.Clean(rp) == rigPath {
-				matched = append(matched, c)
-			}
-		}
-	}
-	return matched
+	return name
 }
 
 // openCityRecorder returns a Recorder that appends to .gc/events.jsonl in the
@@ -519,9 +689,6 @@ func openCityStore(stderr io.Writer, cmdName string) (beads.Store, int) {
 		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err) //nolint:errcheck // best-effort stderr
 		return nil, 1
 	}
-	// Ensure GC_DOLT_PORT is in the environment so bd subprocesses can
-	// connect to the managed dolt server.
-	readDoltPort(cityPath)
 	store, err := openCityStoreAt(cityPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err)                   //nolint:errcheck // best-effort stderr
@@ -538,30 +705,133 @@ func openCityStoreAt(cityPath string) (beads.Store, error) {
 	return openStoreAtForCity(cityPath, cityForStoreDir(cityPath))
 }
 
+const fileStoreLayoutScopedV1 = "scope-local-v1"
+
+func fileStoreLayoutMarkerPath(cityPath string) string {
+	return filepath.Join(cityPath, ".gc", "file-beads-layout")
+}
+
+func fileStoreUsesScopedRoots(cityPath string) bool {
+	data, err := os.ReadFile(fileStoreLayoutMarkerPath(cityPath))
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(data)) == fileStoreLayoutScopedV1
+}
+
+func ensureScopedFileStoreLayout(cityPath string) error {
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(fileStoreLayoutMarkerPath(cityPath), []byte(fileStoreLayoutScopedV1+"\n"), 0o644)
+}
+
+func openScopeLocalFileStore(scopeRoot string) (*beads.FileStore, error) {
+	beadsPath := filepath.Join(scopeRoot, ".gc", "beads.json")
+	store, err := beads.OpenFileStore(fsys.OSFS{}, beadsPath)
+	if err != nil {
+		return nil, err
+	}
+	store.SetLocker(beads.NewFileFlock(beadsPath + ".lock"))
+	return store, nil
+}
+
+func ensurePersistedScopeLocalFileStore(scopeRoot string) error {
+	beadsPath := filepath.Join(scopeRoot, ".gc", "beads.json")
+	if _, err := os.Stat(beadsPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(beadsPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(beadsPath, []byte("{\"seq\":0,\"beads\":[]}\n"), 0o644)
+}
+
+func openExistingScopeLocalFileStore(scopeRoot string) (*beads.FileStore, error) {
+	beadsPath := filepath.Join(scopeRoot, ".gc", "beads.json")
+	if _, err := os.Stat(beadsPath); err != nil {
+		return nil, err
+	}
+	return openScopeLocalFileStore(scopeRoot)
+}
+
+func openCompatibleFileStore(scopeRoot, cityPath string) (*beads.FileStore, error) {
+	scopeRoot = resolveStoreScopeRoot(cityPath, scopeRoot)
+	if !samePath(scopeRoot, cityPath) && scopeUsesFileStoreContract(scopeRoot) {
+		return openExistingScopeLocalFileStore(scopeRoot)
+	}
+	if fileStoreUsesScopedRoots(cityPath) {
+		return openExistingScopeLocalFileStore(scopeRoot)
+	}
+	return openScopeLocalFileStore(cityPath)
+}
+
 func openStoreAtForCity(storePath, cityPath string) (beads.Store, error) {
 	runtimeCityPath := cityPath
 	if runtimeCityPath == "" {
 		runtimeCityPath = cityForStoreDir(storePath)
 	}
-	provider := rawBeadsProvider(runtimeCityPath)
+	scopeRoot := resolveStoreScopeRoot(runtimeCityPath, storePath)
+	provider := rawBeadsProviderForScope(scopeRoot, runtimeCityPath)
 	if strings.HasPrefix(provider, "exec:") {
+		target, err := resolveConfiguredExecStoreTarget(runtimeCityPath, scopeRoot)
+		if err != nil {
+			return nil, err
+		}
+		env := gcExecStoreEnv(runtimeCityPath, target, provider)
+		if execProviderNeedsScopedDoltStoreEnv(provider) {
+			if target.ScopeKind == "rig" {
+				cfg, err := loadCityConfig(runtimeCityPath, io.Discard)
+				if err != nil {
+					return nil, err
+				}
+				copyExecProjectedDoltEnv(env, bdRuntimeEnvForRig(runtimeCityPath, cfg, target.ScopeRoot))
+			} else {
+				copyExecProjectedDoltEnv(env, bdRuntimeEnv(runtimeCityPath))
+			}
+		}
 		store := beadsexec.NewStore(strings.TrimPrefix(provider, "exec:"))
-		store.SetEnv(citylayout.CityRuntimeEnvMap(runtimeCityPath))
+		store.SetEnv(env)
 		return store, nil
 	}
 	switch provider {
 	case "file":
-		beadsPath := filepath.Join(runtimeCityPath, ".gc", "beads.json")
-		store, err := beads.OpenFileStore(fsys.OSFS{}, beadsPath)
-		if err != nil {
-			return nil, err
-		}
-		store.SetLocker(beads.NewFileFlock(beadsPath + ".lock"))
-		return store, nil
+		return openCompatibleFileStore(scopeRoot, runtimeCityPath)
 	default: // "bd" or unrecognized → use bd
 		if _, err := exec.LookPath("bd"); err != nil {
 			return nil, fmt.Errorf("bd not found in PATH (install beads or set GC_BEADS=file)")
 		}
-		return bdStoreForCity(storePath, runtimeCityPath), nil
+		return openBdStoreAt(scopeRoot, runtimeCityPath)
 	}
+}
+
+// resolveStoreScopeRoot resolves a store's scope root under cityPath.
+// An empty storePath falls back to cityPath — this is the "city scope"
+// default used by callers that don't have a specific rig context. Callers
+// that need to distinguish an unbound rig from the city scope must check
+// rig.Path themselves before calling (see rig_scope_resolution.go and
+// beads_provider_lifecycle.go for the `if rig.Path == "" { continue }`
+// pattern).
+func resolveStoreScopeRoot(cityPath, storePath string) string {
+	scopeRoot := strings.TrimSpace(storePath)
+	if scopeRoot == "" {
+		scopeRoot = cityPath
+	}
+	if !filepath.IsAbs(scopeRoot) {
+		scopeRoot = filepath.Join(cityPath, scopeRoot)
+	}
+	return filepath.Clean(scopeRoot)
+}
+
+func openBdStoreAt(storePath, cityPath string) (beads.Store, error) {
+	if filepath.Clean(storePath) == filepath.Clean(cityPath) {
+		return bdStoreForCity(storePath, cityPath), nil
+	}
+	cfg, err := loadCityConfig(cityPath, io.Discard)
+	if err != nil {
+		cfg = nil
+	}
+	return bdStoreForRig(storePath, cityPath, cfg), nil
 }

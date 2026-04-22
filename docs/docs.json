@@ -81,13 +81,20 @@
         "group": "Tutorials",
         "pages": [
           "tutorials/index",
-          "tutorials/01-beads"
+          "tutorials/01-cities-and-rigs",
+          "tutorials/02-agents",
+          "tutorials/03-sessions",
+          "tutorials/04-communication",
+          "tutorials/05-formulas",
+          "tutorials/06-beads",
+          "tutorials/07-orders"
         ]
       },
       {
         "group": "Guides",
         "pages": [
           "guides/index",
+          "guides/migrating-to-pack-vnext",
           "guides/shareable-packs"
         ]
       },
@@ -98,6 +105,9 @@
           "reference/cli",
           "reference/config",
           "reference/formula",
+          "reference/api",
+          "reference/events",
+          "schema/index",
           "reference/exec-session-provider",
           "reference/exec-beads-provider"
         ]

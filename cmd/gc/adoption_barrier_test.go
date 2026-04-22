@@ -16,10 +16,20 @@ type fakeAdoptionProvider struct {
 	runtime.Provider
 	running []string
 	alive   map[string]bool
+	listErr error
 }
 
 func (f *fakeAdoptionProvider) ListRunning(_ string) ([]string, error) {
-	return f.running, nil
+	return f.running, f.listErr
+}
+
+func (f *fakeAdoptionProvider) IsRunning(name string) bool {
+	for _, running := range f.running {
+		if running == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeAdoptionProvider) ProcessAlive(name string, _ []string) bool {
@@ -28,6 +38,12 @@ func (f *fakeAdoptionProvider) ProcessAlive(name string, _ []string) bool {
 	}
 	return f.alive[name]
 }
+
+func (f *fakeAdoptionProvider) IsAttached(string) bool { return false }
+
+func (f *fakeAdoptionProvider) GetMeta(string, string) (string, error) { return "", nil }
+
+func (f *fakeAdoptionProvider) GetLastActivity(string) (time.Time, error) { return time.Time{}, nil }
 
 func TestAdoptionBarrier_NoRunning(t *testing.T) {
 	store := beads.NewMemStore()
@@ -41,6 +57,27 @@ func TestAdoptionBarrier_NoRunning(t *testing.T) {
 	}
 	if result.Total != 0 {
 		t.Errorf("Total = %d, want 0", result.Total)
+	}
+}
+
+func TestAdoptionBarrier_PartialListUsesVisibleSessionsButFailsBarrier(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := &fakeAdoptionProvider{
+		running: []string{"test-city-worker"},
+		listErr: &runtime.PartialListError{Err: runtime.ErrSessionNotFound},
+	}
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	var stderr bytes.Buffer
+
+	result, passed := runAdoptionBarrier(store, sp, cfg, "test-city", clock.Real{}, &stderr, false)
+	if passed {
+		t.Fatal("barrier should fail closed on partial session listing")
+	}
+	if result.Adopted != 1 {
+		t.Fatalf("Adopted = %d, want 1 visible session adopted", result.Adopted)
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("partially failed")) {
+		t.Fatalf("stderr = %q, want partial failure warning", stderr.String())
 	}
 }
 

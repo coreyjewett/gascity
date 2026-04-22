@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 func TestRegistryEmptyFile(t *testing.T) {
@@ -39,9 +41,9 @@ func TestRegistryRegisterAndList(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 entry, got %d", len(entries))
 	}
-	// Register canonicalizes via filepath.EvalSymlinks; resolve expected
-	// path so the comparison holds on macOS (/var → /private/var).
-	wantCity, _ := filepath.EvalSymlinks(cityPath)
+	// Register stores the same canonical comparison form used by runtime
+	// path comparisons.
+	wantCity := testutil.CanonicalPath(cityPath)
 	if entries[0].Path != wantCity {
 		t.Errorf("expected path %s, got %s", wantCity, entries[0].Path)
 	}
@@ -166,9 +168,9 @@ func TestRegistryMultipleCities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Register canonicalizes via filepath.EvalSymlinks; resolve expected
-	// path so the comparison holds on macOS (/var → /private/var).
-	wantPath2, _ := filepath.EvalSymlinks(path2)
+	// Register stores the same canonical comparison form used by runtime
+	// path comparisons.
+	wantPath2 := testutil.CanonicalPath(path2)
 	if len(entries) != 1 || entries[0].Path != wantPath2 {
 		t.Errorf("expected only city-b, got %v", entries)
 	}
@@ -362,6 +364,71 @@ func TestRigUnregisterNotFound(t *testing.T) {
 	}
 }
 
+func TestRegistryMutatorsRefuseHostRegistryDuringTests(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	hostRegistry := filepath.Join(home, ".gc", "cities.toml")
+	r := NewRegistry(hostRegistry)
+
+	tests := []struct {
+		name string
+		call func(*Registry)
+	}{
+		{
+			name: "Register",
+			call: func(r *Registry) {
+				_ = r.Register(filepath.Join(home, "cities", "alpha"), "alpha")
+			},
+		},
+		{
+			name: "Unregister",
+			call: func(r *Registry) {
+				_ = r.Unregister(filepath.Join(home, "cities", "alpha"))
+			},
+		},
+		{
+			name: "RegisterRig",
+			call: func(r *Registry) {
+				_ = r.RegisterRig(filepath.Join(home, "rigs", "alpha"), "alpha", "")
+			},
+		},
+		{
+			name: "UnregisterRig",
+			call: func(r *Registry) {
+				_ = r.UnregisterRig(filepath.Join(home, "rigs", "alpha"))
+			},
+		},
+		{
+			name: "SetRigDefault",
+			call: func(r *Registry) {
+				_ = r.SetRigDefault(filepath.Join(home, "rigs", "alpha"), filepath.Join(home, "cities", "alpha"))
+			},
+		},
+		{
+			name: "ReconcileRigs",
+			call: func(r *Registry) {
+				_ = r.ReconcileRigs([]RigCityMapping{{
+					RigPath:  filepath.Join(home, "rigs", "alpha"),
+					RigName:  "alpha",
+					CityPath: filepath.Join(home, "cities", "alpha"),
+				}})
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recovered := recover(); recovered == nil {
+					t.Fatalf("expected panic for %s against host registry path", tc.name)
+				}
+			}()
+			tc.call(r)
+		})
+	}
+}
+
 func TestRigLookupByPath(t *testing.T) {
 	dir := t.TempDir()
 	r := NewRegistry(filepath.Join(dir, "cities.toml"))
@@ -444,9 +511,7 @@ func TestRigLookupByName(t *testing.T) {
 	if !ok {
 		t.Fatal("expected to find rig by name")
 	}
-	if entry.Path != rigPath {
-		t.Errorf("expected path %s, got %s", rigPath, entry.Path)
-	}
+	testutil.AssertSamePath(t, entry.Path, rigPath)
 
 	_, ok = r.LookupRigByName("nonexistent")
 	if ok {

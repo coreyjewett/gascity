@@ -77,8 +77,30 @@ func requirePython3(t *testing.T) {
 	}
 }
 
+// helperPassthroughForTests is the passthrough list proxy_process helper
+// subprocesses need through internal/testenv's scrub: the city identity vars
+// that proxy_process.go intentionally seeds into the helper env. Other GC_*
+// leak vectors stay scrubbed. GC_SERVICE_* vars are not leak vectors so they
+// flow through untouched without being listed here.
+const helperPassthroughForTests = "GC_CITY,GC_CITY_PATH,GC_CITY_RUNTIME_DIR"
+
+// setHelperPassthrough installs extraHelperEnv so proxy_process.start()
+// appends the passthrough var to the helper subprocess env. Tests run
+// serially so the package-level var is safe to mutate.
+func setHelperPassthrough(t *testing.T) {
+	t.Helper()
+	prev := extraHelperEnv
+	extraHelperEnv = []string{"GC_TESTENV_PASSTHROUGH=" + helperPassthroughForTests}
+	t.Cleanup(func() { extraHelperEnv = prev })
+}
+
 func TestManagerReloadProxyProcessStartsAndProxies(t *testing.T) {
 	t.Setenv("GC_SERVICE_HELPER", "1")
+	// The helper subprocess is the same test binary. proxy_process.go seeds
+	// GC_CITY / GC_CITY_PATH / GC_CITY_RUNTIME_DIR into the child env; without
+	// a passthrough declaration the child's internal/testenv init() would
+	// strip them.
+	setHelperPassthrough(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("Executable: %v", err)
@@ -150,7 +172,8 @@ func TestProxyProcessHelper(t *testing.T) {
 	})
 	mux.HandleFunc("/env", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"GC_CITY_ROOT":              os.Getenv("GC_CITY_ROOT"),
+			"GC_CITY":                   os.Getenv("GC_CITY"),
+			"GC_CITY_PATH":              os.Getenv("GC_CITY_PATH"),
 			"GC_CITY_RUNTIME_DIR":       os.Getenv("GC_CITY_RUNTIME_DIR"),
 			"GC_SERVICE_NAME":           os.Getenv("GC_SERVICE_NAME"),
 			"GC_SERVICE_STATE_ROOT":     os.Getenv("GC_SERVICE_STATE_ROOT"),
@@ -172,6 +195,11 @@ func TestProxyProcessHelper(t *testing.T) {
 
 func TestProxyProcessPublishesServiceEnv(t *testing.T) {
 	t.Setenv("GC_SERVICE_HELPER", "1")
+	// The helper subprocess is the same test binary. proxy_process.go seeds
+	// GC_CITY / GC_CITY_PATH / GC_CITY_RUNTIME_DIR into the child env; without
+	// a passthrough declaration the child's internal/testenv init() would
+	// strip them.
+	setHelperPassthrough(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("Executable: %v", err)
@@ -229,8 +257,11 @@ func TestProxyProcessPublishesServiceEnv(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&env); err != nil {
 		t.Fatalf("decode env: %v", err)
 	}
-	if env["GC_CITY_ROOT"] != rt.cityPath {
-		t.Fatalf("GC_CITY_ROOT = %q, want %q", env["GC_CITY_ROOT"], rt.cityPath)
+	if env["GC_CITY"] != rt.cityPath {
+		t.Fatalf("GC_CITY = %q, want %q", env["GC_CITY"], rt.cityPath)
+	}
+	if env["GC_CITY_PATH"] != rt.cityPath {
+		t.Fatalf("GC_CITY_PATH = %q, want %q", env["GC_CITY_PATH"], rt.cityPath)
 	}
 	if env["GC_CITY_RUNTIME_DIR"] != filepath.Join(rt.cityPath, ".gc", "runtime") {
 		t.Fatalf("GC_CITY_RUNTIME_DIR = %q, want %q", env["GC_CITY_RUNTIME_DIR"], filepath.Join(rt.cityPath, ".gc", "runtime"))
@@ -254,6 +285,11 @@ func TestProxyProcessPublishesServiceEnv(t *testing.T) {
 
 func TestProxyProcessReloadRefreshesPublicationEnv(t *testing.T) {
 	t.Setenv("GC_SERVICE_HELPER", "1")
+	// The helper subprocess is the same test binary. proxy_process.go seeds
+	// GC_CITY / GC_CITY_PATH / GC_CITY_RUNTIME_DIR into the child env; without
+	// a passthrough declaration the child's internal/testenv init() would
+	// strip them.
+	setHelperPassthrough(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("Executable: %v", err)
@@ -594,6 +630,11 @@ func TestNewProxyProcessInstanceCleansUpSocketDirOnStartFailure(t *testing.T) {
 
 func TestProxyProcessTickUsesCachedPublicationRefsOnReadError(t *testing.T) {
 	t.Setenv("GC_SERVICE_HELPER", "1")
+	// The helper subprocess is the same test binary. proxy_process.go seeds
+	// GC_CITY / GC_CITY_PATH / GC_CITY_RUNTIME_DIR into the child env; without
+	// a passthrough declaration the child's internal/testenv init() would
+	// strip them.
+	setHelperPassthrough(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("Executable: %v", err)
@@ -691,6 +732,11 @@ func TestProxyProcessTickUsesCachedPublicationRefsOnReadError(t *testing.T) {
 
 func TestProxyProcessSwapAndCloseCleanUpSocketFiles(t *testing.T) {
 	t.Setenv("GC_SERVICE_HELPER", "1")
+	// The helper subprocess is the same test binary. proxy_process.go seeds
+	// GC_CITY / GC_CITY_PATH / GC_CITY_RUNTIME_DIR into the child env; without
+	// a passthrough declaration the child's internal/testenv init() would
+	// strip them.
+	setHelperPassthrough(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("Executable: %v", err)

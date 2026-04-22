@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -58,12 +59,11 @@ func (g *Git) DefaultBranch() (string, error) {
 	if err != nil {
 		return "main", nil
 	}
-	// Output is like "refs/remotes/origin/main"
+	// Output is like "refs/remotes/origin/main" or
+	// "refs/remotes/origin/user/feature". Strip the full prefix so branch
+	// names containing slashes are preserved.
 	ref := strings.TrimSpace(out)
-	if i := strings.LastIndex(ref, "/"); i >= 0 {
-		return ref[i+1:], nil
-	}
-	return ref, nil
+	return strings.TrimPrefix(ref, "refs/remotes/origin/"), nil
 }
 
 // WorktreeRemove removes a worktree. If force is true, removes even with
@@ -282,7 +282,7 @@ func parseWorktreeList(output string) []Worktree {
 		}
 		switch {
 		case strings.HasPrefix(line, "worktree "):
-			current.Path = strings.TrimPrefix(line, "worktree ")
+			current.Path = canonicalWorktreePath(strings.TrimPrefix(line, "worktree "))
 		case strings.HasPrefix(line, "HEAD "):
 			current.Head = strings.TrimPrefix(line, "HEAD ")
 		case strings.HasPrefix(line, "branch "):
@@ -296,4 +296,11 @@ func parseWorktreeList(output string) []Worktree {
 		worktrees = append(worktrees, current)
 	}
 	return worktrees
+}
+
+func canonicalWorktreePath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
 }

@@ -3,17 +3,27 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
+	"github.com/gastownhall/gascity/internal/bootstrap"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
+
+func disableBootstrapForTests(t *testing.T) {
+	t.Helper()
+	old := bootstrap.BootstrapPacks
+	bootstrap.BootstrapPacks = nil
+	t.Cleanup(func() { bootstrap.BootstrapPacks = old })
+}
 
 func TestMaybePrintWizardProviderGuidanceNeedsAuth(t *testing.T) {
 	oldProbe := initProbeProvidersReadiness
@@ -48,13 +58,14 @@ func TestFinalizeInitBlocksProviderReadinessBeforeSupervisorRegistration(t *test
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")
 	configureIsolatedRuntimeEnv(t)
+	disableBootstrapForTests(t)
 
 	cityPath := filepath.Join(t.TempDir(), "bright-lights")
 	var initStdout, initStderr bytes.Buffer
 	code := doInit(fsys.OSFS{}, cityPath, wizardConfig{
-		configName: "tutorial",
+		configName: "minimal",
 		provider:   "claude",
-	}, &initStdout, &initStderr)
+	}, "", &initStdout, &initStderr)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0: %s", code, initStderr.String())
 	}
@@ -108,6 +119,7 @@ func TestFinalizeInitWarnsForUnprobeableCustomProviderAndContinues(t *testing.T)
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")
 	configureIsolatedRuntimeEnv(t)
+	disableBootstrapForTests(t)
 
 	cityPath := filepath.Join(t.TempDir(), "bright-lights")
 	if err := os.MkdirAll(cityPath, 0o755); err != nil {
@@ -161,6 +173,7 @@ func TestFinalizeInitFetchesRemotePacksBeforeProviderReadiness(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")
 	configureIsolatedRuntimeEnv(t)
+	disableBootstrapForTests(t)
 
 	cityPath := filepath.Join(t.TempDir(), "bright-lights")
 	if err := os.MkdirAll(cityPath, 0o755); err != nil {
@@ -223,10 +236,48 @@ func TestFinalizeInitFetchesRemotePacksBeforeProviderReadiness(t *testing.T) {
 	}
 }
 
+func TestFinalizeInitDoesNotWriteImplicitImportState(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+	configureIsolatedRuntimeEnv(t)
+
+	cityPath := filepath.Join(t.TempDir(), "bright-lights")
+	var initStdout, initStderr bytes.Buffer
+	code := doInit(fsys.OSFS{}, cityPath, defaultWizardConfig(), "", &initStdout, &initStderr)
+	if code != 0 {
+		t.Fatalf("doInit = %d, want 0: %s", code, initStderr.String())
+	}
+
+	oldLookPath := initLookPath
+	initLookPath = func(name string) (string, error) { return "/usr/bin/" + name, nil }
+	t.Cleanup(func() { initLookPath = oldLookPath })
+
+	oldRegister := registerCityWithSupervisorTestHook
+	registerCityWithSupervisorTestHook = func(_ string, _ string, _ io.Writer, _ io.Writer) (bool, int) {
+		return true, 0
+	}
+	t.Cleanup(func() { registerCityWithSupervisorTestHook = oldRegister })
+
+	var stdout, stderr bytes.Buffer
+	code = finalizeInit(cityPath, &stdout, &stderr, initFinalizeOptions{
+		commandName:           "gc init",
+		skipProviderReadiness: true,
+	})
+	if code != 0 {
+		t.Fatalf("finalizeInit = %d, want 0: %s", code, stderr.String())
+	}
+
+	implicitPath := filepath.Join(os.Getenv("GC_HOME"), "implicit-import.toml")
+	if _, err := os.Stat(implicitPath); !os.IsNotExist(err) {
+		t.Fatalf("implicit-import.toml should not be created during finalizeInit, stat err = %v", err)
+	}
+}
+
 func TestFinalizeInitReportsConfigLoadErrorDuringProviderPreflight(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")
 	configureIsolatedRuntimeEnv(t)
+	disableBootstrapForTests(t)
 
 	cityPath := filepath.Join(t.TempDir(), "bright-lights")
 	if err := os.MkdirAll(cityPath, 0o755); err != nil {
@@ -258,13 +309,14 @@ func TestFinalizeInitWithoutProgressSkipsStepCounter(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")
 	configureIsolatedRuntimeEnv(t)
+	disableBootstrapForTests(t)
 
 	cityPath := filepath.Join(t.TempDir(), "bright-lights")
 	var initStdout, initStderr bytes.Buffer
 	code := doInit(fsys.OSFS{}, cityPath, wizardConfig{
-		configName: "tutorial",
+		configName: "minimal",
 		provider:   "claude",
-	}, &initStdout, &initStderr)
+	}, "", &initStdout, &initStderr)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0: %s", code, initStderr.String())
 	}
@@ -305,7 +357,7 @@ func TestFinalizeInitWithoutProgressSkipsStepCounter(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("finalizeInit = %d, want 0: %s", code, stderr.String())
 	}
-	if strings.Contains(stdout.String(), "[8/8]") {
+	if strings.Contains(stdout.String(), "[9/9]") {
 		t.Fatalf("stdout = %q, want no progress counter", stdout.String())
 	}
 	if !strings.Contains(stdout.String(), "Waiting for supervisor to start city...") {
@@ -317,13 +369,14 @@ func TestCmdInitResumesFinalizeForExistingCity(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")
 	configureIsolatedRuntimeEnv(t)
+	disableBootstrapForTests(t)
 
 	cityPath := filepath.Join(t.TempDir(), "bright-lights")
 	var initStdout, initStderr bytes.Buffer
 	code := doInit(fsys.OSFS{}, cityPath, wizardConfig{
 		configName: "gastown",
 		provider:   "claude",
-	}, &initStdout, &initStderr)
+	}, "", &initStdout, &initStderr)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0: %s", code, initStderr.String())
 	}
@@ -378,13 +431,14 @@ func TestCmdInitSkipProviderReadinessBypassesBlockedProvider(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_DOLT", "skip")
 	configureIsolatedRuntimeEnv(t)
+	disableBootstrapForTests(t)
 
 	cityPath := filepath.Join(t.TempDir(), "bright-lights")
 	var initStdout, initStderr bytes.Buffer
 	code := doInit(fsys.OSFS{}, cityPath, wizardConfig{
-		configName: "tutorial",
+		configName: "minimal",
 		provider:   "claude",
-	}, &initStdout, &initStderr)
+	}, "", &initStdout, &initStderr)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0: %s", code, initStderr.String())
 	}
@@ -413,7 +467,7 @@ func TestCmdInitSkipProviderReadinessBypassesBlockedProvider(t *testing.T) {
 	t.Cleanup(func() { registerCityWithSupervisorTestHook = oldRegister })
 
 	var stdout, stderr bytes.Buffer
-	code = cmdInitWithOptions([]string{cityPath}, "", "", &stdout, &stderr, true)
+	code = cmdInitWithOptions([]string{cityPath}, "", "", "", &stdout, &stderr, true)
 	if code != 0 {
 		t.Fatalf("cmdInitWithOptions = %d, want 0: %s", code, stderr.String())
 	}
@@ -451,6 +505,41 @@ func TestShellQuotePathForOSWindows(t *testing.T) {
 	}
 }
 
+func TestInitRunVersionTimesOutHungVersionCommand(t *testing.T) {
+	oldCommandContext := initRunVersionCommandContext
+	oldTimeout := initRunVersionTimeout
+	initRunVersionTimeout = 50 * time.Millisecond
+	initRunVersionCommandContext = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcessInitRunVersionHang", "--")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		return cmd
+	}
+	t.Cleanup(func() {
+		initRunVersionCommandContext = oldCommandContext
+		initRunVersionTimeout = oldTimeout
+	})
+
+	start := time.Now()
+	line, err := initRunVersion("hung-binary")
+	if err == nil {
+		t.Fatal("initRunVersion error = nil, want timeout")
+	}
+	if line != "" {
+		t.Fatalf("initRunVersion line = %q, want empty on timeout", line)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("initRunVersion elapsed = %v, want timeout-bound execution", elapsed)
+	}
+}
+
+func TestHelperProcessInitRunVersionHang(_ *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	time.Sleep(10 * time.Second)
+	os.Exit(0)
+}
+
 func initBareProviderPackRepo(t *testing.T, name, provider string) string {
 	t.Helper()
 
@@ -477,4 +566,316 @@ func initBareProviderPackRepo(t *testing.T, name, provider string) string {
 	mustGit(t, workDir, "commit", "-m", "initial")
 	mustGit(t, workDir, "clone", "--bare", workDir, bareDir)
 	return bareDir
+}
+
+func TestCheckHardDependenciesTreatsExecGcBeadsBdAsBdContract(t *testing.T) {
+	t.Setenv("GC_BEADS", "exec:/tmp/gc-beads-bd")
+
+	oldLookPath := initLookPath
+	initLookPath = func(name string) (string, error) {
+		if name == "dolt" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/bin/" + name, nil
+	}
+	t.Cleanup(func() { initLookPath = oldLookPath })
+
+	oldRunVersion := initRunVersion
+	initRunVersion = func(binary string) (string, error) {
+		switch binary {
+		case "bd":
+			return "bd version " + bdMinVersion, nil
+		case "flock", "tmux", "jq", "git", "pgrep", "lsof":
+			return binary + " version", nil
+		default:
+			return binary + " version " + doltMinVersion, nil
+		}
+	}
+	t.Cleanup(func() { initRunVersion = oldRunVersion })
+
+	missing := checkHardDependencies(t.TempDir())
+	if len(missing) != 1 {
+		t.Fatalf("missing deps = %#v, want only dolt", missing)
+	}
+	if missing[0].name != "dolt" {
+		t.Fatalf("missing dep = %#v, want dolt", missing[0])
+	}
+}
+
+func TestCheckHardDependenciesRequiresBdToolsForBdRigUnderFileCity(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "file"
+
+[[rigs]]
+name = "frontend"
+path = "frontend"
+prefix = "fe"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldLookPath := initLookPath
+	initLookPath = func(name string) (string, error) {
+		if name == "dolt" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/bin/" + name, nil
+	}
+	t.Cleanup(func() { initLookPath = oldLookPath })
+
+	oldRunVersion := initRunVersion
+	initRunVersion = func(binary string) (string, error) {
+		switch binary {
+		case "bd":
+			return "bd version " + bdMinVersion, nil
+		case "flock", "tmux", "jq", "git", "pgrep", "lsof":
+			return binary + " version", nil
+		default:
+			return binary + " version " + doltMinVersion, nil
+		}
+	}
+	t.Cleanup(func() { initRunVersion = oldRunVersion })
+
+	missing := checkHardDependencies(cityDir)
+	if len(missing) != 1 || missing[0].name != "dolt" {
+		t.Fatalf("missing deps = %#v, want only dolt for bd-backed rig", missing)
+	}
+}
+
+func TestCheckHardDependenciesRequiresBdToolsForSiteBoundBdRigUnderFileCity(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "frontend")
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "file"
+
+[[rigs]]
+name = "frontend"
+prefix = "fe"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, ".gc", "site.toml"), []byte(`[[rig]]
+name = "frontend"
+path = "frontend"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldLookPath := initLookPath
+	initLookPath = func(name string) (string, error) {
+		if name == "dolt" {
+			return "", os.ErrNotExist
+		}
+		return "/usr/bin/" + name, nil
+	}
+	t.Cleanup(func() { initLookPath = oldLookPath })
+
+	oldRunVersion := initRunVersion
+	initRunVersion = func(binary string) (string, error) {
+		switch binary {
+		case "bd":
+			return "bd version " + bdMinVersion, nil
+		case "flock", "tmux", "jq", "git", "pgrep", "lsof":
+			return binary + " version", nil
+		default:
+			return binary + " version " + doltMinVersion, nil
+		}
+	}
+	t.Cleanup(func() { initRunVersion = oldRunVersion })
+
+	missing := checkHardDependencies(cityDir)
+	if len(missing) != 1 || missing[0].name != "dolt" {
+		t.Fatalf("missing deps = %#v, want only dolt for site-bound bd-backed rig", missing)
+	}
+}
+
+func TestFinalizeInitCanonicalizesBdStoreBeforeProviderReadinessBlock(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+	configureIsolatedRuntimeEnv(t)
+
+	cityPath := filepath.Join(t.TempDir(), "bright-lights")
+	var initStdout, initStderr bytes.Buffer
+	code := doInit(fsys.OSFS{}, cityPath, wizardConfig{
+		configName: "minimal",
+		provider:   "claude",
+	}, "", &initStdout, &initStderr)
+	if code != 0 {
+		t.Fatalf("doInit = %d, want 0: %s", code, initStderr.String())
+	}
+
+	oldProbe := initProbeProvidersReadiness
+	initProbeProvidersReadiness = func(_ context.Context, _ []string, fresh bool) (map[string]api.ReadinessItem, error) {
+		if !fresh {
+			t.Fatal("finalizeInit should force a fresh readiness probe")
+		}
+		if _, err := os.Stat(filepath.Join(cityPath, ".beads", "metadata.json")); err != nil {
+			t.Fatalf("metadata.json missing before readiness block: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(cityPath, ".beads", "config.yaml")); err != nil {
+			t.Fatalf("config.yaml missing before readiness block: %v", err)
+		}
+		return map[string]api.ReadinessItem{
+			"claude": {
+				Name:        "claude",
+				Kind:        api.ProbeKindProvider,
+				DisplayName: "Claude Code",
+				Status:      api.ProbeStatusNeedsAuth,
+			},
+		}, nil
+	}
+	t.Cleanup(func() { initProbeProvidersReadiness = oldProbe })
+
+	calledRegister := false
+	oldRegister := registerCityWithSupervisorTestHook
+	registerCityWithSupervisorTestHook = func(_ string, _ string, _ io.Writer, _ io.Writer) (bool, int) {
+		calledRegister = true
+		return true, 0
+	}
+	t.Cleanup(func() { registerCityWithSupervisorTestHook = oldRegister })
+
+	var stdout, stderr bytes.Buffer
+	code = finalizeInit(cityPath, &stdout, &stderr, initFinalizeOptions{commandName: "gc init"})
+	if code != 1 {
+		t.Fatalf("finalizeInit = %d, want 1", code)
+	}
+	if calledRegister {
+		t.Fatal("registerCityWithSupervisor should not run when provider readiness blocks init")
+	}
+	if _, err := os.Stat(filepath.Join(cityPath, ".beads", "metadata.json")); err != nil {
+		t.Fatalf("metadata.json missing after readiness block: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cityPath, ".beads", "config.yaml")); err != nil {
+		t.Fatalf("config.yaml missing after readiness block: %v", err)
+	}
+}
+
+func TestFinalizeInitCanonicalizesBdStoreBeforeProviderReadinessBlockWithoutSkip(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	configureIsolatedRuntimeEnv(t)
+
+	cityPath := filepath.Join(t.TempDir(), "bright-lights")
+	var initStdout, initStderr bytes.Buffer
+	code := doInit(fsys.OSFS{}, cityPath, wizardConfig{
+		configName: "minimal",
+		provider:   "claude",
+	}, "", &initStdout, &initStderr)
+	if code != 0 {
+		t.Fatalf("doInit = %d, want 0: %s", code, initStderr.String())
+	}
+
+	oldProbe := initProbeProvidersReadiness
+	initProbeProvidersReadiness = func(_ context.Context, _ []string, fresh bool) (map[string]api.ReadinessItem, error) {
+		if !fresh {
+			t.Fatal("finalizeInit should force a fresh readiness probe")
+		}
+		if _, err := os.Stat(filepath.Join(cityPath, ".beads", "metadata.json")); err != nil {
+			t.Fatalf("metadata.json missing before readiness block: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(cityPath, ".beads", "config.yaml")); err != nil {
+			t.Fatalf("config.yaml missing before readiness block: %v", err)
+		}
+		return map[string]api.ReadinessItem{
+			"claude": {
+				Name:        "claude",
+				Kind:        api.ProbeKindProvider,
+				DisplayName: "Claude Code",
+				Status:      api.ProbeStatusNeedsAuth,
+			},
+		}, nil
+	}
+	t.Cleanup(func() { initProbeProvidersReadiness = oldProbe })
+
+	var stdout, stderr bytes.Buffer
+	code = finalizeInit(cityPath, &stdout, &stderr, initFinalizeOptions{commandName: "gc init"})
+	if code != 1 {
+		t.Fatalf("finalizeInit = %d, want 1", code)
+	}
+	if _, err := os.Stat(filepath.Join(cityPath, ".beads", "metadata.json")); err != nil {
+		t.Fatalf("metadata.json missing after readiness block: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cityPath, ".beads", "config.yaml")); err != nil {
+		t.Fatalf("config.yaml missing after readiness block: %v", err)
+	}
+}
+
+func TestFinalizeInitDoesNotRunBdProviderBeforeProviderReadinessBlock(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+	t.Setenv("GC_DOLT", "")
+
+	cityPath := filepath.Join(t.TempDir(), "bright-lights")
+	var initStdout, initStderr bytes.Buffer
+	code := doInit(fsys.OSFS{}, cityPath, wizardConfig{
+		configName: "minimal",
+		provider:   "claude",
+	}, "", &initStdout, &initStderr)
+	if code != 0 {
+		t.Fatalf("doInit = %d, want 0: %s", code, initStderr.String())
+	}
+
+	spyDir := t.TempDir()
+	callLog := filepath.Join(spyDir, "gc-beads-bd.calls")
+	spy := filepath.Join(spyDir, "gc-beads-bd")
+	scriptBody := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %q\nexit 0\n", callLog)
+	if err := os.WriteFile(spy, []byte(scriptBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GC_BEADS", "")
+	cityConfigPath := filepath.Join(cityPath, "city.toml")
+	cityConfig, err := os.ReadFile(cityConfigPath)
+	if err != nil {
+		t.Fatalf("ReadFile(city.toml): %v", err)
+	}
+	cityConfig = append(cityConfig, []byte(fmt.Sprintf("\n[beads]\nprovider = %q\n", "exec:"+spy))...)
+	if err := os.WriteFile(cityConfigPath, cityConfig, 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+
+	oldProbe := initProbeProvidersReadiness
+	initProbeProvidersReadiness = func(_ context.Context, _ []string, fresh bool) (map[string]api.ReadinessItem, error) {
+		if !fresh {
+			t.Fatal("finalizeInit should force a fresh readiness probe")
+		}
+		return map[string]api.ReadinessItem{
+			"claude": {
+				Name:        "claude",
+				Kind:        api.ProbeKindProvider,
+				DisplayName: "Claude Code",
+				Status:      api.ProbeStatusNeedsAuth,
+			},
+		}, nil
+	}
+	t.Cleanup(func() { initProbeProvidersReadiness = oldProbe })
+
+	var stdout, stderr bytes.Buffer
+	code = finalizeInit(cityPath, &stdout, &stderr, initFinalizeOptions{commandName: "gc init"})
+	if code != 1 {
+		t.Fatalf("finalizeInit = %d, want 1", code)
+	}
+	if data, err := os.ReadFile(callLog); err == nil && strings.TrimSpace(string(data)) != "" {
+		t.Fatalf("gc-beads-bd should not run before provider readiness passes, got:\n%s", data)
+	}
 }

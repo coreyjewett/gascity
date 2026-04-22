@@ -16,6 +16,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/overlay"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 // Provider adapts [Tmux] to the [runtime.Provider] interface.
@@ -31,8 +32,10 @@ var instanceTokenReader = rand.Reader
 
 // Compile-time check.
 var (
-	_ runtime.Provider               = (*Provider)(nil)
-	_ runtime.ImmediateNudgeProvider = (*Provider)(nil)
+	_ runtime.Provider                      = (*Provider)(nil)
+	_ runtime.ImmediateNudgeProvider        = (*Provider)(nil)
+	_ runtime.InterruptBoundaryWaitProvider = (*Provider)(nil)
+	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
 )
 
 // NewProvider returns a [Provider] backed by a real tmux installation
@@ -64,6 +67,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	if err != nil {
 		return fmt.Errorf("ensuring instance token: %w", err)
 	}
+	cfg.Env = injectSessionRuntimeHintsEnv(cfg.Env, cfg)
 
 	// Store workDir for CopyTo.
 	if cfg.WorkDir != "" {
@@ -74,17 +78,20 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 
 	// Copy overlays and CopyFiles before creating the tmux session.
 	// Local provider: files are on the same filesystem.
-	// Pack-level overlays (lower priority, merged additively).
+	// V2 per-provider overlay support: CopyDirForProviders copies universal
+	// files then per-provider/<provider>/ slots for ProviderName plus any
+	// InstallAgentHooks entries (flattened).
+	overlayProviders := append([]string{cfg.ProviderName}, cfg.InstallAgentHooks...)
 	if cfg.WorkDir != "" {
 		for _, od := range cfg.PackOverlayDirs {
-			if err := overlay.CopyDir(od, cfg.WorkDir, io.Discard); err != nil {
+			if err := overlay.CopyDirForProviders(od, cfg.WorkDir, overlayProviders, io.Discard); err != nil {
 				return fmt.Errorf("copying pack overlay %s: %w", od, err)
 			}
 		}
 	}
 	// Agent-level overlay (highest priority; merges known settings files, overwrites others).
 	if cfg.OverlayDir != "" && cfg.WorkDir != "" {
-		if err := overlay.CopyDir(cfg.OverlayDir, cfg.WorkDir, io.Discard); err != nil {
+		if err := overlay.CopyDirForProviders(cfg.OverlayDir, cfg.WorkDir, overlayProviders, io.Discard); err != nil {
 			return fmt.Errorf("copying overlay %s: %w", cfg.OverlayDir, err)
 		}
 	}
@@ -126,6 +133,19 @@ func ensureInstanceToken(env map[string]string) (map[string]string, error) {
 	return cloned, nil
 }
 
+func injectSessionRuntimeHintsEnv(env map[string]string, cfg runtime.Config) map[string]string {
+	cloned := make(map[string]string, len(env)+1)
+	for k, v := range env {
+		cloned[k] = v
+	}
+	if prompt := strings.TrimSpace(cfg.ReadyPromptPrefix); prompt != "" {
+		cloned[sessionReadyPromptEnvKey] = cfg.ReadyPromptPrefix
+	} else {
+		delete(cloned, sessionReadyPromptEnvKey)
+	}
+	return cloned
+}
+
 func newInstanceToken() (string, error) {
 	b := make([]byte, 16)
 	if _, err := io.ReadFull(instanceTokenReader, b); err != nil {
@@ -165,6 +185,7 @@ func (p *Provider) RunLive(name string, cfg runtime.Config) error {
 // Invalidates the state cache after a successful stop so subsequent
 // IsRunning calls see the updated state immediately.
 func (p *Provider) Stop(name string) error {
+	p.tm.CloseHiddenAttachClient(name)
 	err := p.tm.KillSessionWithProcesses(name)
 	if err != nil && (errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer)) {
 		return nil // idempotent
@@ -180,6 +201,17 @@ func (p *Provider) Stop(name string) error {
 // Interrupt sends Ctrl-C to the named tmux session.
 // Best-effort: returns nil if the session doesn't exist.
 func (p *Provider) Interrupt(name string) error {
+	if p.tm.requiresHiddenAttachedInterrupt(name) && !p.tm.IsSessionAttached(name) {
+		if err := p.tm.ensureHiddenAttachedClient(name); err != nil {
+			return fmt.Errorf("preparing detached gemini interrupt: %w", err)
+		}
+	}
+	if used, err := p.tm.sendHiddenAttachedKeys(name, "C-c"); used {
+		if err != nil {
+			return err
+		}
+		return nil
+	}
 	err := p.tm.SendKeysRaw(name, "C-c")
 	if err != nil && (errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer)) {
 		return nil
@@ -230,6 +262,68 @@ func (p *Provider) WaitForIdle(ctx context.Context, name string, timeout time.Du
 	return p.tm.WaitForIdle(ctx, name, timeout)
 }
 
+// WaitForInterruptBoundary waits for a provider-native interrupt acknowledgement
+// before the next user turn is injected.
+func (p *Provider) WaitForInterruptBoundary(ctx context.Context, name string, since time.Time, timeout time.Duration) error {
+	return p.tm.WaitForInterruptBoundary(ctx, name, since, timeout)
+}
+
+// ResetInterruptedTurn discards the just-interrupted Gemini user turn without
+// restarting the session.
+func (p *Provider) ResetInterruptedTurn(ctx context.Context, name string) error {
+	if p.tm.requiresHiddenAttachedInterrupt(name) && !p.tm.IsSessionAttached(name) {
+		if err := p.tm.ensureHiddenAttachedClient(name); err != nil {
+			return fmt.Errorf("preparing detached gemini rewind: %w", err)
+		}
+	}
+	if err := p.NudgeNow(name, runtime.TextContent("/rewind")); err != nil {
+		return fmt.Errorf("opening gemini rewind: %w", err)
+	}
+	if err := p.waitForPane(ctx, name, geminiRewindDialogVisible); err != nil {
+		return fmt.Errorf("waiting for gemini rewind picker: %w", err)
+	}
+	if err := p.SendKeys(name, "Up"); err != nil {
+		return fmt.Errorf("selecting interrupted gemini turn: %w", err)
+	}
+	if err := sleepWithContext(ctx, 100*time.Millisecond); err != nil {
+		return err
+	}
+	if err := p.SendKeys(name, "Enter"); err != nil {
+		return fmt.Errorf("opening gemini rewind confirmation: %w", err)
+	}
+	if err := p.waitForPane(ctx, name, geminiRewindConfirmationVisible); err != nil {
+		return fmt.Errorf("waiting for gemini rewind confirmation: %w", err)
+	}
+	pane, err := p.tm.CapturePane(name, 80)
+	if err != nil {
+		return fmt.Errorf("capturing gemini rewind confirmation: %w", err)
+	}
+	if !strings.Contains(pane, "No code changes to revert.") {
+		if err := p.SendKeys(name, "Down"); err != nil {
+			return fmt.Errorf("choosing gemini rewind-only action: %w", err)
+		}
+		if err := sleepWithContext(ctx, 100*time.Millisecond); err != nil {
+			return err
+		}
+	}
+	if err := p.SendKeys(name, "Enter"); err != nil {
+		return fmt.Errorf("confirming gemini rewind: %w", err)
+	}
+	if err := p.waitForPane(ctx, name, geminiRewindComplete); err != nil {
+		return fmt.Errorf("waiting for gemini rewind completion: %w", err)
+	}
+	if err := p.tm.WaitForIdle(ctx, name, 10*time.Second); err != nil {
+		return fmt.Errorf("waiting for gemini prompt after rewind: %w", err)
+	}
+	return nil
+}
+
+// DismissKnownDialogs best-effort clears known trust/permissions dialogs on a
+// running session using a bounded timeout.
+func (p *Provider) DismissKnownDialogs(ctx context.Context, name string, timeout time.Duration) error {
+	return p.tm.DismissKnownDialogs(ctx, name, timeout)
+}
+
 // Nudge sends a message to the named session to wake or redirect the agent.
 // By default, waits for the agent to be idle before sending (wait-idle mode)
 // to avoid interrupting active tool calls. If the agent doesn't become idle
@@ -275,6 +369,13 @@ func (p *Provider) NudgeNow(name string, content []runtime.ContentBlock) error {
 	}
 	message := strings.Join(parts, "\n")
 	if message == "" {
+		return nil
+	}
+
+	if used, err := p.tm.sendHiddenAttachedText(name, message); used {
+		if err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -346,10 +447,59 @@ func (p *Provider) ClearScrollback(name string) error {
 	return p.tm.ClearHistory(name)
 }
 
+func (p *Provider) waitForPane(ctx context.Context, name string, match func(string) bool) error {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		pane, err := p.tm.CapturePane(name, 80)
+		if err == nil && match(pane) {
+			return nil
+		}
+		if err := sleepWithContext(ctx, 100*time.Millisecond); err != nil {
+			return err
+		}
+	}
+	return ErrIdleTimeout
+}
+
+func geminiRewindDialogVisible(pane string) bool {
+	return strings.Contains(pane, "Cancel rewind and stay here") || strings.Contains(pane, "> Rewind")
+}
+
+func geminiRewindConfirmationVisible(pane string) bool {
+	return strings.Contains(pane, "Confirm Rewind")
+}
+
+func geminiRewindComplete(pane string) bool {
+	return !strings.Contains(pane, "Confirm Rewind") &&
+		!strings.Contains(pane, "Cancel rewind and stay here") &&
+		!strings.Contains(pane, "> Rewind") &&
+		!strings.Contains(pane, "Rewinding...")
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // SendKeys sends bare keystrokes to the named session. Each key is sent
 // as a separate tmux send-keys invocation (e.g., "Enter", "Down", "C-c").
 // Best-effort: returns nil if the session doesn't exist.
 func (p *Provider) SendKeys(name string, keys ...string) error {
+	if used, err := p.tm.sendHiddenAttachedKeys(name, keys...); used {
+		if err != nil {
+			return err
+		}
+		return nil
+	}
 	for _, k := range keys {
 		err := p.tm.SendKeysRaw(name, k)
 		if err != nil && (errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer)) {
@@ -472,6 +622,9 @@ func (o *tmuxStartOps) runSetupCommand(ctx context.Context, cmd string, env map[
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	if workDir := strings.TrimSpace(env["GC_DIR"]); workDir != "" {
+		c.Dir = workDir
+	}
 	c.Env = os.Environ()
 	for k, v := range env {
 		c.Env = append(c.Env, k+"="+v)
@@ -552,6 +705,16 @@ func doStartSession(ctx context.Context, ops startOps, name string, cfg runtime.
 			ProcessNames:      cfg.ProcessNames,
 		}}
 		_ = ops.waitForReady(ctx, name, rc, 60*time.Second) // best-effort
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	// Some CLIs surface trust or permissions dialogs only after their initial
+	// ready screen. Re-run dialog acceptance after readiness so late dialogs do
+	// not strand the session in an unusable startup state.
+	if len(cfg.ProcessNames) > 0 || cfg.EmitsPermissionWarning {
+		_ = ops.acceptStartupDialogs(ctx, name) // best-effort
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -675,27 +838,24 @@ const maxInlinePromptLen = 1024
 
 func ensureFreshSession(ops startOps, name string, cfg runtime.Config) error {
 	fullCommand := cfg.Command
+	promptFile := ""
 	if cfg.PromptSuffix != "" {
-		if len(cfg.PromptSuffix) > maxInlinePromptLen && cfg.WorkDir != "" {
+		if len(cfg.PromptSuffix) > maxInlinePromptLen {
 			// Large prompt — write to temp file and use $(cat ...) expansion
-			// inside the tmux session's shell to avoid the protocol limit.
-			promptFile, err := writePromptFile(cfg.WorkDir, name, cfg.PromptSuffix)
-			if err == nil {
-				if cfg.PromptFlag != "" {
-					fullCommand = fmt.Sprintf(`sh -c 'exec %s %s "$(cat %q)" && rm -f %q'`,
-						cfg.Command, cfg.PromptFlag, promptFile, promptFile)
-				} else {
-					fullCommand = fmt.Sprintf(`sh -c 'exec %s "$(cat %q)" && rm -f %q'`,
-						cfg.Command, promptFile, promptFile)
-				}
-			} else {
-				// Fall back to inline (will likely fail, but preserves old behavior).
-				if cfg.PromptFlag != "" {
-					fullCommand = fullCommand + " " + cfg.PromptFlag + " " + cfg.PromptSuffix
-				} else {
-					fullCommand = fullCommand + " " + cfg.PromptSuffix
-				}
+			// inside the tmux session's shell to avoid the protocol limit and
+			// prevent the quoted prompt from leaking into the exec command
+			// line (which triggers ENAMETOOLONG / exit 126 when the total
+			// command overflows kernel argv/exec buffers).
+			var err error
+			promptFile, err = writePromptFile(cfg.WorkDir, name, cfg.PromptSuffix)
+			if err != nil {
+				// No silent fallback: the inline path would produce the
+				// "File name too long" tmux pane death that this helper
+				// exists to prevent. Surface the failure so the reconciler
+				// records it and the operator can diagnose the cause.
+				return fmt.Errorf("writing prompt temp file for session %q: %w", name, err)
 			}
+			fullCommand = longPromptCommand(cfg.Command, cfg.PromptFlag, promptFile)
 		} else {
 			if cfg.PromptFlag != "" {
 				fullCommand = fullCommand + " " + cfg.PromptFlag + " " + cfg.PromptSuffix
@@ -708,22 +868,25 @@ func ensureFreshSession(ops startOps, name string, cfg runtime.Config) error {
 	if err == nil {
 		return nil // created successfully
 	}
+	if errors.Is(err, ErrNoServer) {
+		time.Sleep(50 * time.Millisecond)
+		err = ops.createSession(name, cfg.WorkDir, fullCommand, cfg.Env)
+		if err == nil {
+			return nil
+		}
+	}
 	if !errors.Is(err, ErrSessionExists) {
-		return fmt.Errorf("creating session: %w", err)
+		return cleanupPromptFileOnError(promptFile, fmt.Errorf("creating session: %w", err))
 	}
 
 	// Session exists but the pane is already dead (e.g. remain-on-exit corpse).
 	// Safe to recycle even when ProcessNames are unavailable.
 	if !ops.isSessionRunning(name) {
 		if err := ops.killSession(name); err != nil {
-			return fmt.Errorf("killing dead session: %w", err)
+			return cleanupPromptFileOnError(promptFile, fmt.Errorf("killing dead session: %w", err))
 		}
-		err = ops.createSession(name, cfg.WorkDir, fullCommand, cfg.Env)
-		if errors.Is(err, ErrSessionExists) {
-			return nil // race: another process created it
-		}
-		if err != nil {
-			return fmt.Errorf("creating session after dead-session cleanup: %w", err)
+		if err := recreateSessionAfterCleanup(ops, name, cfg.WorkDir, fullCommand, cfg.Env, promptFile); err != nil {
+			return cleanupPromptFileOnError(promptFile, fmt.Errorf("creating session after dead-session cleanup: %w", err))
 		}
 		return nil
 	}
@@ -731,32 +894,83 @@ func ensureFreshSession(ops startOps, name string, cfg runtime.Config) error {
 	// Session exists — without process names we can't distinguish a zombie
 	// from a healthy session, so treat it as a duplicate.
 	if len(cfg.ProcessNames) == 0 {
-		return fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name)
+		return cleanupPromptFileOnError(promptFile, fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name))
 	}
 
 	// We have process names — check if the agent is alive.
 	if ops.isRuntimeRunning(name, cfg.ProcessNames) {
-		return fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name)
+		return cleanupPromptFileOnError(promptFile, fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name))
 	}
 
 	// Zombie: tmux alive but agent dead. Kill and recreate.
 	if err := ops.killSession(name); err != nil {
-		return fmt.Errorf("killing zombie session: %w", err)
+		return cleanupPromptFileOnError(promptFile, fmt.Errorf("killing zombie session: %w", err))
 	}
-	err = ops.createSession(name, cfg.WorkDir, fullCommand, cfg.Env)
-	if errors.Is(err, ErrSessionExists) {
-		return nil // race: another process created it
-	}
-	if err != nil {
-		return fmt.Errorf("creating session after zombie cleanup: %w", err)
+	if err := recreateSessionAfterCleanup(ops, name, cfg.WorkDir, fullCommand, cfg.Env, promptFile); err != nil {
+		return cleanupPromptFileOnError(promptFile, fmt.Errorf("creating session after zombie cleanup: %w", err))
 	}
 	return nil
 }
 
-// writePromptFile writes a shell-quoted prompt string to a temp file in
-// the agent's working directory. The file contains the raw prompt text
-// (unquoted) so it can be read back via $(cat ...) inside the shell.
-// Returns the file path on success.
+func longPromptCommand(command, promptFlag, promptFile string) string {
+	quotedPromptFile := shellquote.Quote(promptFile)
+	var script string
+	if promptFlag != "" {
+		script = fmt.Sprintf(`__gc_prompt="$(cat %s && printf .)"; __gc_status=$?; rm -f %s; [ "$__gc_status" -eq 0 ] || exit "$__gc_status"; __gc_prompt="${__gc_prompt%%.}"; exec %s %s "$__gc_prompt"`,
+			quotedPromptFile, quotedPromptFile, command, promptFlag)
+	} else {
+		script = fmt.Sprintf(`__gc_prompt="$(cat %s && printf .)"; __gc_status=$?; rm -f %s; [ "$__gc_status" -eq 0 ] || exit "$__gc_status"; __gc_prompt="${__gc_prompt%%.}"; exec %s "$__gc_prompt"`,
+			quotedPromptFile, quotedPromptFile, command)
+	}
+	return "sh -c " + shellquote.Quote(script)
+}
+
+func removePromptFile(promptFile string) error {
+	if promptFile == "" {
+		return nil
+	}
+	if err := os.Remove(promptFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing prompt temp file %q: %w", promptFile, err)
+	}
+	return nil
+}
+
+func cleanupPromptFileOnError(promptFile string, err error) error {
+	if promptFile == "" || err == nil {
+		return err
+	}
+	if removeErr := removePromptFile(promptFile); removeErr != nil {
+		return errors.Join(err, removeErr)
+	}
+	return err
+}
+
+func recreateSessionAfterCleanup(ops startOps, name, workDir, command string, env map[string]string, promptFile string) error {
+	err := ops.createSession(name, workDir, command, env)
+	if errors.Is(err, ErrNoServer) {
+		time.Sleep(50 * time.Millisecond)
+		err = ops.createSession(name, workDir, command, env)
+	}
+	if errors.Is(err, ErrSessionExists) {
+		_ = removePromptFile(promptFile)
+		return nil // race: another process created it
+	}
+	return err
+}
+
+// writePromptFile writes a shell-quoted prompt string to a temp file for
+// the tmux session's shell to read back via $(cat ...). The file contains
+// the raw prompt text (unquoted) so shell expansion yields a single argv
+// element.
+//
+// Preferred location is <workDir>/.gc/tmp (visible from inside the worktree
+// and cleaned up with the agent's scratch space). A non-empty WorkDir must
+// exist and be a directory, because tmux may otherwise start the pane in the
+// wrong checkout. If WorkDir is empty, or WorkDir exists but its .gc/tmp path
+// is unusable, this falls back to a gc-scoped directory under os.TempDir().
+// The fallback is load-bearing: without it a failed MkdirAll used to trigger
+// a silent "inline the prompt into the tmux command line" path that produced
+// "cannot execute: File name too long" pane deaths for large prompts.
 func writePromptFile(workDir, agentName, shellQuotedPrompt string) (string, error) {
 	// Strip surrounding single quotes from shell-quoted string.
 	raw := shellQuotedPrompt
@@ -764,7 +978,38 @@ func writePromptFile(workDir, agentName, shellQuotedPrompt string) (string, erro
 		raw = raw[1 : len(raw)-1]
 		raw = strings.ReplaceAll(raw, `'\''`, `'`)
 	}
-	dir := filepath.Join(workDir, ".gc", "tmp")
+
+	// Try workDir-scoped path first so the prompt file sits next to the
+	// session's scratch state. An unusable workDir is not fatal; we still
+	// want a valid argv-via-file path to avoid the inline fallback.
+	var candidateErrs []error
+	if workDir != "" {
+		info, err := os.Stat(workDir)
+		if err != nil {
+			return "", fmt.Errorf("workdir unavailable: %w", err)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("workdir %q is not a directory", workDir)
+		}
+		dir := filepath.Join(workDir, ".gc", "tmp")
+		path, err := writePromptToDir(dir, agentName, raw)
+		if err == nil {
+			return path, nil
+		}
+		candidateErrs = append(candidateErrs, fmt.Errorf("workdir tmp: %w", err))
+	}
+	osTmpDir := filepath.Join(os.TempDir(), fmt.Sprintf(".gc-%d", os.Getuid()), "tmux-prompts")
+	path, err := writePromptToDir(osTmpDir, agentName, raw)
+	if err == nil {
+		return path, nil
+	}
+	candidateErrs = append(candidateErrs, fmt.Errorf("os tmp: %w", err))
+	return "", errors.Join(candidateErrs...)
+}
+
+// writePromptToDir creates the target directory and writes the prompt to
+// a new temp file inside it. Returns the temp file path on success.
+func writePromptToDir(dir, agentName, raw string) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}

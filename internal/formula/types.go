@@ -28,8 +28,10 @@
 package formula
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Type categorizes formulas by their purpose.
@@ -66,10 +68,16 @@ type Formula struct {
 	// Description explains what this formula does.
 	Description string `json:"description,omitempty"`
 
-	// Version is the schema version.
-	// Version 1 uses the legacy hierarchy-first compilation model.
-	// Version 2 opts into graph-first workflow compilation.
+	// Version is the formula revision.
+	// It is intentionally not a graph.v2 opt-in: legacy molecule formulas use
+	// this field for their own revisions and must keep hierarchy-first
+	// molecule semantics unless they explicitly declare a graph contract or use
+	// graph-only step constructs.
 	Version int `json:"version"`
+
+	// Contract opts the formula into a specific runtime contract.
+	// "graph.v2" enables graph-first workflow compilation when formula_v2 is enabled.
+	Contract string `json:"contract,omitempty" toml:"contract,omitempty"`
 
 	// Type categorizes the formula: workflow, expansion, or aspect.
 	Type Type `json:"type"`
@@ -212,7 +220,8 @@ type Step struct {
 	Priority *int `json:"priority,omitempty"`
 
 	// Labels are applied to the created issue.
-	Labels []string `json:"labels,omitempty"`
+	// TOML key is "tags" (formula author facing); JSON/Go name is "labels" (bead facing).
+	Labels []string `json:"labels,omitempty" toml:"tags,omitempty"`
 
 	// Metadata is copied to the cooked issue metadata as string key/value pairs.
 	// Reserved runtime keys under the gc.* namespace may be added by transforms.
@@ -266,12 +275,21 @@ type Step struct {
 	// Ralph wraps this step in an inline run/check retry loop.
 	// The original step becomes a logical container, and the actionable work is
 	// emitted as first-class graph steps.
+	// JSON storage intentionally retains the legacy "ralph" field name for
+	// backward-compatible step snapshots; the parser also accepts canonical
+	// public "check" input.
 	Ralph *RalphSpec `json:"ralph,omitempty" toml:"ralph,omitempty"`
 
 	// Retry wraps an executable step in an inline attempt/eval retry loop.
 	// The original step becomes a stable logical container, and the actionable
 	// work is emitted as first-class graph steps.
 	Retry *RetrySpec `json:"retry,omitempty" toml:"retry,omitempty"`
+
+	// Timeout is the maximum duration for this step's Ralph check script.
+	// Gate condition scripts use gate.timeout instead.
+	// Format: Go duration string (e.g., "5m", "2m30s", "300s").
+	// Overrides DefaultGateTimeout (5m) unless check.timeout is set.
+	Timeout string `json:"timeout,omitempty" toml:"timeout,omitempty"`
 
 	// Source tracing fields: track where this step came from.
 	// These are set during parsing/transformation and copied to Issues during cooking.
@@ -283,6 +301,283 @@ type Step struct {
 	// SourceLocation is the path within the source formula.
 	// Format: "steps[0]", "steps[2].children[1]", "advice[0].after", "loop.body[0]"
 	SourceLocation string `json:"-"` // Internal only, not serialized to JSON
+}
+
+// UnmarshalJSON accepts the canonical public "check" spelling while keeping the
+// internal runtime field wired through Ralph.
+func (s *Step) UnmarshalJSON(data []byte) error {
+	type stepAlias Step
+
+	var decoded stepAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*s = Step(decoded)
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	rawCheck, hasCheck := raw["check"]
+	rawRalph, hasRalph := raw["ralph"]
+	return s.normalizeCheckAlias(hasCheck, rawCheck, hasRalph, rawRalph)
+}
+
+// UnmarshalTOML accepts the canonical public "check" spelling while keeping the
+// internal runtime field wired through Ralph.
+func (s *Step) UnmarshalTOML(data interface{}) error {
+	raw, ok := data.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("type mismatch for formula.Step: expected table but found %T", data)
+	}
+
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("encode formula.Step: %w", err)
+	}
+
+	var decoded stepTOMLAlias
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return fmt.Errorf("decode formula.Step: %w", err)
+	}
+	step, err := decoded.toStep()
+	if err != nil {
+		return err
+	}
+	*s = step
+
+	rawCheck, hasCheck := raw["check"]
+	rawRalph, hasRalph := raw["ralph"]
+	return s.normalizeCheckAlias(hasCheck, rawCheck, hasRalph, rawRalph)
+}
+
+func (s *Step) normalizeCheckAlias(hasCheck bool, rawCheck interface{}, hasRalph bool, rawRalph interface{}) error {
+	if hasCheck && hasRalph {
+		return fmt.Errorf("step.check: cannot be specified more than once")
+	}
+
+	switch {
+	case hasCheck:
+		spec, err := decodePublicCheckSpec(rawCheck)
+		if err != nil {
+			return err
+		}
+		s.Ralph = spec
+	case hasRalph:
+		if err := validatePublicCheckSpecShape(rawRalph); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+type stepTOMLAlias struct {
+	ID              string            `json:"id"`
+	Title           string            `json:"title"`
+	Description     string            `json:"description,omitempty"`
+	DescriptionFile string            `json:"description_file,omitempty"`
+	Notes           string            `json:"notes,omitempty"`
+	Type            string            `json:"type,omitempty"`
+	Priority        *int              `json:"priority,omitempty"`
+	Labels          []string          `json:"tags,omitempty"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
+	DependsOn       []string          `json:"depends_on,omitempty"`
+	Needs           []string          `json:"needs,omitempty"`
+	WaitsFor        string            `json:"waits_for,omitempty"`
+	Assignee        string            `json:"assignee,omitempty"`
+	Expand          string            `json:"expand,omitempty"`
+	ExpandVars      map[string]string `json:"expand_vars,omitempty"`
+	Condition       string            `json:"condition,omitempty"`
+	Children        []*stepTOMLAlias  `json:"children,omitempty"`
+	Gate            *Gate             `json:"gate,omitempty"`
+	Loop            *loopTOMLAlias    `json:"loop,omitempty"`
+	OnComplete      *OnCompleteSpec   `json:"on_complete,omitempty"`
+	Check           json.RawMessage   `json:"check,omitempty"`
+	Ralph           json.RawMessage   `json:"ralph,omitempty"`
+	Retry           *RetrySpec        `json:"retry,omitempty"`
+	Timeout         string            `json:"timeout,omitempty"`
+}
+
+type loopTOMLAlias struct {
+	Count int              `json:"count,omitempty"`
+	Until string           `json:"until,omitempty"`
+	Max   int              `json:"max,omitempty"`
+	Range string           `json:"range,omitempty"`
+	Var   string           `json:"var,omitempty"`
+	Body  []*stepTOMLAlias `json:"body"`
+}
+
+func (a stepTOMLAlias) toStep() (Step, error) {
+	hasCheck := len(a.Check) > 0
+	hasRalph := len(a.Ralph) > 0
+	if hasCheck && hasRalph {
+		return Step{}, fmt.Errorf("step.check: cannot be specified more than once")
+	}
+
+	children := make([]*Step, 0, len(a.Children))
+	for _, child := range a.Children {
+		if child == nil {
+			continue
+		}
+		step, err := child.toStep()
+		if err != nil {
+			return Step{}, err
+		}
+		children = append(children, &step)
+	}
+
+	var ralph *RalphSpec
+	switch {
+	case hasCheck:
+		spec, err := decodePublicCheckSpec(a.Check)
+		if err != nil {
+			return Step{}, err
+		}
+		ralph = spec
+	case hasRalph:
+		spec, err := decodePublicCheckSpec(a.Ralph)
+		if err != nil {
+			return Step{}, err
+		}
+		ralph = spec
+	}
+	loop, err := a.Loop.toLoopSpec()
+	if err != nil {
+		return Step{}, err
+	}
+
+	return Step{
+		ID:              a.ID,
+		Title:           a.Title,
+		Description:     a.Description,
+		DescriptionFile: a.DescriptionFile,
+		Notes:           a.Notes,
+		Type:            a.Type,
+		Priority:        a.Priority,
+		Labels:          a.Labels,
+		Metadata:        a.Metadata,
+		DependsOn:       a.DependsOn,
+		Needs:           a.Needs,
+		WaitsFor:        a.WaitsFor,
+		Assignee:        a.Assignee,
+		Expand:          a.Expand,
+		ExpandVars:      a.ExpandVars,
+		Condition:       a.Condition,
+		Children:        children,
+		Gate:            a.Gate,
+		Loop:            loop,
+		OnComplete:      a.OnComplete,
+		Ralph:           ralph,
+		Retry:           a.Retry,
+		Timeout:         a.Timeout,
+	}, nil
+}
+
+func (a *loopTOMLAlias) toLoopSpec() (*LoopSpec, error) {
+	if a == nil {
+		return nil, nil
+	}
+
+	body := make([]*Step, 0, len(a.Body))
+	for _, child := range a.Body {
+		if child == nil {
+			continue
+		}
+		step, err := child.toStep()
+		if err != nil {
+			return nil, err
+		}
+		body = append(body, &step)
+	}
+
+	return &LoopSpec{
+		Count: a.Count,
+		Until: a.Until,
+		Max:   a.Max,
+		Range: a.Range,
+		Var:   a.Var,
+		Body:  body,
+	}, nil
+}
+
+func decodePublicCheckSpec(raw interface{}) (*RalphSpec, error) {
+	if err := validatePublicCheckSpecShape(raw); err != nil {
+		return nil, err
+	}
+
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("step.check: encode spec: %w", err)
+	}
+	if string(encoded) == "null" {
+		return nil, nil
+	}
+
+	var spec RalphSpec
+	if err := json.Unmarshal(encoded, &spec); err != nil {
+		return nil, fmt.Errorf("step.check: decode spec: %w", err)
+	}
+	return &spec, nil
+}
+
+func validatePublicCheckSpecShape(raw interface{}) error {
+	if raw == nil {
+		return nil
+	}
+
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("step.check: encode spec: %w", err)
+	}
+	if string(encoded) == "null" {
+		return nil
+	}
+
+	var spec map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &spec); err != nil {
+		return fmt.Errorf("step.check: expected an object")
+	}
+
+	for key, value := range spec {
+		switch key {
+		case "max_attempts":
+			continue
+		case "check":
+			if err := validatePublicCheckBodyShape(value); err != nil {
+				return err
+			}
+		case "exec", "inference":
+			return fmt.Errorf("step.check: unsupported key %q (expected max_attempts or check)", key)
+		default:
+			continue
+		}
+	}
+
+	return nil
+}
+
+func validatePublicCheckBodyShape(raw json.RawMessage) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return fmt.Errorf("step.check.check: expected an object")
+	}
+
+	for key := range body {
+		switch key {
+		case "exec", "inference":
+			return fmt.Errorf("step.check.check: unsupported key %q (expected mode, path, or timeout)", key)
+		default:
+			continue
+		}
+	}
+
+	return nil
 }
 
 // Gate defines an async wait condition for formula steps.
@@ -584,6 +879,83 @@ type AroundAdvice struct {
 	After []*AdviceStep `json:"after,omitempty"`
 }
 
+func requiresExplicitGraphContract(f *Formula) bool {
+	if f == nil || strings.TrimSpace(f.Contract) != "" {
+		return false
+	}
+	if f.Version < 2 {
+		if stepsRequireDetachedGraphContract(f.Steps) {
+			return true
+		}
+		return stepsRequireDetachedGraphContract(f.Template)
+	}
+	if stepsRequireGraphContract(f.Steps) {
+		return true
+	}
+	return stepsRequireGraphContract(f.Template)
+}
+
+func stepsRequireDetachedGraphContract(steps []*Step) bool {
+	for _, step := range steps {
+		if stepRequiresDetachedGraphContract(step) {
+			return true
+		}
+	}
+	return false
+}
+
+func stepRequiresDetachedGraphContract(step *Step) bool {
+	if step == nil {
+		return false
+	}
+	if metadataRequiresGraphContract(step.Metadata) {
+		return true
+	}
+	if step.Loop != nil && stepsRequireDetachedGraphContract(step.Loop.Body) {
+		return true
+	}
+	return stepsRequireDetachedGraphContract(step.Children)
+}
+
+func stepsRequireGraphContract(steps []*Step) bool {
+	for _, step := range steps {
+		if stepRequiresGraphContract(step) {
+			return true
+		}
+	}
+	return false
+}
+
+func stepRequiresGraphContract(step *Step) bool {
+	if step == nil {
+		return false
+	}
+	if step.Ralph != nil || step.Retry != nil || step.OnComplete != nil || metadataRequiresGraphContract(step.Metadata) {
+		return true
+	}
+	if step.Loop != nil && stepsRequireGraphContract(step.Loop.Body) {
+		return true
+	}
+	return stepsRequireGraphContract(step.Children)
+}
+
+func metadataRequiresGraphContract(metadata map[string]string) bool {
+	for rawKey, rawValue := range metadata {
+		key := strings.TrimSpace(rawKey)
+		value := strings.TrimSpace(rawValue)
+		switch key {
+		case "gc.kind":
+			switch value {
+			case "scope", "cleanup", "scope-check", "workflow-finalize", "retry", "retry-run", "retry-eval", "ralph", "run", "check":
+				return true
+			}
+		case "gc.scope_name", "gc.scope_role", "gc.scope_ref", "gc.continuation_group", "gc.on_fail":
+			return true
+		}
+	}
+	return false
+}
+
 // Validate checks the formula for structural errors.
 func (f *Formula) Validate() error {
 	var errs []string
@@ -594,6 +966,13 @@ func (f *Formula) Validate() error {
 
 	if f.Version < 1 {
 		errs = append(errs, "version: must be >= 1")
+	}
+
+	if contract := strings.TrimSpace(f.Contract); contract != "" && !strings.EqualFold(contract, "graph.v2") {
+		errs = append(errs, fmt.Sprintf("contract: invalid value %q (must be graph.v2)", f.Contract))
+	}
+	if requiresExplicitGraphContract(f) {
+		errs = append(errs, `contract: formulas that use graph-only constructs must declare contract = "graph.v2" explicitly`)
 	}
 
 	if f.Type != "" && !f.Type.IsValid() {
@@ -633,6 +1012,12 @@ func (f *Formula) Validate() error {
 		if step.Priority != nil && (*step.Priority < 0 || *step.Priority > 4) {
 			errs = append(errs, fmt.Sprintf("%s (%s): priority must be 0-4", prefix, step.ID))
 		}
+
+		// Validate timeout format
+		if err := validateStepTimeout(prefix, step.ID, step.Timeout, step.Ralph != nil, nil, true); err != "" {
+			errs = append(errs, err)
+		}
+		validateLoopBodyTimeouts(step.Loop, &errs, fmt.Sprintf("%s (%s).loop", prefix, step.ID), nil, true)
 
 		if step.Ralph != nil {
 			validateRalph(step.Ralph, &errs, fmt.Sprintf("%s (%s)", prefix, step.ID), step)
@@ -711,6 +1096,92 @@ func (f *Formula) Validate() error {
 	return nil
 }
 
+func validateStepTimeout(prefix, stepID, raw string, hasRalph bool, allowedLoopVars map[string]struct{}, allowUnresolvedVars bool) string {
+	if raw == "" {
+		return ""
+	}
+	if err := validatePositiveTimeout(fmt.Sprintf("%s (%s)", prefix, stepID), raw, allowedLoopVars, allowUnresolvedVars); err != "" {
+		return err
+	}
+	if !hasRalph {
+		return fmt.Sprintf("%s (%s): timeout requires check; convergence gate scripts use convergence.gate_timeout or --gate-timeout", prefix, stepID)
+	}
+	return ""
+}
+
+func validatePositiveTimeout(prefix, raw string, allowedLoopVars map[string]struct{}, allowUnresolvedVars bool) string {
+	if raw == "" {
+		return ""
+	}
+	parseRaw := substituteAllowedTimeoutLoopVars(raw, allowedLoopVars)
+	if allowUnresolvedVars && rangeVarPattern.MatchString(parseRaw) {
+		return ""
+	}
+	d, err := time.ParseDuration(parseRaw)
+	if err != nil {
+		return fmt.Sprintf("%s: invalid timeout %q: %v", prefix, raw, err)
+	}
+	if d <= 0 {
+		return fmt.Sprintf("%s: timeout must be positive, got %v", prefix, d)
+	}
+	return ""
+}
+
+func validateRalphCheckTimeout(prefix, raw string, allowedLoopVars map[string]struct{}, allowUnresolvedVars bool) string {
+	return validatePositiveTimeout(prefix, raw, allowedLoopVars, allowUnresolvedVars)
+}
+
+func substituteAllowedTimeoutLoopVars(raw string, allowedLoopVars map[string]struct{}) string {
+	if len(allowedLoopVars) == 0 {
+		return raw
+	}
+	return rangeVarPattern.ReplaceAllStringFunc(raw, func(match string) string {
+		name := match[1 : len(match)-1]
+		if _, ok := allowedLoopVars[name]; ok {
+			return "1"
+		}
+		return match
+	})
+}
+
+func validateLoopBodyTimeouts(loop *LoopSpec, errs *[]string, prefix string, allowedLoopVars map[string]struct{}, allowUnresolvedVars bool) {
+	if loop == nil {
+		return
+	}
+	validateNestedStepTimeoutsWithOptions(loop.Body, errs, prefix+".body", timeoutLoopVarsFor(loop, allowedLoopVars), allowUnresolvedVars)
+}
+
+func timeoutLoopVarsFor(loop *LoopSpec, parent map[string]struct{}) map[string]struct{} {
+	if loop == nil || loop.Var == "" {
+		return parent
+	}
+	vars := make(map[string]struct{}, len(parent)+1)
+	for k, v := range parent {
+		vars[k] = v
+	}
+	vars[loop.Var] = struct{}{}
+	return vars
+}
+
+func validateNestedStepTimeoutsWithOptions(steps []*Step, errs *[]string, prefix string, allowedLoopVars map[string]struct{}, allowUnresolvedVars bool) {
+	for i, step := range steps {
+		if step == nil {
+			continue
+		}
+		stepPrefix := fmt.Sprintf("%s[%d]", prefix, i)
+		if err := validateStepTimeout(stepPrefix, step.ID, step.Timeout, step.Ralph != nil, allowedLoopVars, allowUnresolvedVars); err != "" {
+			*errs = append(*errs, err)
+		}
+		if step.Ralph != nil && step.Ralph.Check != nil {
+			if err := validateRalphCheckTimeout(fmt.Sprintf("%s (%s).check.check", stepPrefix, step.ID), step.Ralph.Check.Timeout, allowedLoopVars, allowUnresolvedVars); err != "" {
+				*errs = append(*errs, err)
+			}
+		}
+		validateNestedStepTimeoutsWithOptions(step.Children, errs, stepPrefix+".children", allowedLoopVars, allowUnresolvedVars)
+		validateLoopBodyTimeouts(step.Loop, errs, fmt.Sprintf("%s (%s).loop", stepPrefix, step.ID), allowedLoopVars, allowUnresolvedVars)
+	}
+}
+
 // collectChildIDs recursively collects step IDs from children.
 // idLocations maps ID -> location where first defined (for better duplicate error messages).
 func collectChildIDs(children []*Step, idLocations map[string]string, errs *[]string, prefix string) {
@@ -734,6 +1205,12 @@ func collectChildIDs(children []*Step, idLocations map[string]string, errs *[]st
 		if child.Priority != nil && (*child.Priority < 0 || *child.Priority > 4) {
 			*errs = append(*errs, fmt.Sprintf("%s (%s): priority must be 0-4", childPrefix, child.ID))
 		}
+
+		// Validate timeout format for children
+		if err := validateStepTimeout(childPrefix, child.ID, child.Timeout, child.Ralph != nil, nil, true); err != "" {
+			*errs = append(*errs, err)
+		}
+		validateLoopBodyTimeouts(child.Loop, errs, fmt.Sprintf("%s (%s).loop", childPrefix, child.ID), nil, true)
 
 		if child.Ralph != nil {
 			validateRalph(child.Ralph, errs, fmt.Sprintf("%s (%s)", childPrefix, child.ID), child)
@@ -860,38 +1337,41 @@ func validateOnComplete(oc *OnCompleteSpec, errs *[]string, prefix string) {
 
 func validateRalph(spec *RalphSpec, errs *[]string, prefix string, step *Step) {
 	if spec.MaxAttempts < 1 {
-		*errs = append(*errs, fmt.Sprintf("%s.ralph: max_attempts must be >= 1", prefix))
+		*errs = append(*errs, fmt.Sprintf("%s.check: max_attempts must be >= 1", prefix))
 	}
 	if spec.Check == nil {
-		*errs = append(*errs, fmt.Sprintf("%s.ralph: check is required", prefix))
+		*errs = append(*errs, fmt.Sprintf("%s.check: check is required", prefix))
 	} else {
 		if spec.Check.Mode == "" {
-			*errs = append(*errs, fmt.Sprintf("%s.ralph.check: mode is required", prefix))
+			*errs = append(*errs, fmt.Sprintf("%s.check.check: mode is required", prefix))
 		} else if spec.Check.Mode != "exec" {
-			*errs = append(*errs, fmt.Sprintf("%s.ralph.check: unsupported mode %q (only exec is supported)", prefix, spec.Check.Mode))
+			*errs = append(*errs, fmt.Sprintf("%s.check.check: unsupported mode %q (only exec is supported)", prefix, spec.Check.Mode))
 		}
 		if spec.Check.Path == "" {
-			*errs = append(*errs, fmt.Sprintf("%s.ralph.check: path is required", prefix))
+			*errs = append(*errs, fmt.Sprintf("%s.check.check: path is required", prefix))
+		}
+		if err := validateRalphCheckTimeout(fmt.Sprintf("%s.check.check", prefix), spec.Check.Timeout, nil, true); err != "" {
+			*errs = append(*errs, err)
 		}
 	}
 
 	if step.Loop != nil {
-		*errs = append(*errs, fmt.Sprintf("%s: ralph cannot be combined with loop", prefix))
+		*errs = append(*errs, fmt.Sprintf("%s: check cannot be combined with loop", prefix))
 	}
 	if step.OnComplete != nil {
-		*errs = append(*errs, fmt.Sprintf("%s: ralph cannot be combined with on_complete", prefix))
+		*errs = append(*errs, fmt.Sprintf("%s: check cannot be combined with on_complete", prefix))
 	}
 	if step.Gate != nil {
-		*errs = append(*errs, fmt.Sprintf("%s: ralph cannot be combined with gate", prefix))
+		*errs = append(*errs, fmt.Sprintf("%s: check cannot be combined with gate", prefix))
 	}
 	if step.Expand != "" {
-		*errs = append(*errs, fmt.Sprintf("%s: ralph cannot be combined with expand", prefix))
+		*errs = append(*errs, fmt.Sprintf("%s: check cannot be combined with expand", prefix))
 	}
 	if step.Assignee != "" {
-		*errs = append(*errs, fmt.Sprintf("%s: ralph cannot be combined with assignee (route work via gc.run_target instead)", prefix))
+		*errs = append(*errs, fmt.Sprintf("%s: check cannot be combined with assignee (route work via gc.run_target instead)", prefix))
 	}
 	if step.Retry != nil {
-		*errs = append(*errs, fmt.Sprintf("%s: ralph cannot be combined with retry", prefix))
+		*errs = append(*errs, fmt.Sprintf("%s: check cannot be combined with retry", prefix))
 	}
 }
 
@@ -906,7 +1386,7 @@ func validateRetry(spec *RetrySpec, errs *[]string, prefix string, step *Step) {
 	}
 
 	if step.Ralph != nil {
-		*errs = append(*errs, fmt.Sprintf("%s: retry cannot be combined with ralph", prefix))
+		*errs = append(*errs, fmt.Sprintf("%s: retry cannot be combined with check", prefix))
 	}
 	if step.Loop != nil {
 		*errs = append(*errs, fmt.Sprintf("%s: retry cannot be combined with loop", prefix))

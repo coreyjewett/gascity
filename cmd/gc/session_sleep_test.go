@@ -220,6 +220,8 @@ func TestReconcileSessionBeads_StartsIdleDrainAfterGrace(t *testing.T) {
 	session.Metadata["last_woke_at"] = ts
 	session.Metadata["detached_at"] = ts
 	env.sp.WaitForIdleErrors["worker"] = nil
+	idleGate := make(chan struct{}) // see waitForIdleProbeReady godoc
+	env.sp.WaitForIdleGates["worker"] = idleGate
 
 	poolDesired := map[string]int{"worker": 1}
 	cfgNames := configuredSessionNames(env.cfg, "", env.store)
@@ -228,9 +230,14 @@ func TestReconcileSessionBeads_StartsIdleDrainAfterGrace(t *testing.T) {
 		env.store, nil, nil, nil, env.dt, poolDesired, false, nil, "",
 		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
 	)
+	close(idleGate)
 	waitForIdleProbeReady(t, env.dt, session.ID)
+	fresh, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(session): %v", err)
+	}
 	reconcileSessionBeads(
-		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames, env.cfg, env.sp,
+		context.Background(), []beads.Bead{fresh}, env.desiredState, cfgNames, env.cfg, env.sp,
 		env.store, nil, nil, nil, env.dt, poolDesired, false, nil, "",
 		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
 	)
@@ -670,6 +677,7 @@ func TestRecoverPendingIdleSleep_PreservesPreDrainFingerprint(t *testing.T) {
 			"sleep_intent":             "idle-stop-pending",
 			"sleep_policy_fingerprint": "old-fingerprint",
 			"last_woke_at":             clk.Time.Add(-10 * time.Second).UTC().Format(time.RFC3339),
+			"pending_create_claim":     "true",
 		},
 	})
 	if err != nil {
@@ -685,6 +693,9 @@ func TestRecoverPendingIdleSleep_PreservesPreDrainFingerprint(t *testing.T) {
 	}
 	if got.Metadata["sleep_policy_fingerprint"] != "old-fingerprint" {
 		t.Fatalf("sleep_policy_fingerprint = %q, want preserved pre-drain value", got.Metadata["sleep_policy_fingerprint"])
+	}
+	if got.Metadata["pending_create_claim"] != "" {
+		t.Fatalf("pending_create_claim = %q, want cleared after pending idle sleep recovery", got.Metadata["pending_create_claim"])
 	}
 }
 
@@ -984,14 +995,26 @@ func TestAdvanceSessionDrainsWithSessions_UsesProvidedWakeEvaluations(t *testing
 	}
 }
 
+// waitForIdleProbeReady polls the drain tracker until the idle probe for
+// beadID is registered and marked ready, or until the deadline expires.
+//
+// Callers must ensure the probe goroutine does not complete within the
+// same reconcile tick that started it — otherwise shouldBeginIdleDrain
+// observes probe.ready=true and its deferred clearIdleProbe removes the
+// probe from the map before this helper can see it. The standard way to
+// enforce that ordering is to set env.sp.WaitForIdleGates[sessionName]
+// to a channel, run the tick (probe goroutine blocks on the gate), then
+// close the gate and call this helper. Without the gate, tests race
+// against goroutine scheduling and flake under -race.
 func waitForIdleProbeReady(t *testing.T, dt *drainTracker, beadID string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if probe, ok := dt.idleProbe(beadID); ok && probe.ready {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("idle probe for %s did not complete", beadID)
+	t.Fatalf("idle probe for %s not ready within 10s", beadID)
 }

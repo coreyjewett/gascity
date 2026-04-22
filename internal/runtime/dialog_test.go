@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -47,6 +48,11 @@ func TestContainsWorkspaceTrustDialog(t *testing.T) {
 		{
 			name:    "codex trust dialog",
 			content: "> Do you trust the contents of this directory?",
+			want:    true,
+		},
+		{
+			name:    "gemini trust dialog",
+			content: "Do you trust the files in this folder?\n1. Trust folder",
 			want:    true,
 		},
 		{
@@ -96,6 +102,60 @@ func TestAcceptStartupDialogsAcceptsCodexTrustDialog(t *testing.T) {
 	}
 }
 
+func TestAcceptStartupDialogsAcceptsGeminiTrustDialog(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	peekCall := 0
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			peekCall++
+			if peekCall == 1 {
+				return "Do you trust the files in this folder?\n● 1. Trust folder (city)\n  2. Trust parent folder\n  3. Don't trust", nil
+			}
+			return "Type your message or @path/to/file", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Enter"}) {
+		t.Fatalf("sent keys = %v, want [Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsPeeksDeepEnoughForLateTrustDialog(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(lines int) (string, error) {
+			if lines < 100 {
+				return "› Implement {feature}", nil
+			}
+			return "Do you trust the contents of this directory?\n› Implement {feature}", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Enter"}) {
+		t.Fatalf("sent keys = %v, want [Enter]", sent)
+	}
+}
+
 func TestAcceptStartupDialogsAcceptsBypassPermissionsWarning(t *testing.T) {
 	withZeroDialogTimings(t)
 	dialogPollTimeout = time.Second
@@ -125,6 +185,292 @@ func TestAcceptStartupDialogsAcceptsBypassPermissionsWarning(t *testing.T) {
 	}
 }
 
+func TestAcceptStartupDialogsAcceptsCustomAPIKeyDialog(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	call := 0
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			call++
+			if call <= 2 {
+				return "normal startup output", nil
+			}
+			return "Detected a custom API key in your environment\nDo you want to use this API key?\n1. Yes\n2. No (recommended)", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Up", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Up Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamAcceptsTrustDialog(t *testing.T) {
+	var sent []string
+	snapshots := make(chan string, 2)
+	snapshots <- "Do you trust the contents of this directory?"
+	snapshots <- "user@host $"
+	close(snapshots)
+
+	err := AcceptStartupDialogsFromStream(
+		context.Background(),
+		time.Second,
+		snapshots,
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogsFromStream() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Enter"}) {
+		t.Fatalf("sent keys = %v, want [Enter]", sent)
+	}
+}
+
+func TestAcceptWorkspaceTrustDialogFromStreamPreservesEarlierSnapshots(t *testing.T) {
+	stream := &replayableSnapshotStream{update: make(chan struct{})}
+	stream.publish("Do you trust the contents of this directory?")
+	stream.publish("user@host $")
+	stream.finish()
+
+	var sent []string
+	_, err := acceptWorkspaceTrustDialogFromStream(
+		context.Background(),
+		time.Second,
+		newReplayableSnapshotCursorFromStream(stream),
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("acceptWorkspaceTrustDialogFromStream() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Enter"}) {
+		t.Fatalf("sent keys = %v, want [Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamPrefersLaterDialogOverEarlierPrompt(t *testing.T) {
+	var sent []string
+	snapshots := make(chan string, 2)
+	snapshots <- "user@host $"
+	snapshots <- "Bypass Permissions mode"
+	close(snapshots)
+
+	err := AcceptStartupDialogsFromStream(
+		context.Background(),
+		time.Second,
+		snapshots,
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogsFromStream() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Down", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Down Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamWaitsBrieflyForDelayedDialogAfterPrompt(t *testing.T) {
+	oldGrace := startupDialogStreamReadyGrace
+	startupDialogStreamReadyGrace = 75 * time.Millisecond
+	t.Cleanup(func() {
+		startupDialogStreamReadyGrace = oldGrace
+	})
+
+	var sent []string
+	snapshots := make(chan string, 1)
+	snapshots <- "user@host $"
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		snapshots <- "Bypass Permissions mode"
+		close(snapshots)
+	}()
+
+	err := AcceptStartupDialogsFromStream(
+		context.Background(),
+		time.Second,
+		snapshots,
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogsFromStream() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Down", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Down Enter]", sent)
+	}
+}
+
+func TestAcceptBypassPermissionsWarningFromStreamSendsKeysSeparately(t *testing.T) {
+	oldDelay := bypassDialogConfirmDelay
+	bypassDialogConfirmDelay = 10 * time.Millisecond
+	t.Cleanup(func() {
+		bypassDialogConfirmDelay = oldDelay
+	})
+
+	stream := &replayableSnapshotStream{update: make(chan struct{})}
+	stream.publish("Bypass Permissions mode")
+	stream.finish()
+
+	var calls []string
+	var callTimes []time.Time
+	_, err := acceptBypassPermissionsWarningFromStream(
+		context.Background(),
+		time.Second,
+		newReplayableSnapshotCursorFromStream(stream),
+		func(keys ...string) error {
+			calls = append(calls, strings.Join(keys, ","))
+			callTimes = append(callTimes, time.Now())
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("acceptBypassPermissionsWarningFromStream() error = %v", err)
+	}
+	if !reflect.DeepEqual(calls, []string{"Down", "Enter"}) {
+		t.Fatalf("calls = %v, want [Down Enter]", calls)
+	}
+	if len(callTimes) != 2 || callTimes[1].Sub(callTimes[0]) < 10*time.Millisecond {
+		t.Fatalf("callTimes gap = %v, want >= 10ms", callTimes[1].Sub(callTimes[0]))
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamReplaysBypassDialogAcrossPhases(t *testing.T) {
+	var sent []string
+	snapshots := make(chan string, 1)
+	snapshots <- "Bypass Permissions mode"
+	close(snapshots)
+
+	err := AcceptStartupDialogsFromStream(
+		context.Background(),
+		time.Second,
+		snapshots,
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogsFromStream() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Down", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Down Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamReplaysCustomAPIKeyDialogAcrossPhases(t *testing.T) {
+	var sent []string
+	snapshots := make(chan string, 1)
+	snapshots <- "Detected a custom API key in your environment\nDo you want to use this API key?"
+	close(snapshots)
+
+	err := AcceptStartupDialogsFromStream(
+		context.Background(),
+		time.Second,
+		snapshots,
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogsFromStream() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Up", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Up Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamReplaysRateLimitDialogAcrossPhases(t *testing.T) {
+	var sent []string
+	snapshots := make(chan string, 1)
+	snapshots <- "Usage limit reached"
+	close(snapshots)
+
+	err := AcceptStartupDialogsFromStream(
+		context.Background(),
+		time.Second,
+		snapshots,
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogsFromStream() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Down", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Down Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamTimesOutDespiteContinuousIrrelevantSnapshots(t *testing.T) {
+	stream := &replayableSnapshotStream{update: make(chan struct{})}
+	donePublishing := make(chan struct{})
+	go func() {
+		defer close(donePublishing)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for i := 0; i < 50; i++ {
+			stream.publish("still booting")
+			<-ticker.C
+		}
+		stream.finish()
+	}()
+
+	start := time.Now()
+	_, err := acceptWorkspaceTrustDialogFromStream(
+		context.Background(),
+		30*time.Millisecond,
+		newReplayableSnapshotCursorFromStream(stream),
+		func(_ ...string) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("acceptWorkspaceTrustDialogFromStream() error = %v, want nil timeout exit", err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("acceptWorkspaceTrustDialogFromStream() took %s, want timeout-bounded exit", elapsed)
+	}
+	<-donePublishing
+}
+
+func TestAcceptStartupDialogsFromStreamWithStatusReturnsFalseAfterIrrelevantSnapshots(t *testing.T) {
+	observed, err := AcceptStartupDialogsFromStreamWithStatus(
+		context.Background(),
+		30*time.Millisecond,
+		func() <-chan string {
+			snapshots := make(chan string, 1)
+			snapshots <- "starting up"
+			close(snapshots)
+			return snapshots
+		}(),
+		func(_ ...string) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogsFromStreamWithStatus() error = %v", err)
+	}
+	if observed {
+		t.Fatal("AcceptStartupDialogsFromStreamWithStatus() observed = true, want false")
+	}
+}
+
 func TestContainsPromptIndicator(t *testing.T) {
 	t.Parallel()
 
@@ -138,6 +484,7 @@ func TestContainsPromptIndicator(t *testing.T) {
 		{name: "percent prompt", content: "zsh %", want: true},
 		{name: "angle prompt", content: "claude >", want: true},
 		{name: "powerline prompt", content: "dir \u276f", want: true},
+		{name: "claude nbsp prompt", content: "❯\u00a0", want: true},
 		{name: "empty content", content: "", want: false},
 		{name: "no prompt", content: "loading...", want: false},
 		{name: "blank lines only", content: "\n\n", want: false},
@@ -174,6 +521,29 @@ func TestExitsEarlyOnPrompt(t *testing.T) {
 	}
 	if len(sent) != 0 {
 		t.Fatalf("sent keys = %v, want none (prompt detected)", sent)
+	}
+}
+
+func TestExitsEarlyOnClaudeNBSPPrompt(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			return "❯\u00a0", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs() error = %v", err)
+	}
+	if len(sent) != 0 {
+		t.Fatalf("sent keys = %v, want none (NBSP prompt detected)", sent)
 	}
 }
 
@@ -271,6 +641,40 @@ func TestContainsRateLimitDialog(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := containsRateLimitDialog(tt.content); got != tt.want {
 				t.Errorf("containsRateLimitDialog(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestContainsCustomAPIKeyDialog(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "custom api key prompt",
+			content: "Detected a custom API key in your environment\nDo you want to use this API key?",
+			want:    true,
+		},
+		{
+			name:    "question only",
+			content: "Do you want to use this API key?",
+			want:    true,
+		},
+		{
+			name:    "normal output",
+			content: "Starting Claude Code...",
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := containsCustomAPIKeyDialog(tt.content); got != tt.want {
+				t.Fatalf("containsCustomAPIKeyDialog(%q) = %v, want %v", tt.content, got, tt.want)
 			}
 		})
 	}

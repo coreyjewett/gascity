@@ -28,7 +28,7 @@ type AgentPatch struct {
 	Scope *string `toml:"scope,omitempty"`
 	// Suspended overrides the agent's suspended state.
 	Suspended *bool `toml:"suspended,omitempty"`
-	// Pool overrides pool configuration fields.
+	// Pool overrides legacy [pool] fields that map to session scaling.
 	Pool *PoolOverride `toml:"pool,omitempty"`
 	// Env adds or overrides environment variables.
 	Env map[string]string `toml:"env,omitempty"`
@@ -54,12 +54,38 @@ type AgentPatch struct {
 	SleepAfterIdle *string `toml:"sleep_after_idle,omitempty"`
 	// InstallAgentHooks overrides the agent's install_agent_hooks list.
 	InstallAgentHooks []string `toml:"install_agent_hooks,omitempty"`
+	// Skills is a tombstone field retained for v0.15.1 backwards compatibility.
+	//
+	// Deprecated: removed in v0.16. Tombstone — accepted but ignored. See
+	// engdocs/proposals/skill-materialization.md
+	Skills []string `toml:"skills,omitempty"`
+	// MCP is a tombstone field retained for v0.15.1 backwards compatibility.
+	//
+	// Deprecated: removed in v0.16. Tombstone — accepted but ignored. See
+	// engdocs/proposals/skill-materialization.md
+	MCP []string `toml:"mcp,omitempty"`
+	// SkillsAppend is a tombstone field retained for v0.15.1 backwards
+	// compatibility.
+	//
+	// Deprecated: removed in v0.16. Tombstone — accepted but ignored. See
+	// engdocs/proposals/skill-materialization.md
+	SkillsAppend []string `toml:"skills_append,omitempty"`
+	// MCPAppend is a tombstone field retained for v0.15.1 backwards
+	// compatibility.
+	//
+	// Deprecated: removed in v0.16. Tombstone — accepted but ignored. See
+	// engdocs/proposals/skill-materialization.md
+	MCPAppend []string `toml:"mcp_append,omitempty"`
 	// HooksInstalled overrides automatic hook detection.
 	HooksInstalled *bool `toml:"hooks_installed,omitempty"`
+	// InjectAssignedSkills overrides per-agent appendix injection
+	// (see Agent.InjectAssignedSkills).
+	InjectAssignedSkills *bool `toml:"inject_assigned_skills,omitempty"`
 	// SessionSetup overrides the agent's session_setup commands.
 	SessionSetup []string `toml:"session_setup,omitempty"`
 	// SessionSetupScript overrides the agent's session_setup_script path.
-	// Relative paths resolve against the city directory.
+	// Relative paths resolve against the declaring config file's directory
+	// (pack-safe). Paths prefixed with "//" resolve against the city root.
 	SessionSetupScript *string `toml:"session_setup_script,omitempty"`
 	// SessionLive overrides the agent's session_live commands.
 	SessionLive []string `toml:"session_live,omitempty"`
@@ -71,6 +97,8 @@ type AgentPatch struct {
 	DefaultSlingFormula *string `toml:"default_sling_formula,omitempty"`
 	// InjectFragments overrides the agent's inject_fragments list.
 	InjectFragments []string `toml:"inject_fragments,omitempty"`
+	// AppendFragments overrides the agent's append_fragments list.
+	AppendFragments []string `toml:"append_fragments,omitempty"`
 	// Attach overrides the agent's attach setting.
 	Attach *bool `toml:"attach,omitempty"`
 	// DependsOn overrides the agent's dependency list.
@@ -94,23 +122,33 @@ type AgentPatch struct {
 	MaxActiveSessions *int `toml:"max_active_sessions,omitempty"`
 	// MinActiveSessions overrides the minimum number of sessions to keep alive.
 	MinActiveSessions *int `toml:"min_active_sessions,omitempty"`
-	// ScaleCheck overrides the shell command whose output determines desired session count.
+	// ScaleCheck overrides the command template whose output determines desired
+	// session count. Supports the same Go template placeholders as
+	// Agent.scale_check.
 	ScaleCheck *string `toml:"scale_check,omitempty"`
+	// OptionDefaults adds or overrides provider option defaults for this agent.
+	// Keys are option keys, values are choice values. Merges additively
+	// (patch keys win over existing agent keys).
+	// Example: option_defaults = { model = "sonnet" }
+	OptionDefaults map[string]string `toml:"option_defaults,omitempty"`
 }
 
-// PoolOverride modifies pool configuration fields. Nil fields are not changed.
+// PoolOverride modifies legacy [pool] fields that map to session scaling. Nil fields are not changed.
 type PoolOverride struct {
-	// Min overrides pool minimum instances.
+	// Min overrides the minimum number of sessions.
 	Min *int `toml:"min,omitempty" jsonschema:"minimum=0"`
-	// Max overrides pool maximum instances. 0 means the pool is disabled.
+	// Max overrides the maximum number of sessions. 0 means no sessions can claim routed work.
 	Max *int `toml:"max,omitempty" jsonschema:"minimum=0"`
-	// Check overrides the pool check command.
+	// Check overrides the session scale check command template. Supports the
+	// same Go template placeholders as Agent.scale_check.
 	Check *string `toml:"check,omitempty"`
 	// DrainTimeout overrides the drain timeout. Duration string (e.g., "5m", "30m", "1h").
 	DrainTimeout *string `toml:"drain_timeout,omitempty"`
-	// OnDeath overrides the on_death command.
+	// OnDeath overrides the on_death command template. Supports the same Go
+	// template placeholders as Agent.on_death.
 	OnDeath *string `toml:"on_death,omitempty"`
-	// OnBoot overrides the on_boot command.
+	// OnBoot overrides the on_boot command template. Supports the same Go
+	// template placeholders as Agent.on_boot.
 	OnBoot *string `toml:"on_boot,omitempty"`
 }
 
@@ -130,10 +168,24 @@ type RigPatch struct {
 type ProviderPatch struct {
 	// Name is the targeting key (required). Must match an existing provider's name.
 	Name string `toml:"name" jsonschema:"required"`
+	// Base overrides the provider's inheritance parent (presence-aware).
+	// Pointer to a pointer so the patch can distinguish "no change"
+	// (double-nil) from "clear to inherit default" (single-nil value in
+	// outer pointer) from "set to explicit empty opt-out" (value "" in
+	// inner pointer) from "set to <name>". Callers use:
+	//   nil          = patch does not touch Base
+	//   &(*string)(nil) = patch clears Base to absent
+	//   &(&"")       = patch sets Base = "" (explicit opt-out)
+	//   &(&"builtin:codex") = patch sets Base to that value
+	Base **string `toml:"base,omitempty"`
 	// Command overrides the provider command.
 	Command *string `toml:"command,omitempty"`
 	// Args overrides the provider args.
 	Args []string `toml:"args,omitempty"`
+	// ArgsAppend overrides the provider args_append list.
+	ArgsAppend []string `toml:"args_append,omitempty"`
+	// OptionsSchemaMerge overrides the options_schema merge mode.
+	OptionsSchemaMerge *string `toml:"options_schema_merge,omitempty"`
 	// PromptMode overrides prompt delivery mode.
 	PromptMode *string `toml:"prompt_mode,omitempty" jsonschema:"enum=arg,enum=flag,enum=none"`
 	// PromptFlag overrides the prompt flag.
@@ -184,6 +236,13 @@ func applyAgentPatch(cfg *City, patch *AgentPatch) error {
 	target := qualifiedNameFromPatch(patch.Dir, patch.Name)
 	for i := range cfg.Agents {
 		a := &cfg.Agents[i]
+		// V2: match by qualified name so patches targeting "gastown.mayor"
+		// find agents with BindingName="gastown" and Name="mayor".
+		if AgentMatchesIdentity(a, target) {
+			applyAgentPatchFields(a, patch)
+			return nil
+		}
+		// V1 fallback: direct Dir+Name match.
 		if a.Dir == patch.Dir && a.Name == patch.Name {
 			applyAgentPatchFields(a, patch)
 			return nil
@@ -239,6 +298,9 @@ func applyAgentPatchFields(a *Agent, p *AgentPatch) {
 	if p.HooksInstalled != nil {
 		a.HooksInstalled = p.HooksInstalled
 	}
+	if p.InjectAssignedSkills != nil {
+		a.InjectAssignedSkills = p.InjectAssignedSkills
+	}
 	if len(p.SessionSetup) > 0 {
 		a.SessionSetup = append([]string(nil), p.SessionSetup...)
 	}
@@ -258,7 +320,7 @@ func applyAgentPatchFields(a *Agent, p *AgentPatch) {
 		a.OverlayDir = *p.OverlayDir
 	}
 	if p.DefaultSlingFormula != nil {
-		a.DefaultSlingFormula = *p.DefaultSlingFormula
+		a.DefaultSlingFormula = p.DefaultSlingFormula
 	}
 	if p.Attach != nil {
 		a.Attach = p.Attach
@@ -278,6 +340,9 @@ func applyAgentPatchFields(a *Agent, p *AgentPatch) {
 	}
 	if len(p.InjectFragments) > 0 {
 		a.InjectFragments = append([]string(nil), p.InjectFragments...)
+	}
+	if len(p.AppendFragments) > 0 {
+		a.AppendFragments = append([]string(nil), p.AppendFragments...)
 	}
 	if len(p.InjectFragmentsAppend) > 0 {
 		a.InjectFragments = append(a.InjectFragments, p.InjectFragmentsAppend...)
@@ -303,6 +368,15 @@ func applyAgentPatchFields(a *Agent, p *AgentPatch) {
 	}
 	if p.ScaleCheck != nil {
 		a.ScaleCheck = *p.ScaleCheck
+	}
+	// OptionDefaults: additive merge (patch keys win).
+	if len(p.OptionDefaults) > 0 {
+		if a.OptionDefaults == nil {
+			a.OptionDefaults = make(map[string]string, len(p.OptionDefaults))
+		}
+		for k, v := range p.OptionDefaults {
+			a.OptionDefaults[k] = v
+		}
 	}
 	// Pool: sub-field patching.
 	if p.Pool != nil {
@@ -371,12 +445,22 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 	if patch.Replace {
 		// Full replacement — build a new spec from patch fields only.
 		var newSpec ProviderSpec
+		if patch.Base != nil {
+			newSpec.Base = *patch.Base
+		}
 		if patch.Command != nil {
 			newSpec.Command = *patch.Command
 		}
 		if len(patch.Args) > 0 {
 			newSpec.Args = make([]string, len(patch.Args))
 			copy(newSpec.Args, patch.Args)
+		}
+		if len(patch.ArgsAppend) > 0 {
+			newSpec.ArgsAppend = make([]string, len(patch.ArgsAppend))
+			copy(newSpec.ArgsAppend, patch.ArgsAppend)
+		}
+		if patch.OptionsSchemaMerge != nil {
+			newSpec.OptionsSchemaMerge = *patch.OptionsSchemaMerge
 		}
 		if patch.PromptMode != nil {
 			newSpec.PromptMode = *patch.PromptMode
@@ -397,12 +481,22 @@ func applyProviderPatch(cfg *City, patch *ProviderPatch) error {
 		return nil
 	}
 	// Deep merge: only set fields override.
+	if patch.Base != nil {
+		spec.Base = *patch.Base // outer nil handled above; *patch.Base may be nil (clear) or valid
+	}
 	if patch.Command != nil {
 		spec.Command = *patch.Command
 	}
 	if len(patch.Args) > 0 {
 		spec.Args = make([]string, len(patch.Args))
 		copy(spec.Args, patch.Args)
+	}
+	if len(patch.ArgsAppend) > 0 {
+		spec.ArgsAppend = make([]string, len(patch.ArgsAppend))
+		copy(spec.ArgsAppend, patch.ArgsAppend)
+	}
+	if patch.OptionsSchemaMerge != nil {
+		spec.OptionsSchemaMerge = *patch.OptionsSchemaMerge
 	}
 	if patch.PromptMode != nil {
 		spec.PromptMode = *patch.PromptMode

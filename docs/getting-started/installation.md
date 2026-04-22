@@ -21,15 +21,16 @@ managers). Choose source when you need unreleased changes or plan to contribute.
 Gas City requires a small set of runtime tools. Homebrew installs all of them
 for you; the other methods require manual installation.
 
-| Tool | Required | macOS | Linux | Notes |
-|------|----------|-------|-------|-------|
-| tmux | Yes | `brew install tmux` | `apt install tmux` | Session management |
-| jq | Yes | `brew install jq` | `apt install jq` | JSON processing |
-| git | Yes | (built-in) | (built-in) | Version control |
-| dolt | Yes | `brew install dolt` | [releases](https://github.com/dolthub/dolt/releases) | Beads data plane |
-| bd (Beads CLI) | Yes | `brew install beads` | [releases](https://github.com/gastownhall/beads/releases) | Issue tracking |
-| flock | Yes | `brew install flock` | (built-in via util-linux) | File locking |
-| Go 1.25+ | Source only | `brew install go` | [golang.org](https://go.dev/dl/) | Compiler |
+| Tool | Required | Min version | macOS | Linux | Notes |
+|------|----------|-------------|-------|-------|-------|
+| tmux | Yes | — | `brew install tmux` | `apt install tmux` | Session management |
+| jq | Yes | — | `brew install jq` | `apt install jq` | JSON processing |
+| git | Yes | — | (built-in) | (built-in) | Version control |
+| dolt | Yes | 1.86.1 | `brew install dolt` | [releases](https://github.com/dolthub/dolt/releases) | Beads data plane |
+| bd (Beads CLI) | Yes | 1.0.0 | `brew install beads` | [releases](https://github.com/gastownhall/beads/releases) | Issue tracking |
+| flock | Yes | — | `brew install flock` | (built-in via util-linux) | File locking |
+| Go 1.25+ | Source only | 1.25 | `brew install go` | [golang.org](https://go.dev/dl/) | Compiler |
+| make | Source only | — | (built-in) | `apt install make` (or `build-essential`) | Drives `make install` |
 
 The exact versions CI pins are in [`deps.env`](https://github.com/gastownhall/gascity/blob/main/deps.env).
 
@@ -47,6 +48,14 @@ Verify the installation:
 ```bash
 gc version
 ```
+
+<Warning>
+If you use Oh My Zsh with the `git` plugin, `gc` may already be an alias for
+`git commit --verbose`. Run `command gc version` once to bypass the alias. For
+a persistent fix, add `unalias gc 2>/dev/null` after Oh My Zsh loads in
+`~/.zshrc`, or put that line in a file such as
+`~/.oh-my-zsh/custom/gascity.zsh`.
+</Warning>
 
 ### Upgrading via Homebrew
 
@@ -122,7 +131,7 @@ using direct download. Homebrew handles this automatically.
 
 ## Build from source
 
-Requires Go 1.25+ (pinned in `go.mod`).
+Requires `make` and Go 1.25+ (pinned in `go.mod`).
 
 ```bash
 git clone https://github.com/gastownhall/gascity.git
@@ -160,23 +169,28 @@ Regardless of install method, confirm everything is working:
 gc version          # should print the installed version and commit
 ```
 
+If that runs `git commit` instead of Gas City, your shell has a `gc` alias.
+Use `command gc version` for this check and see
+[Troubleshooting](/getting-started/troubleshooting#oh-my-zsh-git-plugin-hides-gc)
+for the permanent fix.
+
 Then create your first city:
 
 ```bash
 gc init ~/my-city
 cd ~/my-city
-gc start
 ```
 
-See the [Quickstart](./quickstart.md) for a complete walkthrough.
+`gc init` registers the city with the supervisor and starts it automatically.
+See the [Quickstart](/getting-started/quickstart) for a complete walkthrough.
 
 ## Docs preview
 
-The docs site uses [Mintlify](https://mintlify.com). Preview locally:
+The docs site uses [Mintlify](https://mintlify.com). Preview locally from the
+repo root:
 
 ```bash
-cd docs
-npx --yes mint@latest dev
+./mint.sh dev
 ```
 
 Or run a link check without starting the server:

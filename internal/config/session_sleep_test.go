@@ -254,6 +254,25 @@ func TestValidateNamedSessions_RejectsAliasSessionNameCollision(t *testing.T) {
 	}
 }
 
+func TestValidateNamedSessions_RejectsQualifiedAliasName(t *testing.T) {
+	cfg := &City{
+		Workspace: Workspace{Name: "test-city"},
+		Agents: []Agent{{
+			Name: "mayor",
+		}},
+		NamedSessions: []NamedSession{{
+			Name:     "gs.witness",
+			Template: "mayor",
+		}},
+	}
+
+	if err := ValidateNamedSessions(cfg); err == nil {
+		t.Fatal("ValidateNamedSessions() = nil, want error")
+	} else if !strings.Contains(err.Error(), `name "gs.witness"`) {
+		t.Fatalf("ValidateNamedSessions() error = %v, want qualified alias rejection", err)
+	}
+}
+
 func TestValidateNamedSessions_UsesResolvedWorkspaceName(t *testing.T) {
 	cfg := &City{
 		ResolvedWorkspaceName: "test-city",

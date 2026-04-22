@@ -65,7 +65,8 @@ type ConditionEnv struct {
 }
 
 // Environ returns the environment variable slice for exec.Cmd.
-// Only whitelisted variables: PATH (safe default), HOME, TMPDIR, and convergence vars.
+// Only whitelisted variables: PATH (safe default), HOME, TMPDIR, convergence
+// vars, and GC_INTEGRATION_REAL_BD when present for integration-test bd shims.
 func (ce ConditionEnv) Environ() []string {
 	// Use CityPath as HOME to sandbox gate scripts from the
 	// controller's home directory (which may contain .ssh, .gnupg, etc).
@@ -80,15 +81,13 @@ func (ce ConditionEnv) Environ() []string {
 		"BEADS_DIR=" + filepath.Join(ce.CityPath, ".beads"),
 		"GC_BEAD_ID=" + ce.BeadID,
 		"GC_ITERATION=" + strconv.Itoa(ce.Iteration),
-		"GC_CITY_ROOT=" + ce.CityPath,
-		"GC_CITY_PATH=" + ce.CityPath,
-		"GC_CITY_RUNTIME_DIR=" + citylayout.RuntimeDataDir(ce.CityPath),
 		"GC_WISP_ID=" + ce.WispID,
 		"GC_ARTIFACT_DIR=" + ce.ArtifactDir,
 		"GC_ITERATION_DURATION_MS=" + strconv.FormatInt(ce.IterationDurationMs, 10),
 		"GC_CUMULATIVE_DURATION_MS=" + strconv.FormatInt(ce.CumulativeDurationMs, 10),
 		"GC_MAX_ITERATIONS=" + strconv.Itoa(ce.MaxIterations),
 	}
+	env = append(env, citylayout.CityRuntimeEnv(ce.CityPath)...)
 
 	// Optional fields: only include if non-empty.
 	if ce.DocPath != "" {
@@ -105,6 +104,9 @@ func (ce ConditionEnv) Environ() []string {
 	}
 	if ce.WorkDir != "" {
 		env = append(env, "GC_WORK_DIR="+ce.WorkDir)
+	}
+	if realBD := os.Getenv("GC_INTEGRATION_REAL_BD"); realBD != "" {
+		env = append(env, "GC_INTEGRATION_REAL_BD="+realBD)
 	}
 
 	return env
@@ -161,7 +163,7 @@ func ResolveConditionPath(cityPath, conditionPath string) (string, error) {
 		return "", fmt.Errorf("resolving gate condition path: file is not executable: %s", resolved)
 	}
 
-	return absPath, nil
+	return resolved, nil
 }
 
 // RunCondition executes a gate condition script with the given environment.

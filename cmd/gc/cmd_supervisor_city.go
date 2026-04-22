@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
@@ -24,11 +25,14 @@ var (
 // registerCityWithSupervisorTestHook lets tests intercept registration after
 // the registry entry is written but before any real supervisor lifecycle runs.
 // It is nil in production.
-var registerCityWithSupervisorTestHook func(cityPath, commandName string, stdout, stderr io.Writer) (bool, int)
+var (
+	registerCityWithSupervisorTestHook func(cityPath, commandName string, stdout, stderr io.Writer) (bool, int)
+	supervisorCityErrorHook            = supervisorCityError
+)
 
 func supervisorCityStartTimeout(cityPath string) time.Duration {
 	timeout := supervisorCityReadyTimeout
-	cfg, err := loadCityConfig(cityPath)
+	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		return timeout
 	}
@@ -40,7 +44,7 @@ func supervisorCityStartTimeout(cityPath string) time.Duration {
 
 func supervisorCityStopTimeout(cityPath string) time.Duration {
 	timeout := supervisorCityReadyTimeout
-	cfg, err := loadCityConfig(cityPath)
+	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		return timeout
 	}
@@ -50,27 +54,28 @@ func supervisorCityStopTimeout(cityPath string) time.Duration {
 	return timeout
 }
 
-func fetchCityPacksIfNeeded(cityPath string) error {
-	tomlPath := filepath.Join(cityPath, "city.toml")
-	if quickCfg, qErr := config.Load(fsys.OSFS{}, tomlPath); qErr == nil && len(quickCfg.Packs) > 0 {
-		if err := config.FetchPacks(quickCfg.Packs, cityPath); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func effectiveCityName(cityPath string) (string, error) {
-	name := filepath.Base(cityPath)
+	if err := MaterializeBuiltinPacks(cityPath); err != nil {
+		return "", fmt.Errorf("materializing builtin packs: %w", err)
+	}
 	tomlPath := filepath.Join(cityPath, "city.toml")
 	cfg, _, err := config.LoadWithIncludes(fsys.OSFS{}, tomlPath)
 	if err != nil {
 		return "", err
 	}
-	if cfg.Workspace.Name != "" {
-		name = cfg.Workspace.Name
+	return config.EffectiveCityName(cfg, filepath.Base(filepath.Clean(cityPath))), nil
+}
+
+func registeredCityName(cityPath, nameOverride string) (string, error) {
+	if alias := strings.TrimSpace(nameOverride); alias != "" {
+		return alias, nil
 	}
-	return name, nil
+	if entry, registered, err := registeredCityEntry(cityPath); err != nil {
+		return "", err
+	} else if registered {
+		return entry.EffectiveName(), nil
+	}
+	return effectiveCityName(cityPath)
 }
 
 func normalizeRegisteredCityPath(cityPath string) (string, error) {
@@ -81,7 +86,7 @@ func normalizeRegisteredCityPath(cityPath string) (string, error) {
 	if resolved, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
 		abs = resolved
 	}
-	return abs, nil
+	return normalizePathForCompare(abs), nil
 }
 
 func registeredCityEntry(cityPath string) (supervisor.CityEntry, bool, error) {
@@ -95,11 +100,22 @@ func registeredCityEntry(cityPath string) (supervisor.CityEntry, bool, error) {
 		return supervisor.CityEntry{}, false, err
 	}
 	for _, entry := range entries {
-		if entry.Path == normalized {
+		if samePath(entry.Path, normalized) {
 			return entry, true, nil
 		}
 	}
 	return supervisor.CityEntry{}, false, nil
+}
+
+func cityUsesManagedReconciler(cityPath string) bool {
+	if controllerAlive(cityPath) != 0 {
+		return true
+	}
+	_, registered, err := registeredCityEntry(cityPath)
+	if err != nil || !registered {
+		return false
+	}
+	return supervisorAlive() != 0
 }
 
 func ensureNoStandaloneController(cityPath string) (int, error) {
@@ -127,32 +143,35 @@ func ensureNoStandaloneController(cityPath string) (int, error) {
 }
 
 func registerCityWithSupervisor(cityPath string, stdout, stderr io.Writer, commandName string, showProgress bool) int {
-	if pid, err := ensureNoStandaloneController(cityPath); err != nil {
-		if errors.Is(err, errControllerAlreadyRunning) {
-			if pid != 0 {
-				fmt.Fprintf(stderr, "%s: standalone controller already running for %s (PID %d); stop it before registering with the supervisor\n", commandName, cityPath, pid) //nolint:errcheck // best-effort stderr
+	return registerCityWithSupervisorNamed(cityPath, "", stdout, stderr, commandName, showProgress)
+}
+
+func supervisorAlreadyManagesCity(cityPath string) bool {
+	running, _, known := supervisorCityRunningHook(cityPath)
+	return known && running
+}
+
+func registerCityWithSupervisorNamed(cityPath, nameOverride string, stdout, stderr io.Writer, commandName string, showProgress bool) int {
+	cityPath = normalizePathForCompare(cityPath)
+	if !supervisorAlreadyManagesCity(cityPath) {
+		if pid, err := ensureNoStandaloneController(cityPath); err != nil {
+			if errors.Is(err, errControllerAlreadyRunning) {
+				writeStandaloneControllerConflict(stderr, commandName, cityPath, pid)
 			} else {
-				fmt.Fprintf(stderr, "%s: standalone controller already running for %s; stop it before registering with the supervisor\n", commandName, cityPath) //nolint:errcheck // best-effort stderr
+				fmt.Fprintf(stderr, "%s: probing standalone controller: %v\n", commandName, err) //nolint:errcheck // best-effort stderr
 			}
-		} else {
-			fmt.Fprintf(stderr, "%s: probing standalone controller: %v\n", commandName, err) //nolint:errcheck // best-effort stderr
-		}
-		return 1
-	}
-	// Materialize gastown packs before config load if the city references them.
-	// This must succeed — without packs, config.LoadWithIncludes will fail
-	// with a confusing "pack.toml: no such file" error downstream.
-	if quickCfg, qErr := config.Load(fsys.OSFS{}, filepath.Join(cityPath, "city.toml")); qErr == nil && usesGastownPack(quickCfg) {
-		if err := MaterializeGastownPacks(cityPath); err != nil {
-			fmt.Fprintf(stderr, "%s: materializing gastown packs: %v\n", commandName, err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
 	}
-	if err := fetchCityPacksIfNeeded(cityPath); err != nil {
+	if err := ensureLegacyNamedPacksCached(cityPath); err != nil {
 		fmt.Fprintf(stderr, "%s: fetching packs: %v\n", commandName, err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	name, err := effectiveCityName(cityPath)
+	if err := MaterializeBuiltinPacks(cityPath); err != nil {
+		fmt.Fprintf(stderr, "%s: materializing builtin packs: %v\n", commandName, err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	name, err := registeredCityName(cityPath, nameOverride)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", commandName, err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -209,12 +228,75 @@ func registerCityWithSupervisor(cityPath string, stdout, stderr io.Writer, comma
 			fmt.Fprintln(stdout, "Waiting for supervisor to start city...") //nolint:errcheck // best-effort stdout
 		}
 		if err := waitForSupervisorCity(cityPath, true, supervisorCityStartTimeout(cityPath), stdout); err != nil {
+			if retried, retriedErr := retrySupervisorCityStartAfterControllerLock(cityPath, stdout, stderr, err); retried {
+				if retriedErr == nil {
+					return 0
+				}
+				err = retriedErr
+			}
 			keepRegisteredCity(entry, stderr, commandName, err.Error())
 			fmt.Fprintf(stderr, "%s: check 'gc supervisor logs' for details\n", commandName) //nolint:errcheck // best-effort stderr
 			return 1
 		}
 	}
 	return 0
+}
+
+func retrySupervisorCityStartAfterControllerLock(cityPath string, stdout, stderr io.Writer, startErr error) (bool, error) {
+	if startErr == nil || !strings.Contains(startErr.Error(), "city failed to start: controller lock: controller already running") {
+		return false, startErr
+	}
+	if err := waitForSupervisorControllerStopHook(cityPath, supervisorCityStopTimeout(cityPath)); err != nil {
+		return true, errors.Join(startErr, fmt.Errorf("previous controller did not finish stopping: %w", err))
+	}
+	if err := bumpSupervisorCityConfigModTime(cityPath); err != nil {
+		return true, errors.Join(startErr, fmt.Errorf("retry trigger failed: %w", err))
+	}
+	if reloadSupervisorHook(stdout, stderr) != 0 {
+		return true, fmt.Errorf("%w; reconcile retry failed", startErr)
+	}
+	if err := waitForSupervisorCity(cityPath, true, supervisorCityStartTimeout(cityPath), stdout); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func bumpSupervisorCityConfigModTime(cityPath string) error {
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	info, err := os.Stat(tomlPath)
+	if err != nil {
+		return err
+	}
+	next := time.Now()
+	if !next.After(info.ModTime()) {
+		next = info.ModTime().Add(time.Second)
+	}
+	return os.Chtimes(tomlPath, next, next)
+}
+
+func writeStandaloneControllerConflict(stderr io.Writer, commandName, cityPath string, pid int) {
+	pidSuffix := ""
+	authority := "standalone controller"
+	if pid != 0 {
+		pidSuffix = fmt.Sprintf(" (PID %d)", pid)
+		authority = fmt.Sprintf("standalone controller PID %d", pid)
+	}
+	nextCommand := "gc stop " + shellQuotePath(cityPath) + " && " + supervisorRetryCommand(commandName, cityPath)
+	_, _ = fmt.Fprintf(stderr,
+		"%s: standalone controller already running for %s%s; supervisor cannot manage this city until it stops\n",
+		commandName, shellQuotePath(cityPath), pidSuffix)
+	fmt.Fprintf(stderr, "%s: Authority: %s\n", commandName, authority) //nolint:errcheck // best-effort stderr
+	fmt.Fprintf(stderr, "%s: Next: %s\n", commandName, nextCommand)    //nolint:errcheck // best-effort stderr
+}
+
+func supervisorRetryCommand(commandName, cityPath string) string {
+	quotedPath := shellQuotePath(cityPath)
+	switch strings.TrimSpace(commandName) {
+	case "gc register":
+		return "gc register " + quotedPath
+	default:
+		return "gc start " + quotedPath
+	}
 }
 
 func keepRegisteredCity(entry supervisor.CityEntry, stderr io.Writer, commandName, reason string) {
@@ -227,23 +309,22 @@ func waitForSupervisorCity(cityPath string, wantRunning bool, timeout time.Durat
 	var lastStatus string
 	for {
 		running, status, known := supervisorCityRunningHook(cityPath)
-		if known {
-			if running == wantRunning {
-				return nil
-			}
-			if !wantRunning {
-				return fmt.Errorf("city is still running under supervisor")
-			}
+		switch {
+		case known && running == wantRunning:
+			return nil
+		case known && !wantRunning:
+			return fmt.Errorf("city is still running under supervisor")
+		case known && wantRunning && status == "init_failed":
 			// If the supervisor reports an init failure, surface the
 			// error immediately instead of polling until timeout.
-			if wantRunning && status == "init_failed" {
-				if errMsg := supervisorCityError(cityPath); errMsg != "" {
-					return fmt.Errorf("city failed to start: %s", errMsg)
-				}
-				return fmt.Errorf("city failed to start under supervisor")
+			if errMsg := supervisorCityErrorHook(cityPath); errMsg != "" {
+				return fmt.Errorf("city failed to start: %s", errMsg)
 			}
-		} else if !wantRunning {
+			return fmt.Errorf("city failed to start under supervisor")
+		case !known && !wantRunning:
 			return nil
+		case !known && supervisorAliveHook() == 0:
+			return fmt.Errorf("supervisor stopped before city became ready")
 		}
 		if stdout != nil && status != "" && status != lastStatus {
 			fmt.Fprintf(stdout, "  %s\n", statusDisplayText(status)) //nolint:errcheck // best-effort stdout
@@ -302,6 +383,7 @@ func statusDisplayText(status string) string {
 }
 
 func unregisterCityFromSupervisor(cityPath string, stdout, stderr io.Writer, commandName string) (bool, int) {
+	cityPath = normalizePathForCompare(cityPath)
 	entry, registered, err := registeredCityEntry(cityPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", commandName, err) //nolint:errcheck // best-effort stderr
@@ -318,6 +400,18 @@ func unregisterCityFromSupervisor(cityPath string, stdout, stderr io.Writer, com
 	}
 
 	fmt.Fprintf(stdout, "Unregistered city '%s' (%s)\n", entry.EffectiveName(), entry.Path) //nolint:errcheck // best-effort stdout
+
+	// If the city directory is gone, there's nothing to wait on or restore.
+	// Skip the supervisor-side probes that would otherwise spew
+	// "probing standalone controller" + "restore failed" on a missing path
+	// (the unregister itself already succeeded; the supervisor's next
+	// reconcile will drop the dead city).
+	if _, statErr := os.Stat(cityPath); errors.Is(statErr, os.ErrNotExist) {
+		if supervisorAliveHook() != 0 && reloadSupervisorHook(stdout, stderr) != 0 {
+			return true, 1
+		}
+		return true, 0
+	}
 
 	if supervisorAliveHook() != 0 {
 		if reloadSupervisorHook(stdout, stderr) != 0 {

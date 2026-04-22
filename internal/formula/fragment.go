@@ -35,10 +35,22 @@ func CompileExpansionFragment(_ context.Context, name string, searchPaths []stri
 		return nil, fmt.Errorf("%q is not an expansion formula (type=%s)", name, resolved.Type)
 	}
 
+	// Same required-var validation as Compile — see #618.
+	if len(vars) > 0 {
+		if err := ValidateVars(resolved, vars); err != nil {
+			return nil, fmt.Errorf("expansion %q: %w", name, err)
+		}
+	}
+
 	expansionVars := ApplyDefaults(resolved, vars)
 	if err := MaterializeExpansionForTarget(resolved, target, expansionVars); err != nil {
 		return nil, err
 	}
+	filteredSteps, err := FilterStepsByCondition(resolved.Steps, expansionVars)
+	if err != nil {
+		return nil, fmt.Errorf("filtering conditioned steps in expansion %q: %w", name, err)
+	}
+	resolved.Steps = filteredSteps
 
 	controlFlowSteps, err := ApplyControlFlow(resolved.Steps, resolved.Compose)
 	if err != nil {
@@ -50,14 +62,14 @@ func CompileExpansionFragment(_ context.Context, name string, searchPaths []stri
 		resolved.Steps = ApplyAdvice(resolved.Steps, resolved.Advice)
 	}
 
-	inlineExpandedSteps, err := ApplyInlineExpansions(resolved.Steps, parser)
+	inlineExpandedSteps, err := ApplyInlineExpansionsWithVars(resolved.Steps, parser, expansionVars)
 	if err != nil {
 		return nil, fmt.Errorf("applying inline expansions to expansion %q: %w", name, err)
 	}
 	resolved.Steps = inlineExpandedSteps
 
 	if resolved.Compose != nil && (len(resolved.Compose.Expand) > 0 || len(resolved.Compose.Map) > 0) {
-		expandedSteps, expandErr := ApplyExpansions(resolved.Steps, resolved.Compose, parser)
+		expandedSteps, expandErr := ApplyExpansionsWithVars(resolved.Steps, resolved.Compose, parser, expansionVars)
 		if expandErr != nil {
 			return nil, fmt.Errorf("applying expansions to expansion %q: %w", name, expandErr)
 		}
@@ -80,7 +92,7 @@ func CompileExpansionFragment(_ context.Context, name string, searchPaths []stri
 		}
 	}
 
-	filteredSteps, err := FilterStepsByCondition(resolved.Steps, expansionVars)
+	filteredSteps, err = FilterStepsByCondition(resolved.Steps, expansionVars)
 	if err != nil {
 		return nil, fmt.Errorf("filtering conditioned steps in expansion %q: %w", name, err)
 	}
@@ -98,9 +110,15 @@ func CompileExpansionFragment(_ context.Context, name string, searchPaths []stri
 	}
 	resolved.Steps = ralphSteps
 
-	ApplyFragmentGraphControls(resolved)
+	graphWorkflow, err := isGraphWorkflow(resolved, IsFormulaV2Enabled())
+	if err != nil {
+		return nil, err
+	}
+	if graphWorkflow {
+		ApplyFragmentGraphControls(resolved)
+	}
 
-	recipe, err := toRecipe(resolved)
+	recipe, err := toRecipeWithGraph(resolved, graphWorkflow)
 	if err != nil {
 		return nil, fmt.Errorf("flattening expansion %q: %w", name, err)
 	}
@@ -219,7 +237,7 @@ func recipeStepNeedsScopeCheck(step RecipeStep) bool {
 		return false
 	}
 	switch step.Metadata["gc.kind"] {
-	case "scope", "scope-check", "workflow-finalize", "fanout", "check":
+	case "scope", "scope-check", "workflow-finalize", "fanout", "check", "spec":
 		return false
 	default:
 		return true
@@ -269,6 +287,10 @@ func fragmentSinkStepIDs(fragment *FragmentRecipe) []string {
 	sinks := make([]string, 0)
 	for _, step := range fragment.Steps {
 		if _, ok := referenced[step.ID]; ok {
+			continue
+		}
+		switch step.Metadata["gc.kind"] {
+		case "workflow-finalize", "spec":
 			continue
 		}
 		sinks = append(sinks, step.ID)

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/events"
 )
 
 // OutboundRequest specifies what to publish to an external conversation.
@@ -28,7 +30,7 @@ type OutboundResult struct {
 type OutboundDeps struct {
 	Services  Services
 	Registry  *AdapterRegistry
-	EmitEvent func(eventType, subject string, payload map[string]any)
+	EmitEvent func(eventType, subject string, payload events.Payload)
 }
 
 // HandleOutbound publishes a message from a session to an external conversation.
@@ -40,8 +42,7 @@ type OutboundDeps struct {
 //  4. Call adapter.Publish.
 //  5. Record delivery context.
 //  6. Append outbound entry to transcript.
-//  7. Notify peer conversation members (best-effort nudge).
-//  8. Emit event.
+//  7. Emit event for the caller to fan out peer notifications.
 func HandleOutbound(ctx context.Context, deps OutboundDeps, caller Caller, req OutboundRequest) (*OutboundResult, error) {
 	if deps.Registry == nil {
 		return nil, errors.New("adapter registry is nil")
@@ -126,14 +127,13 @@ func HandleOutbound(ctx context.Context, deps OutboundDeps, caller Caller, req O
 	}
 
 	// Step 7: Emit event.
-	// Wake is handled by the caller (HTTP handler calls state.Poke()).
-	// Peer sessions discover new entries via gc transcript check --inject.
+	// Wake and peer fanout are handled by the caller.
 	if deps.EmitEvent != nil {
-		deps.EmitEvent("extmsg.outbound", binding.SessionID, map[string]any{
-			"provider":        req.Conversation.Provider,
-			"conversation_id": req.Conversation.ConversationID,
-			"session":         req.SessionID,
-			"message_id":      receipt.MessageID,
+		deps.EmitEvent(events.ExtMsgOutbound, binding.SessionID, OutboundEventPayload{
+			Provider:       req.Conversation.Provider,
+			ConversationID: req.Conversation.ConversationID,
+			Session:        req.SessionID,
+			MessageID:      receipt.MessageID,
 		})
 	}
 

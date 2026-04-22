@@ -20,7 +20,7 @@ LDFLAGS := -X main.version=$(VERSION) \
            -X main.commit=$(COMMIT) \
            -X main.date=$(BUILD_TIME)
 
-.PHONY: build check check-all check-bd check-docker check-docs check-dolt lint fmt-check fmt vet test test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-regression test-tutorial test-integration test-mcp-mail test-docker test-k8s test-cover cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docs-dev
+.PHONY: build check check-all check-bd check-docker check-docs check-dolt check-version-tag lint fmt-check fmt vet test test-cmd-gc-process test-worker-core test-worker-core-phase2 test-worker-core-phase2-real-transport test-worker-inference-phase3 test-acceptance test-acceptance-b test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-mcp-mail test-docker test-k8s test-cover cover install install-tools install-buildx setup clean generate check-schema docker-base docker-agent docker-controller docs-dev
 
 ## build: compile gc binary with version metadata
 build:
@@ -80,6 +80,30 @@ check-dolt:
 	@command -v dolt >/dev/null 2>&1 || \
 		(echo "Error: dolt not found. See docs/getting-started/installation.md" && exit 1)
 
+## check-version-tag: verify HEAD's release tag (if any) is a clean stable vX.Y.Z
+## No-op on untagged HEADs, so safe to run on every checkout. Used by release.yml
+## to reject pre-release tags (vX.Y.Z-rc1, -beta, etc.) — the release workflow
+## publishes stable releases only.
+check-version-tag:
+	@TAG=$$(git describe --tags --exact-match HEAD 2>/dev/null || true); \
+	if [ -z "$$TAG" ]; then \
+		echo "check-version-tag: HEAD is not a release tag, skipping"; \
+		exit 0; \
+	fi; \
+	if echo "$$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "check-version-tag: OK ($$TAG is a stable release tag)"; \
+		exit 0; \
+	fi; \
+	if echo "$$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+-'; then \
+		echo "ERROR: tag '$$TAG' has a pre-release suffix"; \
+		echo "The release workflow publishes stable releases only."; \
+		echo "Pre-release tags should not trigger release.yml."; \
+		exit 1; \
+	fi; \
+	echo "ERROR: tag '$$TAG' is not a vX.Y.Z release tag"; \
+	echo "Release tags must match vMAJOR.MINOR.PATCH exactly."; \
+	exit 1
+
 ## check-all: run all quality gates including integration tests (CI)
 check-all: fmt-check lint vet check-bd check-dolt check-docker test-integration check-docs
 
@@ -99,66 +123,255 @@ fmt: $(GOLANGCI_LINT)
 vet:
 	go vet ./...
 
-## test: run unit tests (skip integration tests tagged with //go:build integration)
-test:
-	go test ./...
+## TEST_ENV: env -i wrapper for `go test` invocations. Strips host env so
+## agent-session vars (GC_CITY, GC_HOME, GC_SESSION_ID, ...) cannot leak into
+## tests and corrupt live cities. Only the allowlist below survives. To opt
+## extra vars through, set EXTRA_TEST_ENV='FOO=bar BAZ=qux' on the make line.
+## See PR #746.
+GOPATH_VAL    := $(shell go env GOPATH)
+GOCACHE_VAL   := $(shell go env GOCACHE)
+GOMODCACHE_VAL := $(shell go env GOMODCACHE)
+GOTMPDIR_VAL  := $(shell go env GOTMPDIR)
+GOROOT_VAL    := $(shell go env GOROOT)
+TEST_ENV = env -i \
+	PATH="$$PATH" \
+	HOME="$$HOME" \
+	USER="$$USER" \
+	LOGNAME="$$LOGNAME" \
+	SHELL="$$SHELL" \
+	LANG="$$LANG" \
+	TMPDIR="$${TMPDIR:-/tmp}" \
+	XDG_RUNTIME_DIR="$$XDG_RUNTIME_DIR" \
+	GOPATH="$(GOPATH_VAL)" \
+	GOCACHE="$(GOCACHE_VAL)" \
+	GOMODCACHE="$(GOMODCACHE_VAL)" \
+	GOTMPDIR="$(GOTMPDIR_VAL)" \
+	GOROOT="$${GOROOT:-$(GOROOT_VAL)}" \
+	GOENV="$${GOENV-}" \
+	GOFLAGS="$${GOFLAGS-}" \
+	GO111MODULE="$${GO111MODULE-}" \
+	GOEXPERIMENT="$${GOEXPERIMENT-}" \
+	GOPROXY="$${GOPROXY-}" \
+	GOPRIVATE="$${GOPRIVATE-}" \
+	GONOPROXY="$${GONOPROXY-}" \
+	GONOSUMDB="$${GONOSUMDB-}" \
+	GOSUMDB="$${GOSUMDB-}" \
+	GOINSECURE="$${GOINSECURE-}" \
+	GOVCS="$${GOVCS-}" \
+	GOWORK="$${GOWORK-}" \
+	$(EXTRA_TEST_ENV)
 
-## test-acceptance: run acceptance tests (Tier A — fast, <5 min, every PR)
+## test: run fast unit tests (skip integration-tagged and GC_FAST_UNIT-gated process tests)
+## The skipped cmd/gc process-backed scenarios remain covered by
+## `make test-cmd-gc-process` locally and the CI `test-integration-packages` shard.
+## Wrapped in $(TEST_ENV) — see comment above for why.
+test:
+	$(TEST_ENV) GC_FAST_UNIT=1 go test ./...
+
+## test-cmd-gc-process: run the full non-short cmd/gc suite, including the
+## process-backed lifecycle coverage routed out of the default fast loop
+test-cmd-gc-process:
+	$(TEST_ENV) GC_FAST_UNIT=0 go test ./cmd/gc
+
+## test-worker-core: run deterministic worker transcript and continuation conformance
+test-worker-core:
+	$(TEST_ENV) PROFILE="$${PROFILE-}" GC_WORKER_REPORT_DIR="$${GC_WORKER_REPORT_DIR-}" go test -count=1 ./internal/worker/workertest -run '^TestPhase1'
+
+## test-worker-core-phase2: run deterministic phase-2 worker conformance coverage
+test-worker-core-phase2:
+	$(TEST_ENV) PROFILE="$${PROFILE-}" GC_WORKER_REPORT_DIR="$${GC_WORKER_REPORT_DIR-}" go test -count=1 ./internal/worker/workertest -run '^TestPhase2'
+	$(TEST_ENV) PROFILE="$${PROFILE-}" GC_WORKER_REPORT_DIR="$${GC_WORKER_REPORT_DIR-}" go test -count=1 ./internal/runtime/tmux -run '^TestPhase2'
+	$(TEST_ENV) PROFILE="$${PROFILE-}" GC_WORKER_REPORT_DIR="$${GC_WORKER_REPORT_DIR-}" go test -count=1 ./cmd/gc -run '^TestPhase2(StartupMaterialization|InitialInputDelivery|InputResultFailureClassification)$$'
+
+## test-worker-core-phase2-real-transport: run the live transport proof for phase 2
+test-worker-core-phase2-real-transport:
+	$(TEST_ENV) PROFILE="$${PROFILE-}" GC_WORKER_REPORT_DIR="$${GC_WORKER_REPORT_DIR-}" go test -count=1 -tags integration ./cmd/gc -run '^TestPhase2WorkerCoreRealTransportProof$$'
+
+## test-worker-inference-phase3: run the live worker inference conformance package
+test-worker-inference-phase3:
+	$(TEST_ENV) PROFILE="$${PROFILE-}" GC_WORKER_REPORT_DIR="$${GC_WORKER_REPORT_DIR-}" go test -count=1 -tags acceptance_c -timeout 45m -v ./test/acceptance/worker_inference
+
+## test-acceptance: run acceptance tests (Tier A — fast, <5 min, every PR).
+## ACCEPTANCE_TIMEOUT overrides the go-test timeout (defaults to 5m on
+## Linux; Mac CI bumps it because launchd-mediated supervisor start is
+## noticeably slower than systemd).
+ACCEPTANCE_TIMEOUT ?= 5m
 test-acceptance:
-	go test -tags acceptance_a -timeout 5m ./test/acceptance/...
+	$(TEST_ENV) go test -tags acceptance_a -timeout $(ACCEPTANCE_TIMEOUT) ./test/acceptance/...
 
 ## test-acceptance-b: run Tier B acceptance tests (lifecycle, ~5 min, nightly)
 test-acceptance-b:
-	go test -tags acceptance_b -timeout 10m -v ./test/acceptance/tier_b/...
+	$(TEST_ENV) go test -tags acceptance_b -timeout 10m -v ./test/acceptance/tier_b/...
 
-## test-acceptance-c: run Tier C acceptance tests (real inference, ~10 min, manual/nightly)
+## test-acceptance-c: run Tier C acceptance tests (real inference, ~30-40 min, manual/nightly)
 test-acceptance-c:
-	go test -tags acceptance_c -timeout 15m -v ./test/acceptance/tier_c/...
+	$(TEST_ENV) go test -tags acceptance_c -timeout 45m -v ./test/acceptance/tier_c/...
 
 ## test-acceptance-all: run all acceptance tiers
 test-acceptance-all: test-acceptance test-acceptance-b test-acceptance-c
 
-## test-tutorial-regression: run manual tutorial regression tests (requires tmux, bd)
-test-tutorial-regression:
-	go test -tags 'integration acceptance' -timeout 10m -v -run TestTutorialRegression ./test/integration/
-
 ## test-integration: run all tests including integration (tmux, etc.)
 test-integration:
-	go test -tags integration -timeout 8m ./...
+	$(TEST_ENV) go test -tags integration -timeout 30m ./...
+
+## test-integration-huma: run just the Huma binary smoke test
+test-integration-huma:
+	$(TEST_ENV) go test -tags integration -timeout 2m -run TestHumaBinary ./test/integration/
+
+## test-integration-shards: run the CI integration shards sequentially
+test-integration-shards: test-integration-packages test-integration-review-formulas test-integration-bdstore test-integration-rest-smoke test-integration-rest-full
+
+## test-integration-shards-cover: run the CI integration coverage shards sequentially
+test-integration-shards-cover: test-integration-packages-cover test-integration-review-formulas-cover test-integration-bdstore-cover test-integration-rest-smoke-cover test-integration-rest-full-cover
+
+## test-integration-packages: run all integration-tagged packages except ./test/integration
+## This shard is also the required non-short CI path for the slow cmd/gc process suite.
+test-integration-packages:
+	./scripts/test-integration-shard packages
+
+## test-integration-packages-cover: run the packages shard with a CI coverage profile
+test-integration-packages-cover:
+	GO_TEST_COVERPROFILE=coverage.integration-packages.txt ./scripts/test-integration-shard packages
+
+## test-integration-review-formulas: run the long-running workflow formula integration tests
+test-integration-review-formulas:
+	@status=0; \
+	$(MAKE) test-integration-review-formulas-basic || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	$(MAKE) test-integration-review-formulas-retries || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	$(MAKE) test-integration-review-formulas-recovery || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	exit $$status
+
+## test-integration-review-formulas-cover: run the review-formulas shard with a CI coverage profile
+test-integration-review-formulas-cover:
+	@status=0; \
+	$(MAKE) test-integration-review-formulas-basic-cover || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	$(MAKE) test-integration-review-formulas-retries-cover || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	$(MAKE) test-integration-review-formulas-recovery-cover || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	if [ $$status -eq 0 ]; then \
+		./scripts/merge-coverprofiles coverage.integration-review-formulas.txt \
+			coverage.integration-review-formulas-basic.txt \
+			coverage.integration-review-formulas-retries.txt \
+			coverage.integration-review-formulas-recovery.txt; \
+	fi; \
+	exit $$status
+
+## test-integration-review-formulas-basic: run the core happy-path review-formulas tests
+test-integration-review-formulas-basic:
+	./scripts/test-integration-shard review-formulas-basic
+
+## test-integration-review-formulas-basic-cover: run the basic review-formulas shard with coverage
+test-integration-review-formulas-basic-cover:
+	GO_TEST_COVERPROFILE=coverage.integration-review-formulas-basic.txt ./scripts/test-integration-shard review-formulas-basic
+
+## test-integration-review-formulas-retries: run the retry/soft-fail review-formulas tests
+test-integration-review-formulas-retries:
+	./scripts/test-integration-shard review-formulas-retries
+
+## test-integration-review-formulas-retries-cover: run the retry/soft-fail review-formulas shard with coverage
+test-integration-review-formulas-retries-cover:
+	GO_TEST_COVERPROFILE=coverage.integration-review-formulas-retries.txt ./scripts/test-integration-shard review-formulas-retries
+
+## test-integration-review-formulas-recovery: run the crash/recovery review-formulas test
+test-integration-review-formulas-recovery:
+	./scripts/test-integration-shard review-formulas-recovery
+
+## test-integration-review-formulas-recovery-cover: run the crash/recovery review-formulas shard with coverage
+test-integration-review-formulas-recovery-cover:
+	GO_TEST_COVERPROFILE=coverage.integration-review-formulas-recovery.txt ./scripts/test-integration-shard review-formulas-recovery
+
+## test-integration-bdstore: run the bd store conformance shard in isolation
+test-integration-bdstore:
+	./scripts/test-integration-shard bdstore
+
+## test-integration-bdstore-cover: run the bdstore shard with a CI coverage profile
+test-integration-bdstore-cover:
+	GO_TEST_COVERPROFILE=coverage.integration-bdstore.txt ./scripts/test-integration-shard bdstore
+
+## test-integration-rest-smoke: run the PR smoke subset of the remaining ./test/integration tests
+test-integration-rest-smoke:
+	./scripts/test-integration-shard rest-smoke
+
+## test-integration-rest-smoke-cover: run the smoke rest shard with a CI coverage profile
+test-integration-rest-smoke-cover:
+	GO_TEST_COVERPROFILE=coverage.integration-rest-smoke.txt ./scripts/test-integration-shard rest-smoke
+
+## test-integration-rest-full: run the heavier rest shard kept for nightly/RC and targeted PRs
+test-integration-rest-full:
+	./scripts/test-integration-shard rest-full
+
+## test-integration-rest-full-cover: run the full rest shard with a CI coverage profile
+test-integration-rest-full-cover:
+	GO_TEST_COVERPROFILE=coverage.integration-rest-full.txt ./scripts/test-integration-shard rest-full
+
+## test-integration-rest: run the combined rest smoke+full suite
+test-integration-rest:
+	@status=0; \
+	$(MAKE) test-integration-rest-smoke || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	$(MAKE) test-integration-rest-full || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	exit $$status
+
+## test-integration-rest-cover: run the combined rest smoke+full coverage shards
+test-integration-rest-cover:
+	@status=0; \
+	$(MAKE) test-integration-rest-smoke-cover || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	$(MAKE) test-integration-rest-full-cover || { st=$$?; [ $$status -ne 0 ] || status=$$st; }; \
+	exit $$status
+
+## test-chaos-dolt: run the opt-in managed Dolt chaos integration test
+## Set GC_DOLT_CHAOS_DURATION and GC_DOLT_CHAOS_SEED to control runtime and replay failures.
+test-chaos-dolt:
+	$(TEST_ENV) \
+		GC_DOLT_CHAOS_DURATION=$${GC_DOLT_CHAOS_DURATION:-2m} \
+		GC_DOLT_CHAOS_SEED="$${GC_DOLT_CHAOS_SEED-}" \
+		go test -tags 'integration chaos_dolt' -timeout 45m -run 'TestManagedDoltChaos_CityAndRigCallersRemainConsistent' -count=1 ./test/integration
 
 
-## test-tutorial: run tutorial acceptance tests (requires tmux, dolt, bd, claude authed)
-## These exercise the full tutorial flow with real inference — run before each release.
-test-tutorial:
-	go test -tags 'integration acceptance' -timeout 10m -v ./test/integration/ -run 'TestTutorial'
+## test-tutorial-goldens: run tutorial golden acceptance tests (requires tmux, dolt, bd, claude auth)
+## These exercise the published tutorial flow with real inference — run before each release.
+test-tutorial-goldens:
+	$(TEST_ENV) go test -tags acceptance_c -timeout 90m -v ./test/acceptance/tutorial_goldens/...
 
-## test-tutorial-regression: alias for test-tutorial
-test-tutorial-regression: test-tutorial
+## test-tutorial: alias for tutorial goldens
+test-tutorial: test-tutorial-goldens
+
+## test-tutorial-regression: alias for tutorial goldens
+test-tutorial-regression: test-tutorial-goldens
 
 ## check-docs: verify docs sync tests
 check-docs:
-	go test ./test/docsync
+	$(TEST_ENV) go test ./test/docsync
 
 # Packages for coverage — exclude noise:
 #   session/tmux: integration-test-only, not meaningful for unit coverage
 #   beadstest: conformance helper, runs under internal/beads coverage
-COVER_PKGS := $(shell go list ./... | grep -v -e /session/tmux -e /beadstest)
+UNIT_COVER_PKGS := $(shell go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v -e /session/tmux -e /beadstest)
 
-## test-cover: run all tests with coverage output (excludes tmux)
+## test-cover: run fast unit-test coverage without the integration-tagged package sweep
+## The skipped cmd/gc process-backed scenarios remain covered by
+## `make test-cmd-gc-process` locally and the CI `test-integration-packages` shard.
 test-cover:
-	go test -tags integration -timeout 8m -coverprofile=coverage.txt $(COVER_PKGS)
+	$(TEST_ENV) GC_FAST_UNIT=1 go test -timeout 8m -coverprofile=coverage.txt $(UNIT_COVER_PKGS)
 
 ## cover: run tests and show coverage report
 cover: test-cover
 	go tool cover -func=coverage.txt
 
-## install-tools: install pinned golangci-lint
-install-tools: $(GOLANGCI_LINT)
+## install-tools: install pinned golangci-lint + oapi-codegen
+install-tools: $(GOLANGCI_LINT) install-oapi-codegen
 
 $(GOLANGCI_LINT):
 	@echo "Installing golangci-lint v$(GOLANGCI_LINT_VERSION)..."
 	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | \
 		sh -s -- -b $(BIN_DIR) v$(GOLANGCI_LINT_VERSION)
+
+## install-oapi-codegen: install pinned oapi-codegen so the spec→client drift
+## test (TestGeneratedClientInSync) can regenerate client_gen.go without skipping.
+.PHONY: install-oapi-codegen
+install-oapi-codegen:
+	@if ! command -v oapi-codegen >/dev/null; then \
+		echo "Installing oapi-codegen..." >&2; \
+		go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.6.0; \
+	fi
 
 ## install-buildx: install docker buildx plugin
 install-buildx:
@@ -170,7 +383,7 @@ install-buildx:
 
 ## test-mcp-mail: run mcp_agent_mail live conformance test (auto-starts server)
 test-mcp-mail:
-	GC_TEST_MCP_MAIL=1 go test ./internal/mail/exec/ -run TestMCPMailConformanceLive -v -count=1
+	$(TEST_ENV) GC_TEST_MCP_MAIL=1 go test ./internal/mail/exec/ -run TestMCPMailConformanceLive -v -count=1
 
 ## test-docker: run Docker session provider integration tests
 test-docker: check-docker
@@ -178,7 +391,7 @@ test-docker: check-docker
 
 ## test-k8s: run K8s session provider conformance tests
 test-k8s:
-	go test -tags integration ./test/integration/ -run TestK8sSessionConformance -v -count=1
+	$(TEST_ENV) go test -tags integration ./test/integration/ -run TestK8sSessionConformance -v -count=1
 
 ## setup: install tools and git hooks
 setup: install-tools
@@ -187,11 +400,48 @@ setup: install-tools
 
 ## docs-dev: run the Mintlify docs locally
 docs-dev:
-	cd docs && npx --yes mint@latest dev
+	./mint.sh dev
+
+## dashboard-build: regenerate SPA types + compile the dist bundle
+dashboard-build:
+	cd cmd/gc/dashboard/web && npm install --silent && npm run gen && npm run build
+
+## dashboard-dev: Vite dev server (HMR) for SPA iteration
+dashboard-dev:
+	cd cmd/gc/dashboard/web && npm run dev
+
+## dashboard-check: typecheck + build the SPA, then go test the static handler
+dashboard-check: dashboard-build
+	cd cmd/gc/dashboard/web && npm run typecheck
+	$(TEST_ENV) go test ./cmd/gc/dashboard/...
+
+## dashboard-ci: rebuild the SPA bundle and fail if the tracked dist/ is stale.
+## Used by CI to enforce that cmd/gc/dashboard/web/dist/ matches the source.
+dashboard-ci: dashboard-check
+	@if ! git diff --quiet -- cmd/gc/dashboard/web/dist; then \
+		echo "ERROR: cmd/gc/dashboard/web/dist/ is stale — run 'make dashboard-build' and commit." >&2; \
+		git --no-pager diff --stat -- cmd/gc/dashboard/web/dist; \
+		exit 1; \
+	fi
+
+## spec-ci: regenerate the OpenAPI spec + generated Go client, fail on drift.
+## Used by CI to enforce that internal/api/openapi.json, docs/schema/openapi.{json,txt},
+## docs/schema/events.{json,txt}, and internal/api/genclient/client_gen.go are
+## all in lock-step with Huma.
+spec-ci: install-oapi-codegen
+	go run ./cmd/genspec
+	go generate ./internal/api/genclient
+	@if ! git diff --quiet -- internal/api/openapi.json docs/schema/openapi.json docs/schema/openapi.txt docs/schema/events.json docs/schema/events.txt internal/api/genclient/client_gen.go; then \
+		echo "ERROR: spec/client artifacts drifted — run 'make spec-ci' locally and commit." >&2; \
+		git --no-pager diff --stat -- internal/api/openapi.json docs/schema/openapi.json docs/schema/openapi.txt docs/schema/events.json docs/schema/events.txt internal/api/genclient/client_gen.go; \
+		exit 1; \
+	fi
 
 ## docker-base: build base image with system dependencies (~2.5 min, rebuild rarely)
 docker-base: check-docker
-	docker build -f contrib/k8s/Dockerfile.base -t gc-agent-base:latest .
+	. ./deps.env && docker build -f contrib/k8s/Dockerfile.base \
+		--build-arg DOLT_VERSION=$$DOLT_VERSION \
+		-t gc-agent-base:latest .
 
 ## docker-agent: build base agent image (~5s on top of base). For prebaked images use: gc build-image
 docker-agent: check-docker

@@ -159,15 +159,15 @@ func cmdSessionWait(args, depIDs []string, matchAny bool, note string, sleep boo
 	}
 	if sleep {
 		cityPath, err := resolveCity()
-		if err != nil || pokeController(cityPath) != nil {
-			fmt.Fprintln(stderr, "gc session wait: controller must be running when --sleep is used") //nolint:errcheck
+		if err != nil || !cityUsesManagedReconciler(cityPath) {
+			fmt.Fprintln(stderr, "gc session wait: a managed controller must be running when --sleep is used") //nolint:errcheck
 			return 1
 		}
 	}
 	cityPath, cityErr := resolveCity()
 	var cfg *config.City
 	if cityErr == nil {
-		cfg, _ = loadCityConfig(cityPath)
+		cfg, _ = loadCityConfig(cityPath, stderr)
 	}
 	sessionID, err := resolveSessionIDWithConfig(cityPath, cfg, store, target)
 	if err != nil {
@@ -180,7 +180,7 @@ func cmdSessionWait(args, depIDs []string, matchAny bool, note string, sleep boo
 		return 1
 	}
 	for _, depID := range depIDs {
-		if _, err := store.Get(depID); err != nil {
+		if _, err := loadWaitDependencyBead(cityPath, store, depID); err != nil {
 			fmt.Fprintf(stderr, "gc session wait: dependency %s: %v\n", depID, err) //nolint:errcheck
 			return 1
 		}
@@ -216,13 +216,15 @@ func cmdSessionWait(args, depIDs []string, matchAny bool, note string, sleep boo
 		fmt.Fprintf(stderr, "gc session wait: creating wait: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	ready, depErr := depsWaitReadyDetailed(store, waitBead)
+	ready, depErr := depsWaitReadyDetailedForCity(cityPath, store, waitBead)
 	if depErr != nil {
-		_ = setWaitTerminalState(store, waitBead.ID, map[string]string{
+		if err := setWaitTerminalState(store, waitBead.ID, map[string]string{
 			"state":      waitStateFailed,
 			"failed_at":  now.Format(time.RFC3339),
 			"last_error": depErr.Error(),
-		})
+		}); err != nil {
+			fmt.Fprintf(stderr, "gc session wait: setting failed state: %v\n", err) //nolint:errcheck
+		}
 		fmt.Fprintf(stderr, "gc session wait: dependency state check: %v\n", depErr) //nolint:errcheck
 		return 1
 	}
@@ -246,7 +248,10 @@ func cmdSessionWait(args, depIDs []string, matchAny bool, note string, sleep boo
 			return 1
 		}
 		if cityPath, err := resolveCity(); err == nil {
-			_ = pokeController(cityPath)
+			if err := pokeController(cityPath); err != nil {
+				fmt.Fprintf(stderr, "gc session wait: poking controller: %v\n", err) //nolint:errcheck
+				return 1
+			}
 		}
 		fmt.Fprintf(stdout, "Registered wait %s for session %s.\nSession %s draining to sleep.\n", waitBead.ID, sessionID, sessionID) //nolint:errcheck
 		return 0
@@ -380,7 +385,10 @@ func cmdWaitSetState(waitID, state string, stdout, stderr io.Writer) int {
 				return 1
 			}
 		}
-		_ = clearSessionWaitHoldIfIdle(store, b.Metadata["session_id"])
+		if err := clearSessionWaitHoldIfIdle(store, b.Metadata["session_id"]); err != nil {
+			fmt.Fprintf(stderr, "gc wait: clearing session wait hold: %v\n", err) //nolint:errcheck
+			return 1
+		}
 	}
 	fmt.Fprintf(stdout, "Updated wait %s to %s.\n", waitID, state) //nolint:errcheck
 	return 0
@@ -428,6 +436,10 @@ func depsWaitReady(store beads.Store, wait beads.Bead) bool {
 }
 
 func depsWaitReadyDetailed(store beads.Store, wait beads.Bead) (bool, error) {
+	return depsWaitReadyDetailedForCity("", store, wait)
+}
+
+func depsWaitReadyDetailedForCity(cityPath string, store beads.Store, wait beads.Bead) (bool, error) {
 	rawDepIDs := strings.Split(wait.Metadata["dep_ids"], ",")
 	depIDs := make([]string, 0, len(rawDepIDs))
 	for _, depID := range rawDepIDs {
@@ -444,7 +456,7 @@ func depsWaitReadyDetailed(store beads.Store, wait beads.Bead) (bool, error) {
 	foundAny := false
 	var missingErr error
 	for _, depID := range depIDs {
-		dep, err := store.Get(depID)
+		dep, err := loadWaitDependencyBead(cityPath, store, depID)
 		if err != nil {
 			if errors.Is(err, beads.ErrNotFound) {
 				if mode != "any" {
@@ -472,6 +484,45 @@ func depsWaitReadyDetailed(store beads.Store, wait beads.Bead) (bool, error) {
 		return false, nil
 	}
 	return closedCount == len(depIDs), nil
+}
+
+func loadWaitDependencyBead(cityPath string, cityStore beads.Store, depID string) (beads.Bead, error) {
+	if strings.TrimSpace(cityPath) == "" {
+		if cityStore == nil {
+			return beads.Bead{}, beads.ErrNotFound
+		}
+		return cityStore.Get(depID)
+	}
+	cfg, err := loadCityConfig(cityPath, io.Discard)
+	if err != nil {
+		return beads.Bead{}, err
+	}
+	cityRoot := filepath.Clean(cityPath)
+	for _, scopeRoot := range convoyStoreCandidates(cfg, cityPath, depID) {
+		scopeRoot = resolveStoreScopeRoot(cityPath, scopeRoot)
+		if scopeRoot == cityRoot && cityStore != nil {
+			dep, err := cityStore.Get(depID)
+			if err == nil {
+				return dep, nil
+			}
+			if !errors.Is(err, beads.ErrNotFound) {
+				return beads.Bead{}, err
+			}
+			continue
+		}
+		scopeStore, err := openStoreAtForCity(scopeRoot, cityPath)
+		if err != nil {
+			continue
+		}
+		dep, err := scopeStore.Get(depID)
+		if err == nil {
+			return dep, nil
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			return beads.Bead{}, err
+		}
+	}
+	return beads.Bead{}, beads.ErrNotFound
 }
 
 func retryableWaitMetadata(src map[string]string) map[string]string {
@@ -505,6 +556,10 @@ func retryableWaitMetadata(src map[string]string) map[string]string {
 }
 
 func prepareWaitWakeState(store beads.Store, now time.Time) (map[string]bool, error) {
+	return prepareWaitWakeStateForCity("", store, now)
+}
+
+func prepareWaitWakeStateForCity(cityPath string, store beads.Store, now time.Time) (map[string]bool, error) {
 	waits, err := loadWaitBeads(store)
 	if err != nil {
 		return nil, err
@@ -567,7 +622,7 @@ func prepareWaitWakeState(store beads.Store, now time.Time) (map[string]bool, er
 		if wait.Metadata["kind"] != "deps" {
 			continue
 		}
-		ready, depErr := depsWaitReadyDetailed(store, wait)
+		ready, depErr := depsWaitReadyDetailedForCity(cityPath, store, wait)
 		if depErr != nil {
 			if errors.Is(depErr, beads.ErrNotFound) {
 				if err := setWaitTerminalState(store, wait.ID, map[string]string{
@@ -614,7 +669,8 @@ func dispatchReadyWaitNudges(cityPath string, store beads.Store, sp runtime.Prov
 		if err != nil {
 			continue
 		}
-		if !sp.IsRunning(sessionBead.Metadata["session_name"]) {
+		running, err := workerSessionTargetRunningWithConfig(cityPath, store, sp, nil, sessionID)
+		if err != nil || !running {
 			continue
 		}
 		nudgeID := waitNudgeID(wait)
@@ -638,9 +694,18 @@ func dispatchReadyWaitNudges(cityPath string, store beads.Store, sp runtime.Prov
 		if err := enqueueQueuedNudgeWithStore(cityPath, store, item); err != nil {
 			return err
 		}
-		_ = store.SetMetadata(wait.ID, "nudge_id", nudgeID)
-		if sessionBead.Metadata["provider"] == "codex" {
-			_ = startNudgePoller(cityPath, waitNudgeAgent(sessionBead), sessionBead.Metadata["session_name"])
+		if err := store.SetMetadata(wait.ID, "nudge_id", nudgeID); err != nil {
+			return fmt.Errorf("setting wait nudge_id: %w", err)
+		}
+		// provider_kind is stamped from ResolvedProvider.Kind /
+		// BuiltinAncestor at session-bead creation, so wrapped codex
+		// aliases (e.g. [providers.my-wrapped-codex] base = "builtin:codex")
+		// already surface as "codex" here. The provider fallback covers
+		// sessions created before provider_kind was stamped.
+		if sessionProviderFamily(sessionBead) == "codex" {
+			if err := startNudgePoller(cityPath, waitNudgeAgent(sessionBead), sessionBead.Metadata["session_name"]); err != nil {
+				return fmt.Errorf("starting wait nudge poller: %w", err)
+			}
 		}
 	}
 	return nil
@@ -776,6 +841,26 @@ func waitNudgeAgent(sessionBead beads.Bead) string {
 	return sessionBead.Metadata["template"]
 }
 
+// sessionProviderFamily returns the built-in provider family for a session
+// bead. Preference order matches internal/session.providerKind:
+//  1. builtin_ancestor — stamped from ResolvedProvider.BuiltinAncestor
+//     at session-bead creation for explicit-base custom providers.
+//  2. provider_kind — stamped for command-matched legacy aliases.
+//  3. provider — raw provider metadata, last-resort fallback.
+//
+// Call sites that branch on provider family MUST consume this helper
+// instead of reading the provider field directly so wrapped custom
+// aliases behave like their built-in ancestor.
+func sessionProviderFamily(sessionBead beads.Bead) string {
+	if ancestor := strings.TrimSpace(sessionBead.Metadata["builtin_ancestor"]); ancestor != "" {
+		return ancestor
+	}
+	if kind := strings.TrimSpace(sessionBead.Metadata["provider_kind"]); kind != "" {
+		return kind
+	}
+	return strings.TrimSpace(sessionBead.Metadata["provider"])
+}
+
 func setWaitTerminalState(store beads.Store, waitID string, batch map[string]string) error {
 	if err := store.SetMetadataBatch(waitID, batch); err != nil {
 		return err
@@ -854,7 +939,7 @@ func nextWaitDeliveryAttempt(store beads.Store, wait beads.Bead) (string, error)
 
 func isTerminalNudgeState(state string) bool {
 	switch state {
-	case "accepted_for_injection", "injected", "expired", "failed":
+	case "accepted_for_injection", "injected", "expired", "failed", "superseded":
 		return true
 	default:
 		return false

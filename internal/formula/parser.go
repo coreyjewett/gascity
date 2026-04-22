@@ -14,9 +14,11 @@ import (
 
 // Formula file extensions. TOML is preferred, JSON is legacy fallback.
 const (
-	FormulaExtTOML = ".formula.toml"
-	FormulaExtJSON = ".formula.json"
-	FormulaExt     = FormulaExtJSON // Legacy alias for backwards compatibility
+	FormulaExtTOML = CanonicalTOMLExt
+	// PACKV2-CUTOVER: remove legacy formula filename support after the infix migration window closes.
+	FormulaLegacyExtTOML = LegacyTOMLExt
+	FormulaExtJSON       = ".formula.json"
+	FormulaExt           = FormulaExtJSON // Legacy alias for backwards compatibility
 )
 
 // Parser handles loading and resolving formulas.
@@ -77,7 +79,7 @@ func defaultSearchPaths() []string {
 }
 
 // ParseFile parses a formula from a file path.
-// Detects format from extension: .formula.toml or .formula.json
+// Detects format from extension: .toml, .formula.toml, or .formula.json.
 func (p *Parser) ParseFile(path string) (*Formula, error) {
 	// Check cache first
 	absPath, err := filepath.Abs(path)
@@ -98,7 +100,7 @@ func (p *Parser) ParseFile(path string) (*Formula, error) {
 
 	// Detect format from extension
 	var formula *Formula
-	if strings.HasSuffix(path, FormulaExtTOML) {
+	if IsTOMLFilename(path) {
 		formula, err = p.ParseTOML(data)
 	} else {
 		formula, err = p.Parse(data)
@@ -190,10 +192,14 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 		Formula:     formula.Formula,
 		Description: formula.Description,
 		Version:     formula.Version,
+		Contract:    formula.Contract,
 		Type:        formula.Type,
 		Source:      formula.Source,
+		Phase:       formula.Phase,
+		Pour:        formula.Pour,
 		Vars:        make(map[string]*VarDef),
 		Steps:       nil,
+		Template:    nil,
 		Compose:     nil,
 	}
 
@@ -210,6 +216,25 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 			return nil, fmt.Errorf("resolve parent %s: %w", parentName, err)
 		}
 
+		if merged.Contract == "" {
+			merged.Contract = parent.Contract
+		}
+
+		// Phase cascades from the first parent that declares one; child
+		// declaration wins because merged was seeded from the child.
+		if merged.Phase == "" {
+			merged.Phase = parent.Phase
+		}
+
+		// Pour is an opt-in escalation: any parent or the child requesting
+		// pour promotes the merged formula. With a plain bool the zero value
+		// is indistinguishable from "unset", so OR is the simplest coherent
+		// rule that preserves monotonic opt-in; a *bool field would allow
+		// explicit child opt-out but isn't worth the complexity for this flag.
+		if !merged.Pour {
+			merged.Pour = parent.Pour
+		}
+
 		// Merge parent vars (parent vars are inherited, child overrides)
 		for name, varDef := range parent.Vars {
 			if _, exists := merged.Vars[name]; !exists {
@@ -219,6 +244,10 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 
 		// Merge parent steps (append, child steps come after)
 		merged.Steps = append(merged.Steps, parent.Steps...)
+
+		// Parent templates append in declaration order. Only the child gets
+		// override semantics so parent-parent conflicts still surface later.
+		merged.Template = append(merged.Template, parent.Template...)
 
 		// Merge parent compose rules
 		merged.Compose = mergeComposeRules(merged.Compose, parent.Compose)
@@ -232,6 +261,7 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 	// Merge child steps: override parent steps by ID (preserving position),
 	// append new child steps at the end.
 	merged.Steps = mergeSteps(merged.Steps, formula.Steps)
+	merged.Template = mergeSteps(merged.Template, formula.Template)
 
 	merged.Compose = mergeComposeRules(merged.Compose, formula.Compose)
 
@@ -248,7 +278,7 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 }
 
 // loadFormula loads a formula by name from search paths.
-// Tries TOML first (.formula.toml), then falls back to JSON (.formula.json).
+// Tries canonical TOML first (.toml), then legacy infixed TOML, then JSON.
 func (p *Parser) loadFormula(name string) (*Formula, error) {
 	// Check cache first
 	if cached, ok := p.cache[name]; ok {
@@ -256,7 +286,7 @@ func (p *Parser) loadFormula(name string) (*Formula, error) {
 	}
 
 	// Search for the formula file - try TOML first, then JSON
-	extensions := []string{FormulaExtTOML, FormulaExtJSON}
+	extensions := []string{FormulaExtTOML, FormulaLegacyExtTOML, FormulaExtJSON}
 	for _, dir := range p.searchPaths {
 		for _, ext := range extensions {
 			path := filepath.Join(dir, name+ext)
@@ -373,6 +403,9 @@ func ExtractVariables(formula *Formula) []string {
 		extract(step.Description)
 		extract(step.Assignee)
 		extract(step.Condition)
+		for _, l := range step.Labels {
+			extract(l)
+		}
 		for _, child := range step.Children {
 			extractFromStep(child)
 		}
@@ -397,12 +430,72 @@ func Substitute(s string, vars map[string]string) string {
 	})
 }
 
+// CheckResidualVars returns the names of any {{...}} placeholders remaining
+// in s after substitution. A non-empty return indicates a var name typo or
+// a missing or misspelled --var flag.
+func CheckResidualVars(s string) []string {
+	matches := varPattern.FindAllStringSubmatch(s, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(matches))
+	names := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if seen[m[1]] {
+			continue
+		}
+		seen[m[1]] = true
+		names = append(names, m[1])
+	}
+	return names
+}
+
+// CheckResidualTimeoutVars returns unresolved {{var}} and {var} placeholders
+// in timeout strings after all available substitutions have been applied.
+func CheckResidualTimeoutVars(s string) []string {
+	seen := make(map[string]bool)
+	var names []string
+	add := func(name string) {
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+
+	for _, name := range CheckResidualVars(s) {
+		add(name)
+	}
+	for _, match := range rangeVarPattern.FindAllStringSubmatchIndex(s, -1) {
+		start, end := match[0], match[1]
+		if start > 0 && s[start-1] == '{' {
+			continue
+		}
+		if end < len(s) && s[end] == '}' {
+			continue
+		}
+		add(s[match[2]:match[3]])
+	}
+	return names
+}
+
 // ValidateVars checks that all required variables are provided
 // and all values pass their constraints.
 func ValidateVars(formula *Formula, values map[string]string) error {
+	return validateVarDefs(formula.Vars, values)
+}
+
+// ValidateVarDefs validates explicit var definitions against provided values.
+// This is the recipe-level equivalent of ValidateVars, used after formula
+// compilation when only the remaining VarDef map is available.
+func ValidateVarDefs(defs map[string]*VarDef, values map[string]string) error {
+	return validateVarDefs(defs, values)
+}
+
+func validateVarDefs(defs map[string]*VarDef, values map[string]string) error {
 	var errs []string
 
-	for name, def := range formula.Vars {
+	for name, def := range defs {
 		val, provided := values[name]
 
 		// Check required

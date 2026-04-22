@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,15 +14,30 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
+type partialListPoolProvider struct {
+	*runtime.Fake
+	listErr   error
+	listNames []string
+}
+
+func (p *partialListPoolProvider) ListRunning(prefix string) ([]string, error) {
+	names := p.listNames
+	if names == nil {
+		names, _ = p.Fake.ListRunning(prefix)
+	}
+	return names, p.listErr
+}
+
 func TestEvaluatePoolSuccess(t *testing.T) {
 	pool := scaleParams{Min: 0, Max: 10, Check: "echo 5"}
-	runner := func(_, _ string) (string, error) { return "5", nil }
+	runner := func(_, _ string, _ map[string]string) (string, error) { return "5", nil }
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err != nil {
 		t.Fatalf("evaluatePool: %v", err)
 	}
@@ -31,9 +48,9 @@ func TestEvaluatePoolSuccess(t *testing.T) {
 
 func TestEvaluatePoolClampToMax(t *testing.T) {
 	pool := scaleParams{Min: 0, Max: 10, Check: "echo 20"}
-	runner := func(_, _ string) (string, error) { return "20", nil }
+	runner := func(_, _ string, _ map[string]string) (string, error) { return "20", nil }
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err != nil {
 		t.Fatalf("evaluatePool: %v", err)
 	}
@@ -44,9 +61,9 @@ func TestEvaluatePoolClampToMax(t *testing.T) {
 
 func TestEvaluatePoolClampToMin(t *testing.T) {
 	pool := scaleParams{Min: 2, Max: 10, Check: "echo 0"}
-	runner := func(_, _ string) (string, error) { return "0", nil }
+	runner := func(_, _ string, _ map[string]string) (string, error) { return "0", nil }
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err != nil {
 		t.Fatalf("evaluatePool: %v", err)
 	}
@@ -57,11 +74,11 @@ func TestEvaluatePoolClampToMin(t *testing.T) {
 
 func TestEvaluatePoolRunnerError(t *testing.T) {
 	pool := scaleParams{Min: 2, Max: 10, Check: "fail"}
-	runner := func(_, _ string) (string, error) {
+	runner := func(_, _ string, _ map[string]string) (string, error) {
 		return "", fmt.Errorf("command failed")
 	}
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -72,9 +89,9 @@ func TestEvaluatePoolRunnerError(t *testing.T) {
 
 func TestEvaluatePoolNonInteger(t *testing.T) {
 	pool := scaleParams{Min: 1, Max: 10, Check: "echo abc"}
-	runner := func(_, _ string) (string, error) { return "abc", nil }
+	runner := func(_, _ string, _ map[string]string) (string, error) { return "abc", nil }
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err == nil {
 		t.Fatal("expected error for non-integer output")
 	}
@@ -106,7 +123,7 @@ func TestEvaluatePoolDefaultScaleCheckCountsRoutedReadyWork(t *testing.T) {
 		MaxActiveSessions: intPtr(3),
 	}
 
-	got, err := evaluatePool("worker", scaleParamsFor(agent), dir, shellScaleCheck)
+	got, err := evaluatePool("worker", scaleParamsFor(agent), dir, nil, shellScaleCheck)
 	if err != nil {
 		t.Fatalf("evaluatePool without routed work: %v", err)
 	}
@@ -117,7 +134,7 @@ func TestEvaluatePoolDefaultScaleCheckCountsRoutedReadyWork(t *testing.T) {
 	runExternal(t, dir, bdPath, "create", "--json", "queued worker job", "-t", "task",
 		"--metadata", `{"gc.routed_to":"worker"}`)
 
-	got, err = evaluatePool("worker", scaleParamsFor(agent), dir, shellScaleCheck)
+	got, err = evaluatePool("worker", scaleParamsFor(agent), dir, nil, shellScaleCheck)
 	if err != nil {
 		t.Fatalf("evaluatePool with routed work: %v", err)
 	}
@@ -164,7 +181,7 @@ func TestEvaluatePoolDefaultScaleCheckCountsRoutedActiveUnassignedWork(t *testin
 		MinActiveSessions: intPtr(0),
 		MaxActiveSessions: intPtr(3),
 	}
-	got, err := evaluatePool("worker", scaleParamsFor(agent), dir, shellScaleCheck)
+	got, err := evaluatePool("worker", scaleParamsFor(agent), dir, nil, shellScaleCheck)
 	if err != nil {
 		t.Fatalf("evaluatePool with routed in-progress work: %v", err)
 	}
@@ -209,16 +226,16 @@ func TestIsMultiSessionCfgAgent_NamepoolMaxOneIsStillPool(t *testing.T) {
 		NamepoolNames:     []string{"furiosa"},
 	}
 
-	if !isMultiSessionCfgAgent(a) {
-		t.Fatal("expected namepool-backed max=1 agent to remain multi-session")
+	if !a.SupportsInstanceExpansion() {
+		t.Fatal("expected namepool-backed max=1 agent to support instance expansion")
 	}
 }
 
 func TestEvaluatePoolWhitespace(t *testing.T) {
 	pool := scaleParams{Min: 0, Max: 10, Check: "echo 3"}
-	runner := func(_, _ string) (string, error) { return " 3\n", nil }
+	runner := func(_, _ string, _ map[string]string) (string, error) { return " 3\n", nil }
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err != nil {
 		t.Fatalf("evaluatePool: %v", err)
 	}
@@ -230,9 +247,9 @@ func TestEvaluatePoolWhitespace(t *testing.T) {
 // Regression: empty check output must be an error, not silent success.
 func TestEvaluatePoolEmptyOutput(t *testing.T) {
 	pool := scaleParams{Min: 2, Max: 10, Check: "true"}
-	runner := func(_, _ string) (string, error) { return "", nil }
+	runner := func(_, _ string, _ map[string]string) (string, error) { return "", nil }
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err == nil {
 		t.Fatal("expected error for empty output")
 	}
@@ -244,9 +261,9 @@ func TestEvaluatePoolEmptyOutput(t *testing.T) {
 // Regression: whitespace-only output should also be treated as empty.
 func TestEvaluatePoolWhitespaceOnly(t *testing.T) {
 	pool := scaleParams{Min: 1, Max: 10, Check: "echo"}
-	runner := func(_, _ string) (string, error) { return "  \n", nil }
+	runner := func(_, _ string, _ map[string]string) (string, error) { return "  \n", nil }
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err == nil {
 		t.Fatal("expected error for whitespace-only output")
 	}
@@ -257,9 +274,9 @@ func TestEvaluatePoolWhitespaceOnly(t *testing.T) {
 
 func TestEvaluatePoolUnlimitedNoClamp(t *testing.T) {
 	pool := scaleParams{Min: 0, Max: -1, Check: "echo 100"}
-	runner := func(_, _ string) (string, error) { return "100", nil }
+	runner := func(_, _ string, _ map[string]string) (string, error) { return "100", nil }
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -271,9 +288,9 @@ func TestEvaluatePoolUnlimitedNoClamp(t *testing.T) {
 
 func TestEvaluatePoolUnlimitedClampsToMin(t *testing.T) {
 	pool := scaleParams{Min: 2, Max: -1, Check: "echo 0"}
-	runner := func(_, _ string) (string, error) { return "0", nil }
+	runner := func(_, _ string, _ map[string]string) (string, error) { return "0", nil }
 
-	got, err := evaluatePool("worker", pool, "", runner)
+	got, err := evaluatePool("worker", pool, "", nil, runner)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -333,6 +350,21 @@ func TestDiscoverPoolInstancesUnlimited(t *testing.T) {
 	}
 }
 
+func TestDiscoverPoolInstancesUnlimitedFailsClosedOnPartialResults(t *testing.T) {
+	sp := &partialListPoolProvider{
+		Fake:    runtime.NewFake(),
+		listErr: &runtime.PartialListError{Err: errors.New("remote backend down")},
+	}
+	_ = sp.Start(context.Background(), "myrig--worker-1", runtime.Config{})
+	_ = sp.Start(context.Background(), "myrig--worker-3", runtime.Config{})
+
+	pool := scaleParams{Min: 0, Max: -1}
+	instances := discoverPoolInstances("worker", "myrig", pool, nil, "city", "", sp)
+	if len(instances) != 0 {
+		t.Fatalf("len = %d, want fail-closed empty result on partial list (instances: %v)", len(instances), instances)
+	}
+}
+
 func TestCountRunningPoolInstancesUnlimited(t *testing.T) {
 	sp := runtime.NewFake()
 	_ = sp.Start(context.Background(), "worker-1", runtime.Config{})
@@ -341,6 +373,20 @@ func TestCountRunningPoolInstancesUnlimited(t *testing.T) {
 	count := countRunningPoolInstances("worker", "", scaleParams{Min: 0, Max: -1}, nil, "city", "", sp)
 	if count != 2 {
 		t.Errorf("count = %d, want 2", count)
+	}
+}
+
+func TestCountRunningPoolInstancesUsesPartialListResults(t *testing.T) {
+	sp := &partialListPoolProvider{
+		Fake:    runtime.NewFake(),
+		listErr: &runtime.PartialListError{Err: errors.New("remote backend down")},
+	}
+	_ = sp.Start(context.Background(), "worker-1", runtime.Config{})
+	_ = sp.Start(context.Background(), "worker-3", runtime.Config{})
+
+	count := countRunningPoolInstances("worker", "", scaleParams{Min: 0, Max: 3}, nil, "city", "", sp)
+	if count != 2 {
+		t.Errorf("count = %d, want 2 from per-session fallback", count)
 	}
 }
 
@@ -465,21 +511,55 @@ func TestExpandSessionSetup_Empty(t *testing.T) {
 }
 
 func TestResolveSetupScript_Relative(t *testing.T) {
-	got := resolveSetupScript("scripts/setup.sh", "/home/user/city")
-	if got != "/home/user/city/scripts/setup.sh" {
+	got := resolveSetupScript("scripts/setup.sh", "/home/user/city/packs/gastown", "/home/user/city")
+	if got != "/home/user/city/packs/gastown/scripts/setup.sh" {
 		t.Errorf("got %q, want absolute path", got)
 	}
 }
 
+func TestResolveSetupScript_DoubleSlashUsesCityRoot(t *testing.T) {
+	got := resolveSetupScript("//scripts/setup.sh", "/home/user/city/packs/gastown", "/home/user/city")
+	if got != "/home/user/city/scripts/setup.sh" {
+		t.Errorf("got %q, want city-root path", got)
+	}
+}
+
+func TestResolveSetupScript_LegacyCityRelativeStillWorks(t *testing.T) {
+	got := resolveSetupScript("packs/gastown/scripts/setup.sh", "/home/user/city/packs/gastown", "/home/user/city")
+	if got != "/home/user/city/packs/gastown/scripts/setup.sh" {
+		t.Errorf("got %q, want legacy city-root-relative path to remain supported", got)
+	}
+}
+
+func TestResolveSetupScript_LegacySharedCityRelativeFallback(t *testing.T) {
+	cityPath := t.TempDir()
+	sourceDir := filepath.Join(cityPath, "packs", "feature")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityScript := filepath.Join(cityPath, "packs", "shared", "scripts", "setup.sh")
+	if err := os.MkdirAll(filepath.Dir(cityScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cityScript, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := resolveSetupScript("packs/shared/scripts/setup.sh", sourceDir, cityPath)
+	if got != cityScript {
+		t.Errorf("got %q, want legacy shared city-root-relative path to remain supported", got)
+	}
+}
+
 func TestResolveSetupScript_Absolute(t *testing.T) {
-	got := resolveSetupScript("/usr/local/bin/setup.sh", "/home/user/city")
+	got := resolveSetupScript("/usr/local/bin/setup.sh", "/home/user/city/packs/gastown", "/home/user/city")
 	if got != "/usr/local/bin/setup.sh" {
 		t.Errorf("got %q, want unchanged absolute path", got)
 	}
 }
 
 func TestResolveSetupScript_Empty(t *testing.T) {
-	got := resolveSetupScript("", "/home/user/city")
+	got := resolveSetupScript("", "/home/user/city/packs/gastown", "/home/user/city")
 	if got != "" {
 		t.Errorf("got %q, want empty", got)
 	}
@@ -495,10 +575,10 @@ func TestExpandSessionSetup_ConfigDir(t *testing.T) {
 		ConfigDir: "/home/user/city/packs/gastown",
 	}
 	cmds := []string{
-		"{{.ConfigDir}}/scripts/status-line.sh {{.Agent}}",
+		"{{.ConfigDir}}/assets/scripts/status-line.sh {{.Agent}}",
 	}
 	got := expandSessionSetup(cmds, ctx)
-	want := "/home/user/city/packs/gastown/scripts/status-line.sh mayor"
+	want := "/home/user/city/packs/gastown/assets/scripts/status-line.sh mayor"
 	if got[0] != want {
 		t.Errorf("got %q, want %q", got[0], want)
 	}
@@ -545,64 +625,86 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 	trueVal := true
 	intVal := 42
 	src := config.Agent{
-		Name:                   "original",
-		Description:            "test agent description",
-		Dir:                    "original-dir",
-		WorkDir:                ".gc/agents/original",
-		Scope:                  "city",
-		Suspended:              true,
-		PreStart:               []string{"pre-cmd"},
-		PromptTemplate:         "prompts/test.md",
-		Nudge:                  "nudge text",
-		Session:                "acp",
-		Provider:               "claude",
-		StartCommand:           "claude --dangerously",
-		Args:                   []string{"--arg1"},
-		PromptMode:             "flag",
-		PromptFlag:             "--prompt",
-		ReadyDelayMs:           &intVal,
-		ReadyPromptPrefix:      "ready>",
-		ProcessNames:           []string{"claude"},
-		EmitsPermissionWarning: &trueVal,
-		Env:                    map[string]string{"K": "V"},
-		MaxActiveSessions:      intPtr(5),
-		MinActiveSessions:      intPtr(1),
-		ScaleCheck:             "echo 3",
-		WorkQuery:              "bd ready",
-		SlingQuery:             "bd update {}",
-		IdleTimeout:            "15m",
-		SleepAfterIdle:         "30s",
-		SleepAfterIdleSource:   "agent",
-		InstallAgentHooks:      []string{"claude"},
-		HooksInstalled:         &trueVal,
-		SessionSetup:           []string{"setup-cmd"},
-		SessionSetupScript:     "scripts/setup.sh",
-		SessionLive:            []string{"live-cmd"},
-		OverlayDir:             "overlays/test",
-		SourceDir:              "/src",
-		DefaultSlingFormula:    "mol-work",
-		InjectFragments:        []string{"frag1"},
-		Attach:                 &trueVal,
-		Fallback:               true,
-		PoolName:               "template/name",
-		ResumeCommand:          "claude --resume {{.SessionKey}} --dangerously",
-		DependsOn:              []string{"other-agent"},
-		WakeMode:               "fresh",
-		Implicit:               true,
-		DrainTimeout:           "10m",
-		OnBoot:                 "echo boot",
-		OnDeath:                "echo death",
-		Namepool:               "names.txt",
-		NamepoolNames:          []string{"alpha", "bravo"},
-		OptionDefaults:         map[string]string{"effort": "max"},
+		Name:                         "original",
+		Description:                  "test agent description",
+		Dir:                          "original-dir",
+		WorkDir:                      ".gc/agents/original",
+		Scope:                        "city",
+		Suspended:                    true,
+		PreStart:                     []string{"pre-cmd"},
+		PromptTemplate:               "prompts/test.md",
+		Nudge:                        "nudge text",
+		Session:                      "acp",
+		Provider:                     "claude",
+		StartCommand:                 "claude --dangerously",
+		Args:                         []string{"--arg1"},
+		PromptMode:                   "flag",
+		PromptFlag:                   "--prompt",
+		ReadyDelayMs:                 &intVal,
+		ReadyPromptPrefix:            "ready>",
+		ProcessNames:                 []string{"claude"},
+		EmitsPermissionWarning:       &trueVal,
+		Env:                          map[string]string{"K": "V"},
+		MaxActiveSessions:            intPtr(5),
+		MinActiveSessions:            intPtr(1),
+		ScaleCheck:                   "echo 3",
+		WorkQuery:                    "bd ready",
+		SlingQuery:                   "bd update {}",
+		IdleTimeout:                  "15m",
+		SleepAfterIdle:               "30s",
+		SleepAfterIdleSource:         "agent",
+		InstallAgentHooks:            []string{"claude"},
+		SkillsDir:                    "/skills",
+		MCPDir:                       "/mcp",
+		HooksInstalled:               &trueVal,
+		InjectAssignedSkills:         &trueVal,
+		SessionSetup:                 []string{"setup-cmd"},
+		SessionSetupScript:           "scripts/setup.sh",
+		SessionLive:                  []string{"live-cmd"},
+		OverlayDir:                   "overlays/test",
+		SourceDir:                    "/src",
+		DefaultSlingFormula:          strPtr("mol-work"),
+		InheritedDefaultSlingFormula: strPtr("mol-pack"),
+		InjectFragments:              []string{"frag1"},
+		AppendFragments:              []string{"agent-footer"},
+		InheritedAppendFragments:     []string{"pack-footer"},
+		Attach:                       &trueVal,
+		Fallback:                     true,
+		PoolName:                     "template/name",
+		ResumeCommand:                "claude --resume {{.SessionKey}} --dangerously",
+		DependsOn:                    []string{"other-agent"},
+		WakeMode:                     "fresh",
+		Implicit:                     true,
+		DrainTimeout:                 "10m",
+		OnBoot:                       "echo boot",
+		OnDeath:                      "echo death",
+		Namepool:                     "names.txt",
+		NamepoolNames:                []string{"alpha", "bravo"},
+		OptionDefaults:               map[string]string{"effort": "max"},
+		BindingName:                  "gastown",
+		PackName:                     "gastown",
 	}
 
-	// Verify every Agent field is set (non-zero) in the test data.
+	// Tombstone fields (deprecated in v0.15.1, removed in v0.16) are not
+	// deep-copied; they are accepted by the TOML parser but not propagated
+	// through the runtime. The deep-copy contract deliberately drops them.
+	tombstones := map[string]bool{
+		"Skills":       true,
+		"MCP":          true,
+		"SharedSkills": true,
+		"SharedMCP":    true,
+	}
+
+	// Verify every non-tombstone Agent field is set (non-zero) in the test data.
 	sv := reflect.ValueOf(src)
 	st := sv.Type()
 	for i := 0; i < st.NumField(); i++ {
+		fname := st.Field(i).Name
+		if tombstones[fname] {
+			continue
+		}
 		if sv.Field(i).IsZero() {
-			t.Fatalf("Agent field %q is zero in test data — add it to the test source", st.Field(i).Name)
+			t.Fatalf("Agent field %q is zero in test data — add it to the test source", fname)
 		}
 	}
 
@@ -616,12 +718,15 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		t.Errorf("Dir = %q, want %q", dst.Dir, "copy-dir")
 	}
 
-	// All other fields should match the source.
+	// All other non-tombstone fields should match the source.
 	dv := reflect.ValueOf(dst)
 	for i := 0; i < st.NumField(); i++ {
 		fname := st.Field(i).Name
 		if fname == "Name" || fname == "Dir" {
 			continue // Intentionally overridden.
+		}
+		if tombstones[fname] {
+			continue
 		}
 		if dv.Field(i).IsZero() {
 			t.Errorf("deepCopyAgent did not copy field %q", fname)
@@ -635,6 +740,8 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 	src.Args[0] = "MUTATED"
 	src.ProcessNames[0] = "MUTATED"
 	src.InjectFragments[0] = "MUTATED"
+	src.AppendFragments[0] = "MUTATED"
+	src.InheritedAppendFragments[0] = "MUTATED"
 	src.InstallAgentHooks[0] = "MUTATED"
 	newMin := 999
 	src.MinActiveSessions = &newMin
@@ -656,6 +763,12 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 	}
 	if dst.InjectFragments[0] == "MUTATED" {
 		t.Error("InjectFragments is not a deep copy")
+	}
+	if dst.AppendFragments[0] == "MUTATED" {
+		t.Error("AppendFragments is not a deep copy")
+	}
+	if dst.InheritedAppendFragments[0] == "MUTATED" {
+		t.Error("InheritedAppendFragments is not a deep copy")
 	}
 	if dst.InstallAgentHooks[0] == "MUTATED" {
 		t.Error("InstallAgentHooks is not a deep copy")
@@ -679,7 +792,7 @@ func TestDeepCopyAgentSetsPoolName(t *testing.T) {
 
 func TestRunPoolOnBoot(t *testing.T) {
 	var ran []string
-	runner := func(cmd, _ string) (string, error) {
+	runner := func(cmd, _ string, _ map[string]string) (string, error) {
 		ran = append(ran, cmd)
 		return "", nil
 	}
@@ -687,8 +800,8 @@ func TestRunPoolOnBoot(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{
 			{Name: "mayor", MaxActiveSessions: intPtr(1)},
-			{Name: "dog", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3)},
-			{Name: "cat", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)},
+			{Name: "dog", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3), OnBoot: "bd update --unclaim"},
+			{Name: "cat", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2), OnBoot: "bd update --unclaim"},
 		},
 	}
 
@@ -707,13 +820,13 @@ func TestRunPoolOnBoot(t *testing.T) {
 }
 
 func TestRunPoolOnBootError(t *testing.T) {
-	runner := func(_, _ string) (string, error) {
+	runner := func(_, _ string, _ map[string]string) (string, error) {
 		return "", fmt.Errorf("bd not found")
 	}
 
 	cfg := &config.City{
 		Agents: []config.Agent{
-			{Name: "dog", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3)},
+			{Name: "dog", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3), OnBoot: "bd update --unclaim"},
 		},
 	}
 
@@ -728,7 +841,7 @@ func TestRunPoolOnBootError(t *testing.T) {
 
 func TestRunPoolOnBootUsesRigRootForRigScopedPools(t *testing.T) {
 	var dirs []string
-	runner := func(_ string, dir string) (string, error) {
+	runner := func(_ string, dir string, _ map[string]string) (string, error) {
 		dirs = append(dirs, dir)
 		return "", nil
 	}
@@ -738,7 +851,7 @@ func TestRunPoolOnBootUsesRigRootForRigScopedPools(t *testing.T) {
 	cfg := &config.City{
 		Rigs: []config.Rig{{Name: "demo", Path: rigRoot}},
 		Agents: []config.Agent{
-			{Name: "polecat", Dir: "demo", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3)},
+			{Name: "polecat", Dir: "demo", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3), OnBoot: "bd update --unclaim"},
 		},
 	}
 
@@ -753,17 +866,84 @@ func TestRunPoolOnBootUsesRigRootForRigScopedPools(t *testing.T) {
 	}
 }
 
+func TestRunPoolOnBootUsesCanonicalRigEnv(t *testing.T) {
+	cityPath, rigDir, cfg := newControllerProbeFixture(t)
+	cfg.Agents[0].MinActiveSessions = intPtr(0)
+	cfg.Agents[0].MaxActiveSessions = intPtr(2)
+
+	var gotDir string
+	var gotPort string
+	var gotPassword string
+	var gotBeadsDir string
+	runner := func(_ string, dir string, env map[string]string) (string, error) {
+		gotDir = dir
+		gotPort = env["GC_DOLT_PORT"]
+		gotPassword = env["GC_DOLT_PASSWORD"]
+		gotBeadsDir = env["BEADS_DIR"]
+		return "", nil
+	}
+
+	var stderr bytes.Buffer
+	runPoolOnBoot(cfg, cityPath, runner, &stderr)
+
+	if gotDir != rigDir {
+		t.Fatalf("on_boot dir = %q, want %q", gotDir, rigDir)
+	}
+	wantPort := currentManagedDoltPort(cityPath)
+	if gotPort != wantPort {
+		t.Fatalf("GC_DOLT_PORT = %q, want %q", gotPort, wantPort)
+	}
+	if gotPassword != "city-secret" {
+		t.Fatalf("GC_DOLT_PASSWORD = %q, want %q", gotPassword, "city-secret")
+	}
+	if gotBeadsDir != filepath.Join(rigDir, ".beads") {
+		t.Fatalf("BEADS_DIR = %q, want %q", gotBeadsDir, filepath.Join(rigDir, ".beads"))
+	}
+}
+
+func TestRunPoolOnBootExpandsTemplateCommands(t *testing.T) {
+	var ran []string
+	cityPath := filepath.Join(t.TempDir(), "demo-city")
+	rigRoot := filepath.Join(cityPath, "frontend")
+	runner := func(cmd, _ string, _ map[string]string) (string, error) {
+		ran = append(ran, cmd)
+		return "", nil
+	}
+
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "frontend", Path: rigRoot}},
+		Agents: []config.Agent{
+			{
+				Name:              "worker",
+				Dir:               "frontend",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(2),
+				OnBoot:            "echo {{.CityName}} {{.Rig}} {{.AgentBase}}",
+			},
+		},
+	}
+
+	runPoolOnBoot(cfg, cityPath, runner, io.Discard)
+
+	if len(ran) != 1 {
+		t.Fatalf("ran %d commands, want 1", len(ran))
+	}
+	if ran[0] != "echo demo-city frontend worker" {
+		t.Fatalf("on_boot command = %q, want %q", ran[0], "echo demo-city frontend worker")
+	}
+}
+
 func TestComputePoolDeathHandlers(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test"},
 		Agents: []config.Agent{
 			{Name: "mayor", MaxActiveSessions: intPtr(1)}, // not a pool
-			{Name: "dog", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3)},
-			{Name: "cat", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(1)}, // max=1, skipped
+			{Name: "dog", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3), OnDeath: "echo death"},
+			{Name: "cat", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(1), OnDeath: "echo death"}, // max=1, skipped
 		},
 	}
 
-	handlers := computePoolDeathHandlers(cfg, "test", t.TempDir(), runtime.NewFake())
+	handlers := computePoolDeathHandlers(cfg, "test", t.TempDir(), runtime.NewFake(), nil)
 
 	// dog has max=3, so 3 handlers (dog-1, dog-2, dog-3).
 	// cat has max=1, skipped. mayor is not a pool.
@@ -779,9 +959,8 @@ func TestComputePoolDeathHandlers(t *testing.T) {
 			t.Errorf("missing handler for %s (have keys: %v)", sn, handlerKeys(handlers))
 			continue
 		}
-		want := fmt.Sprintf("--assignee=dog-%d", i)
-		if !strings.Contains(info.Command, want) {
-			t.Errorf("handler[%s].Command = %q, want %s", sn, info.Command, want)
+		if !strings.Contains(info.Command, "echo death") {
+			t.Errorf("handler[%s].Command = %q, want configured on_death command", sn, info.Command)
 		}
 	}
 }
@@ -792,17 +971,111 @@ func TestComputePoolDeathHandlersUsesRigRootForRigScopedPools(t *testing.T) {
 		Workspace: config.Workspace{Name: "test"},
 		Rigs:      []config.Rig{{Name: "demo", Path: rigRoot}},
 		Agents: []config.Agent{
-			{Name: "polecat", Dir: "demo", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)},
+			{Name: "polecat", Dir: "demo", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2), OnDeath: "echo death"},
 		},
 	}
 
-	handlers := computePoolDeathHandlers(cfg, "test", t.TempDir(), runtime.NewFake())
+	handlers := computePoolDeathHandlers(cfg, "test", t.TempDir(), runtime.NewFake(), nil)
 	if len(handlers) != 2 {
 		t.Fatalf("len(handlers) = %d, want 2", len(handlers))
 	}
 	for sessionName, info := range handlers {
 		if info.Dir != rigRoot {
 			t.Fatalf("handler[%s].Dir = %q, want %q", sessionName, info.Dir, rigRoot)
+		}
+	}
+}
+
+func TestComputePoolDeathHandlersExpandsTemplateCommands(t *testing.T) {
+	cityPath := filepath.Join(t.TempDir(), "demo-city")
+	rigRoot := filepath.Join(cityPath, "frontend")
+	if err := os.MkdirAll(rigRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "frontend", Path: rigRoot}},
+		Agents: []config.Agent{
+			{
+				Name:              "worker",
+				Dir:               "frontend",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(2),
+				OnDeath:           "echo {{.CityName}} {{.Rig}} {{.AgentBase}}",
+			},
+		},
+	}
+
+	handlers := computePoolDeathHandlers(cfg, "demo-city", cityPath, runtime.NewFake(), nil)
+	if len(handlers) != 2 {
+		t.Fatalf("len(handlers) = %d, want 2", len(handlers))
+	}
+	for sessionName, info := range handlers {
+		if !strings.Contains(info.Command, "echo demo-city frontend worker-") {
+			t.Fatalf("handler[%s].Command = %q, want expanded on_death template", sessionName, info.Command)
+		}
+	}
+}
+
+func TestComputePoolDeathHandlersLogsTemplateExpansionWarning(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test"},
+		Agents: []config.Agent{
+			{
+				Name:              "worker",
+				MinActiveSessions: intPtr(0),
+				MaxActiveSessions: intPtr(2),
+				OnDeath:           "echo {{.Rig",
+			},
+		},
+	}
+
+	var stderr bytes.Buffer
+	handlers := computePoolDeathHandlers(cfg, "demo-city", t.TempDir(), runtime.NewFake(), &stderr)
+	if len(handlers) != 2 {
+		t.Fatalf("len(handlers) = %d, want 2", len(handlers))
+	}
+	for sessionName, info := range handlers {
+		if info.Command != "echo {{.Rig" {
+			t.Fatalf("handler[%s].Command = %q, want raw command fallback", sessionName, info.Command)
+		}
+	}
+	if !strings.Contains(stderr.String(), "on_death") {
+		t.Fatalf("stderr missing field name: %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "echo {{.Rig") {
+		t.Fatalf("stderr should redact raw template, got %q", stderr.String())
+	}
+}
+
+func TestComputePoolDeathHandlersUsesCanonicalRigEnv(t *testing.T) {
+	cityPath, rigDir, cfg := newControllerProbeFixture(t)
+	writeCanonicalScopeConfig(t, rigDir, contract.ConfigState{
+		IssuePrefix:    "de",
+		EndpointOrigin: contract.EndpointOriginExplicit,
+		EndpointStatus: contract.EndpointStatusVerified,
+		DoltHost:       "rig-db.example.com",
+		DoltPort:       "3308",
+		DoltUser:       "rig-user",
+	})
+	writeScopePassword(t, rigDir, "rig-secret")
+	cfg.Workspace.Name = "test"
+	cfg.Agents[0].Name = "polecat"
+	cfg.Agents[0].MinActiveSessions = intPtr(0)
+	cfg.Agents[0].MaxActiveSessions = intPtr(2)
+
+	handlers := computePoolDeathHandlers(cfg, "test", cityPath, runtime.NewFake(), nil)
+	if len(handlers) != 2 {
+		t.Fatalf("len(handlers) = %d, want 2", len(handlers))
+	}
+	for sessionName, info := range handlers {
+		if info.Env["GC_DOLT_PORT"] != "3308" {
+			t.Fatalf("handler[%s].Env[GC_DOLT_PORT] = %q, want %q", sessionName, info.Env["GC_DOLT_PORT"], "3308")
+		}
+		if info.Env["GC_DOLT_USER"] != "rig-user" {
+			t.Fatalf("handler[%s].Env[GC_DOLT_USER] = %q, want %q", sessionName, info.Env["GC_DOLT_USER"], "rig-user")
+		}
+		if info.Env["GC_DOLT_PASSWORD"] != "rig-secret" {
+			t.Fatalf("handler[%s].Env[GC_DOLT_PASSWORD] = %q, want %q", sessionName, info.Env["GC_DOLT_PASSWORD"], "rig-secret")
 		}
 	}
 }
@@ -833,7 +1106,7 @@ func TestShellScaleCheck_NoBEADS_DOLT_SERVER_PORT_Injection(t *testing.T) {
 	// Clear any inherited value first so we can detect injection (or lack thereof).
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
 
-	out, err := shellScaleCheck("echo ${BEADS_DOLT_SERVER_PORT:-unset}", "")
+	out, err := shellScaleCheck("echo ${BEADS_DOLT_SERVER_PORT:-unset}", "", nil)
 	if err != nil {
 		t.Fatalf("shellScaleCheck: %v", err)
 	}

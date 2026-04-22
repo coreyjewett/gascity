@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +43,34 @@ func NewStore(script string) *Store {
 	}
 }
 
+func execProcessEnv(overrides map[string]string) []string {
+	out := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || stripExecEnvKey(key) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	keys := make([]string, 0, len(overrides))
+	for key := range overrides {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		out = append(out, key+"="+overrides[key])
+	}
+	return out
+}
+
+func stripExecEnvKey(key string) bool {
+	switch key {
+	case "GC_BEADS_PREFIX", "GC_CITY", "GC_CITY_PATH", "GC_CITY_ROOT", "GC_CITY_RUNTIME_DIR", "GC_PROVIDER", "GC_RIG", "GC_RIG_ROOT", "GC_STORE_ROOT", "GC_STORE_SCOPE":
+		return true
+	}
+	return strings.HasPrefix(key, "BEADS_") || strings.HasPrefix(key, "GC_DOLT_")
+}
+
 // run executes the script with the given args, optionally piping stdinData
 // to its stdin. Returns the trimmed stdout on success.
 //
@@ -55,12 +85,7 @@ func (s *Store) run(stdinData []byte, args ...string) (string, error) {
 	// expires, even if grandchild processes still hold them open.
 	cmd.WaitDelay = 2 * time.Second
 
-	if len(s.env) > 0 {
-		cmd.Env = os.Environ()
-		for k, v := range s.env {
-			cmd.Env = append(cmd.Env, k+"="+v)
-		}
-	}
+	cmd.Env = execProcessEnv(s.env)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -143,8 +168,27 @@ func (w *beadWire) toBead() beads.Bead {
 		Needs:       w.Needs,
 		Description: w.Description,
 		Labels:      w.Labels,
-		Metadata:    w.Metadata,
+		Metadata:    coerceMetadata(w.Metadata),
 	}
+}
+
+// coerceMetadata converts raw JSON metadata values to strings. Backing stores
+// may return numbers or booleans; the domain model is map[string]string.
+func coerceMetadata(raw map[string]json.RawMessage) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(raw))
+	for k, v := range raw {
+		var s string
+		if json.Unmarshal(v, &s) == nil {
+			m[k] = s
+		} else {
+			// Number, boolean, or other non-string — use the raw JSON text.
+			m[k] = strings.TrimSpace(string(v))
+		}
+	}
+	return m
 }
 
 // Create persists a new bead: script create (stdin: JSON)
@@ -245,6 +289,15 @@ func (s *Store) List(query beads.ListQuery) ([]beads.Bead, error) {
 		if query.Status != "" {
 			args = append(args, "--status="+query.Status)
 		}
+		if query.Assignee != "" {
+			args = append(args, "--assignee="+query.Assignee)
+		}
+		if query.Type != "" {
+			args = append(args, "--type="+query.Type)
+		}
+		if query.Limit > 0 && query.CreatedBefore.IsZero() {
+			args = append(args, "--limit="+strconv.Itoa(query.Limit))
+		}
 		out, err = s.run(nil, args...)
 	}
 	if err != nil {
@@ -268,13 +321,24 @@ func (s *Store) ListOpen(status ...string) ([]beads.Bead, error) {
 	return s.List(query)
 }
 
-// Ready returns all open beads: script ready
+// Ready returns actionable open beads (excluding infrastructure types):
+// script ready
 func (s *Store) Ready() ([]beads.Bead, error) {
 	out, err := s.run(nil, "ready")
 	if err != nil {
 		return nil, fmt.Errorf("exec beads ready: %w", err)
 	}
-	return parseBeadList(out)
+	all, err := parseBeadList(out)
+	if err != nil {
+		return nil, err
+	}
+	result := all[:0]
+	for _, b := range all {
+		if !beads.IsReadyExcludedType(b.Type) {
+			result = append(result, b)
+		}
+	}
+	return result, nil
 }
 
 // Children returns non-closed beads whose ParentID matches by default:

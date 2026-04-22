@@ -30,11 +30,12 @@ var markdownLinkRE = regexp.MustCompile(`\[[^][]+\]\(([^)]+)\)`)
 // and should be link-checked. Update this list when adding or removing doc
 // directories. TestDocDirCoverage will fail if a new directory with markdown
 // appears that is not accounted for here or in docTreeIgnored.
-var docTreeDirs = []string{"contrib", "docs", "engdocs"}
+var docTreeDirs = []string{"contrib", "docs", "engdocs", "specs"}
 
 // docTreeIgnored lists directories that contain markdown but are not
-// documentation trees (e.g., embedded prompt templates, test fixtures).
-var docTreeIgnored = []string{"cmd", "examples", "internal", "scripts", "test"}
+// documentation trees (e.g., embedded prompt templates, test fixtures,
+// gitignored scratch space for local work).
+var docTreeIgnored = []string{"cmd", "examples", "internal", "plans", "scripts", "test", "tmp"}
 
 // knownBrokenLinks lists links to docs that do not exist yet. These are
 // excluded from TestLocalMarkdownLinks failures but still logged. Remove
@@ -333,7 +334,7 @@ func isLowerAlpha(s string) bool {
 
 func TestTutorial01CommandSync(t *testing.T) {
 	root := repoRoot()
-	tutorial := filepath.Join(root, "docs", "tutorials", "01-beads.md")
+	tutorial := filepath.Join(root, "docs", "tutorials", "01-cities-and-rigs.md")
 	txtar := filepath.Join(root, "cmd", "gc", "testdata", "01-hello-gas-city.txtar")
 
 	mdVerbs, err := gcVerbsFromMarkdown(tutorial)

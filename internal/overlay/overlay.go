@@ -10,7 +10,8 @@ import (
 
 // CopyFileOrDir copies src into dst. If src is a directory, it recursively
 // copies all files into dst (like CopyDir). If src is a single file, it
-// copies the file to dst, creating parent directories as needed.
+// copies the file to dst, creating parent directories as needed. When dst
+// already exists as a directory, the source basename is preserved under dst.
 func CopyFileOrDir(src, dst string, stderr io.Writer) error {
 	info, err := os.Stat(src)
 	if os.IsNotExist(err) {
@@ -21,6 +22,9 @@ func CopyFileOrDir(src, dst string, stderr io.Writer) error {
 	}
 	if info.IsDir() {
 		return CopyDir(src, dst, stderr)
+	}
+	if dstInfo, err := os.Stat(dst); err == nil && dstInfo.IsDir() {
+		dst = filepath.Join(dst, filepath.Base(src))
 	}
 	return copyFile(src, dst)
 }
@@ -143,6 +147,97 @@ func copyDirWithSkipRecursive(srcBase, dstBase, rel string, skip SkipFunc) error
 		src := filepath.Join(srcBase, entryRel)
 		dst := filepath.Join(dstBase, entryRel)
 		if err := copyOrMergeFile(src, dst, IsMergeablePath(entryRel)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PerProviderDir is the conventional subdirectory name for provider-specific
+// overlay files. Files in overlay/per-provider/<provider>/ are copied to the
+// agent's working directory only when the agent's resolved provider matches.
+const PerProviderDir = "per-provider"
+
+// CopyDirForProvider copies overlay files with provider awareness:
+//  1. Copies everything EXCEPT the per-provider/ subtree (universal files).
+//  2. If per-provider/<providerName>/ exists, copies its contents into dst
+//     (flattened — the per-provider/<provider>/ prefix is stripped).
+//
+// This implements the V2 overlay layering described in doc-agent-v2.md.
+func CopyDirForProvider(srcDir, dstDir, providerName string, stderr io.Writer) error {
+	info, err := os.Stat(srcDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("overlay: stat %q: %w", srcDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("overlay: %q is not a directory", srcDir)
+	}
+
+	// Step 1: copy universal files (skip per-provider/).
+	skip := func(relPath string, _ bool) bool {
+		// Skip the per-provider directory itself and all its contents.
+		return relPath == PerProviderDir || filepath.Dir(relPath) == PerProviderDir ||
+			len(relPath) > len(PerProviderDir)+1 && relPath[:len(PerProviderDir)+1] == PerProviderDir+string(filepath.Separator)
+	}
+	if err := CopyDirWithSkip(srcDir, dstDir, skip, stderr); err != nil {
+		return err
+	}
+
+	// Step 2: copy provider-specific files (flattened into dst).
+	if providerName != "" {
+		providerDir := filepath.Join(srcDir, PerProviderDir, providerName)
+		if err := CopyDir(providerDir, dstDir, stderr); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// CopyDirForProviders copies overlay files for multiple provider slots.
+// Universal (non per-provider/) files are copied once, then per-provider/<p>/
+// content is copied for each name in providers. Used when an agent has
+// install_agent_hooks declaring additional provider hook slots beyond its
+// resolved provider — e.g. an agent running Claude that wants the Gemini
+// hook staged too.
+//
+// Duplicate provider names in the list are de-duped; empty strings are
+// skipped. The order in providers determines which per-provider copy
+// wins when two providers ship the same rel path (last-writer-wins via
+// overwrite or JSON merge).
+func CopyDirForProviders(srcDir, dstDir string, providers []string, stderr io.Writer) error {
+	info, err := os.Stat(srcDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("overlay: stat %q: %w", srcDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("overlay: %q is not a directory", srcDir)
+	}
+
+	// Step 1: copy universal files (skip per-provider/).
+	skip := func(relPath string, _ bool) bool {
+		return relPath == PerProviderDir || filepath.Dir(relPath) == PerProviderDir ||
+			len(relPath) > len(PerProviderDir)+1 && relPath[:len(PerProviderDir)+1] == PerProviderDir+string(filepath.Separator)
+	}
+	if err := CopyDirWithSkip(srcDir, dstDir, skip, stderr); err != nil {
+		return err
+	}
+
+	// Step 2: copy per-provider slots in order, deduped.
+	seen := make(map[string]bool, len(providers))
+	for _, p := range providers {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		providerDir := filepath.Join(srcDir, PerProviderDir, p)
+		if err := CopyDir(providerDir, dstDir, stderr); err != nil {
 			return err
 		}
 	}
