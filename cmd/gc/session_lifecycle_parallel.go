@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -442,6 +443,14 @@ func buildPreparedStart(
 		agentCfg.Env = mergeEnv(agentCfg.Env, map[string]string{"GC_PROVIDER": gcProvider})
 	}
 	agentCfg = runtime.SyncWorkDirEnv(agentCfg)
+	// Phase 1 preflight: if --settings points to a non-existent file, refuse to
+	// start. Stale paths (from city moves/renames) would otherwise cause claude
+	// to create ghost directories and exit status 1 with a misleading error.
+	if settingsPath := extractSettingsPath(agentCfg.Command); settingsPath != "" {
+		if _, statErr := os.Stat(settingsPath); os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("settings file %q does not exist (stale city path?): skipping session start", settingsPath)
+		}
+	}
 	return &preparedStart{
 		candidate:     candidate,
 		cfg:           agentCfg,
@@ -449,6 +458,21 @@ func buildPreparedStart(
 		coreBreakdown: coreBreakdown,
 		liveHash:      liveHash,
 	}, nil
+}
+
+// extractSettingsPath returns the value of --settings in a shell command
+// string, or "" if the flag is not present.
+func extractSettingsPath(cmd string) string {
+	parts := shellquote.Split(cmd)
+	for i, part := range parts {
+		if part == "--settings" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+		if strings.HasPrefix(part, "--settings=") {
+			return strings.TrimPrefix(part, "--settings=")
+		}
+	}
+	return ""
 }
 
 func executePreparedStartWave(

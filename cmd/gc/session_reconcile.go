@@ -959,3 +959,46 @@ func reverseBeads(beadSlice []beads.Bead) []beads.Bead {
 	}
 	return result
 }
+
+// migrateStaleSessionPaths rewrites work_dir and command metadata on all open
+// session beads whose stored work_dir no longer exists on disk. This handles
+// the case where the city directory was moved or renamed: stored absolute paths
+// reference the old location and must be updated to cityRoot before sessions
+// can start cleanly.
+//
+// For each bead: if work_dir != cityRoot and work_dir does not exist, replace
+// every occurrence of the stored work_dir with cityRoot in both work_dir and
+// command metadata. Logs each migration to stderr.
+func migrateStaleSessionPaths(store beads.Store, cityRoot string, stderr io.Writer) {
+	if store == nil || cityRoot == "" {
+		return
+	}
+	sessions, err := store.ListByLabel(sessionpkg.LabelSession, 0)
+	if err != nil {
+		fmt.Fprintf(stderr, "session path migration: listing sessions: %v\n", err) //nolint:errcheck
+		return
+	}
+	for _, b := range sessions {
+		if b.Status == "closed" {
+			continue
+		}
+		workDir := strings.TrimSpace(b.Metadata["work_dir"])
+		if workDir == "" || workDir == cityRoot {
+			continue
+		}
+		if _, statErr := os.Stat(workDir); !os.IsNotExist(statErr) {
+			continue // path exists — no migration needed
+		}
+		cmd := b.Metadata["command"]
+		newCmd := strings.ReplaceAll(cmd, workDir, cityRoot)
+		updates := map[string]string{"work_dir": cityRoot}
+		if newCmd != cmd {
+			updates["command"] = newCmd
+		}
+		if err := store.SetMetadataBatch(b.ID, updates); err != nil {
+			fmt.Fprintf(stderr, "session path migration: updating %s: %v\n", b.ID, err) //nolint:errcheck
+			continue
+		}
+		fmt.Fprintf(stderr, "session path migration: %s: work_dir %q → %q\n", b.ID, workDir, cityRoot) //nolint:errcheck
+	}
+}

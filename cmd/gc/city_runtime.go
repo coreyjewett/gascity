@@ -298,6 +298,13 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		return
 	}
 
+	// Phase 2 path migration: rewrite stale work_dir/command paths in session
+	// beads that reference a city location that no longer exists on disk. This
+	// recovers from city directory renames or moves without requiring manual SQL.
+	if cr.cityBeadStore() != nil {
+		migrateStaleSessionPaths(cr.cityBeadStore(), cityRoot, cr.stderr)
+	}
+
 	retryDelay := cr.cfg.Daemon.PatrolIntervalDuration()
 	startupRetryLimit := cr.cfg.Daemon.MaxRestartsOrDefault()
 	waitForRetry := func() bool {
