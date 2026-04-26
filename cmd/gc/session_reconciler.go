@@ -1527,6 +1527,21 @@ func resolveSessionCommand(command, sessionKey string, rp *config.ResolvedProvid
 	return resolveResumeCommand(command, sessionKey, rp)
 }
 
+// sessionTranscriptExists reports whether a provider transcript (jsonl) file
+// exists for the given session key. Returns false when the file is absent or
+// the search paths cannot be built. Used to gate --resume vs --session-id.
+func sessionTranscriptExists(cfg *config.City, provider, workDir, sessionKey string) bool {
+	if cfg == nil || sessionKey == "" {
+		return false
+	}
+	searchPaths := worker.MergeSearchPaths(cfg.Daemon.ObservePaths)
+	fac, err := worker.NewFactory(worker.FactoryConfig{SearchPaths: searchPaths})
+	if err != nil {
+		return false
+	}
+	return fac.DiscoverTranscript(provider, workDir, sessionKey) != ""
+}
+
 // resolveResumeCommand returns the command to use when resuming a session.
 // Priority: explicit resume_command (with {{.SessionKey}} expansion) >
 // ResumeFlag/ResumeStyle auto-construction > original command unchanged.

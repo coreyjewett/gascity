@@ -343,6 +343,18 @@ func buildPreparedStart(
 	if sk := session.Metadata["session_key"]; sk != "" && tp.ResolvedProvider != nil {
 		firstStart := session.Metadata["started_config_hash"] == ""
 		forceFresh := session.Metadata["wake_mode"] == "fresh"
+		// If this would be a resume (not first start, not force-fresh) but the
+		// provider supports --session-id and the transcript file is missing on
+		// disk, fall back to --session-id. This covers: session_key persisted
+		// without a matching jsonl (manual clear, cross-machine, deleted files).
+		// Without this check, claude exits 0 with "No conversation found" and
+		// the pane dies immediately every reconcile tick.
+		if !firstStart && !forceFresh && tp.ResolvedProvider.SessionIDFlag != "" &&
+			(tp.ResolvedProvider.ResumeFlag != "" || tp.ResolvedProvider.ResumeCommand != "") {
+			if !sessionTranscriptExists(cfg, tp.ResolvedProvider.Name, agentCfg.WorkDir, sk) {
+				firstStart = true
+			}
+		}
 		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, tp.ResolvedProvider, firstStart, forceFresh)
 	}
 	firstStart := session.Metadata["started_config_hash"] == ""

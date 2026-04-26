@@ -707,6 +707,64 @@ func TestPrepareStartCandidate_GeneratesMissingSessionKeyBeforeWake(t *testing.T
 	}
 }
 
+// TestBuildPreparedStart_MissingTranscriptFallsBackToSessionID verifies that
+// when a session has a session_key and started_config_hash (not first-start)
+// but the transcript file does not exist on disk, buildPreparedStart falls back
+// to --session-id instead of --resume to prevent the "No conversation found"
+// immediate-exit loop.
+func TestBuildPreparedStart_MissingTranscriptFallsBackToSessionID(t *testing.T) {
+	store := beads.NewMemStore()
+	searchDir := t.TempDir() // no jsonl files here — transcript is missing
+	session, err := store.Create(beads.Bead{
+		Title:  "mayor",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":        "mayor",
+			"template":            "mayor",
+			"state":               "asleep",
+			"session_key":         "00000000-dead-beef-0000-000000000001",
+			"started_config_hash": "previous-start-hash", // not a first-start
+			// no wake_mode=fresh
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session): %v", err)
+	}
+	cfg := &config.City{
+		Agents: []config.Agent{{Name: "mayor"}},
+		Daemon: config.DaemonConfig{ObservePaths: []string{searchDir}},
+	}
+	prepared, err := buildPreparedStart(startCandidate{
+		session: &session,
+		tp: TemplateParams{
+			TemplateName: "mayor",
+			SessionName:  "mayor",
+			Command:      "claude --dangerously-skip-permissions",
+			ResolvedProvider: &config.ResolvedProvider{
+				Name:          "claude/tmux-cli",
+				ResumeFlag:    "--resume",
+				ResumeStyle:   "flag",
+				SessionIDFlag: "--session-id",
+			},
+		},
+		order: 0,
+	}, cfg, store)
+	if err != nil {
+		t.Fatalf("buildPreparedStart: %v", err)
+	}
+	cmd := prepared.cfg.Command
+	if strings.Contains(cmd, "--resume") {
+		t.Fatalf("command = %q; want --session-id (not --resume) when transcript is missing", cmd)
+	}
+	if !strings.Contains(cmd, "--session-id") {
+		t.Fatalf("command = %q; want --session-id fallback when transcript is missing", cmd)
+	}
+	if !strings.Contains(cmd, "00000000-dead-beef-0000-000000000001") {
+		t.Fatalf("command = %q; want original session key preserved", cmd)
+	}
+}
+
 func TestReconcileSessionBeads_BlockedCandidatesDoNotConsumeWakeBudget(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
