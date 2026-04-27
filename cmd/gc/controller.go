@@ -989,6 +989,7 @@ func controllerLoop(
 		poolSessions:        poolSessions,
 		poolDeathHandlers:   poolDeathHandlers,
 		suspendedNames:      suspendedNames,
+		sessionDrains:       newDrainTracker(),
 		pokeCh:              make(chan struct{}, 1),
 		controlDispatcherCh: make(chan struct{}, 1),
 		logPrefix:           "gc start",

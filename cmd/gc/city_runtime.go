@@ -68,7 +68,11 @@ type CityRuntime struct {
 	standaloneRigStores map[string]beads.Store
 
 	// Bead-driven reconciler state (Phase 2f).
-	sessionDrains  *drainTracker // in-memory drain tracker; nil when bead reconciler disabled
+	// sessionDrains holds in-memory drain state and is initialized eagerly
+	// in newCityRuntime — beadReconcileTick gates on cityBeadStore() instead.
+	// (gascity-910: a nil tracker silently disabled the entire reconciler
+	// when the bead store failed to open at startup.)
+	sessionDrains  *drainTracker
 	demandSnapshot *runtimeDemandSnapshot
 
 	convHandler         *convergence.Handler     // nil until bead store available
@@ -205,6 +209,7 @@ func newCityRuntime(p CityRuntimeParams) *CityRuntime {
 		poolDeathHandlers:       p.PoolDeathHandlers,
 		suspendedNames:          suspendedNames,
 		convergenceReqCh:        p.ConvergenceReqCh,
+		sessionDrains:           newDrainTracker(),
 		reloadReqCh: func() chan reloadRequest {
 			if p.ReloadReqCh != nil {
 				return p.ReloadReqCh
@@ -293,10 +298,6 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// Record bead store health metric.
 	telemetry.RecordBeadStoreHealth(context.Background(), cr.cityName, cr.cityBeadStore() != nil)
 
-	// Initialize bead-driven drain tracker when bead store is available.
-	if cr.cityBeadStore() != nil && cr.tomlPath != "" {
-		cr.sessionDrains = newDrainTracker()
-	}
 	if ctx.Err() != nil {
 		return
 	}
@@ -427,9 +428,7 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			return
 		}
 
-		if cr.sessionDrains != nil {
-			cr.beadReconcileTick(ctx, result, sessionBeads, startupTrace)
-		}
+		cr.beadReconcileTick(ctx, result, sessionBeads, startupTrace)
 		completion = TraceCompletionCompleted
 		startupComplete = true
 	}) {
@@ -707,10 +706,9 @@ func (cr *CityRuntime) tick(
 		cr.stderr,
 	)
 
-	// Bead-driven reconciliation (requires bead store / drain tracker).
-	if cr.sessionDrains != nil {
-		cr.beadReconcileTick(ctx, result, sessionBeads, trace)
-	}
+	// Bead-driven reconciliation. beadReconcileTick gates on bead store
+	// availability internally; sessionDrains is always non-nil (gascity-910).
+	cr.beadReconcileTick(ctx, result, sessionBeads, trace)
 
 	// Wisp GC: purge expired closed molecules.
 	if store := cr.cityBeadStore(); cr.wg != nil && store != nil && cr.wg.shouldRun(time.Now()) {
@@ -1056,10 +1054,6 @@ func (cr *CityRuntime) reloadConfigTraced(
 		cr.standaloneRigStores = buildStandaloneRigStores(nextCfg, cr.cityPath, cr.stderr)
 	}
 
-	// Ensure drain tracker is initialized when bead store becomes available.
-	if cr.cityBeadStore() != nil && cr.tomlPath != "" && cr.sessionDrains == nil {
-		cr.sessionDrains = newDrainTracker()
-	}
 	cr.configRev = result.Revision
 	cr.watchTargets = config.WatchTargets(result.Prov, nextCfg, cityRoot)
 	cr.restartConfigWatcher()
@@ -1499,7 +1493,7 @@ func parseRFC3339Metadata(v string) (time.Time, bool) {
 
 func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
 	store := cr.cityBeadStore()
-	if store == nil || cr.sessionDrains == nil {
+	if store == nil {
 		return
 	}
 
@@ -1576,7 +1570,7 @@ func (cr *CityRuntime) syncBeadsAndUpdateIndex(desiredState map[string]TemplateP
 	store := cr.cityBeadStore()
 	cfgNames := configuredSessionNamesWithSnapshot(cr.cfg, cr.cityName, sessionBeads)
 	_, updated := syncSessionBeadsWithSnapshot(
-		cr.cityPath, store, desiredState, cr.sp, cfgNames, cr.cfg, clock.Real{}, cr.stderr, cr.sessionDrains != nil, sessionBeads,
+		cr.cityPath, store, desiredState, cr.sp, cfgNames, cr.cfg, clock.Real{}, cr.stderr, store != nil, sessionBeads,
 	)
 	return updated
 }
