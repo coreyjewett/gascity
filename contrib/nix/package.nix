@@ -26,7 +26,13 @@ let
     pname = "gascity";
     inherit src version;
 
-    vendorHash = "sha256-Z5fI5WqPXJfKv3kB1MVLBhxdAI+knAcxa0CWlmyNzkg=";
+    vendorHash = "sha256-59k7xFBaLZJ50KWNhwIzttE8j7GXZPneq6o4eUTlvBI=";
+
+    # Upstream does not commit vendor/. proxyVendor tells buildGoModule to
+    # fetch dependencies via the Go module proxy using go.mod + go.sum,
+    # validated against vendorHash. If upstream ever starts committing
+    # vendor/ again, this can be removed.
+    proxyVendor = true;
 
     doCheck = false;
 
