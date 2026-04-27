@@ -215,7 +215,7 @@ func cmdSling(args []string, isFormula, doNudge, force bool, title string, vars 
 			fmt.Fprintf(stderr, "gc sling: inline text requires explicit target\n  usage: gc sling <target> %q\n", beadOrFormula) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		bp := sling.BeadPrefix(beadOrFormula)
+		bp := sling.BeadPrefixKnown(beadOrFormula, sling.CityBeadPrefixes(cfg))
 		if bp == "" {
 			fmt.Fprintf(stderr, "gc sling: cannot derive rig from bead %q (no prefix)\n", beadOrFormula) //nolint:errcheck // best-effort stderr
 			return 1
@@ -389,7 +389,7 @@ func resolveSlingStoreRoot(cfg *config.City, cityPath, beadOrFormula string, a c
 	// resolveStoreScopeRoot would silently alias them to the city
 	// scope. Skip them so sling falls back to the agent's rig_dir or
 	// the city store instead of operating on the wrong store.
-	if bp := beadPrefix(beadOrFormula); bp != "" {
+	if bp := sling.BeadPrefixKnown(beadOrFormula, sling.CityBeadPrefixes(cfg)); bp != "" {
 		if rig, found := findRigByPrefix(cfg, bp); found && strings.TrimSpace(rig.Path) != "" {
 			return resolveStoreScopeRoot(cityPath, rig.Path)
 		}
@@ -901,7 +901,7 @@ func formatBeadLabel(id, title string) string {
 // printCrossRigSection prints the Cross-rig dry-run section if applicable.
 func printCrossRigSection(w func(string), beadID string, a config.Agent, cfg *config.City) {
 	if msg := checkCrossRig(beadID, a, cfg); msg != "" {
-		bp := sling.BeadPrefix(beadID)
+		bp := sling.BeadPrefixKnown(beadID, sling.CityBeadPrefixes(cfg))
 		rp := rigPrefixForAgent(a, cfg)
 		w("Cross-rig:")
 		w(fmt.Sprintf("  Bead %s (prefix %q) targets %s (rig prefix %q).", beadID, bp, a.QualifiedName(), rp))
@@ -1755,7 +1755,7 @@ func rigPrefixForAgent(a config.Agent, cfg *config.City) string {
 // doesn't match the target agent's rig prefix. Returns "" when the check
 // passes or can't be performed (missing prefix, city-wide agent, no rig).
 func checkCrossRig(beadID string, a config.Agent, cfg *config.City) string {
-	bp := sling.BeadPrefix(beadID)
+	bp := sling.BeadPrefixKnown(beadID, sling.CityBeadPrefixes(cfg))
 	if bp == "" {
 		return ""
 	}

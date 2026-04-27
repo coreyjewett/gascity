@@ -266,6 +266,7 @@ func TestBeadPrefixSling(t *testing.T) {
 		id   string
 		want string
 	}{
+		// Single-segment prefixes (unchanged behavior)
 		{"BL-42", "bl"},
 		{"HW-1", "hw"},
 		{"FE-123", "fe"},
@@ -276,12 +277,68 @@ func TestBeadPrefixSling(t *testing.T) {
 		{"", ""},
 		{"nohyphen", ""},
 		{"-1", ""},
+		// Multi-segment prefixes (new: last-hyphen heuristic)
+		{"pieces-annotator-x8o", "pieces-annotator"},   // 3-char hash
+		{"pieces-annotator-a3f", "pieces-annotator"},   // 3-char hash with letter+digit+letter
+		{"pieces-cli-5b8i", "pieces-cli"},              // 4-char hash with digit
+		{"my-cool-app-123", "my-cool-app"},             // numeric suffix
+		{"beads-vscode-1", "beads-vscode"},             // numeric suffix
+		// Word-like suffixes fall back to first hyphen
+		{"vc-baseline-test", "vc"},
+		{"pieces-annotator-baseline", "pieces"},        // "baseline" is word-like (8 chars, no digits)
 	}
 	for _, tt := range tests {
 		got := BeadPrefix(tt.id)
 		if got != tt.want {
 			t.Errorf("BeadPrefix(%q) = %q, want %q", tt.id, got, tt.want)
 		}
+	}
+}
+
+func TestBeadPrefixKnown(t *testing.T) {
+	tests := []struct {
+		id       string
+		known    []string
+		want     string
+	}{
+		// Longest-match beats heuristic
+		{"pieces-annotator-x8o", []string{"pieces", "pieces-annotator"}, "pieces-annotator"},
+		{"pieces-cli-5b8i", []string{"pieces", "pieces-cli", "pieces-annotator"}, "pieces-cli"},
+		{"pieces-5b8i", []string{"pieces", "pieces-cli"}, "pieces"},
+		// Word-like suffix: known prefix rescues the match
+		{"pieces-annotator-baseline", []string{"pieces-annotator", "pieces"}, "pieces-annotator"},
+		// No known prefix match: falls back to heuristic
+		{"ga-5b8i", []string{"pieces"}, "ga"},
+		// Empty known list: falls back to heuristic
+		{"pieces-annotator-x8o", nil, "pieces-annotator"},
+		// Overlapping prefixes: longest match wins
+		{"hq-cv-a3f", []string{"hq", "hq-cv"}, "hq-cv"},
+	}
+	for _, tt := range tests {
+		got := BeadPrefixKnown(tt.id, tt.known)
+		if got != tt.want {
+			t.Errorf("BeadPrefixKnown(%q, %v) = %q, want %q", tt.id, tt.known, got, tt.want)
+		}
+	}
+}
+
+func TestCityBeadPrefixes(t *testing.T) {
+	cfg := &config.City{
+		Rigs: []config.Rig{
+			{Name: "pieces-annotator", Path: "/pieces-annotator", Prefix: "pieces-annotator"},
+			{Name: "pieces-cli", Path: "/pieces-cli", Prefix: "pieces-cli"},
+		},
+	}
+	prefixes := CityBeadPrefixes(cfg)
+	found := make(map[string]bool, len(prefixes))
+	for _, p := range prefixes {
+		found[p] = true
+	}
+	if !found["pieces-annotator"] {
+		t.Errorf("CityBeadPrefixes missing pieces-annotator; got %v", prefixes)
+	}
+	if !found["pieces-cli"] {
+		t.Errorf("CityBeadPrefixes missing pieces-cli; got %v", prefixes)
 	}
 }
 

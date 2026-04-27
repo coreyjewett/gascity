@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -305,7 +306,7 @@ func FindRigByPrefix(cfg *config.City, prefix string) (config.Rig, bool) {
 // RigDirForBead resolves the rig directory for a bead ID by extracting
 // the bead prefix and looking up the rig path.
 func RigDirForBead(cfg *config.City, beadID string) string {
-	bp := BeadPrefix(beadID)
+	bp := BeadPrefixKnown(beadID, CityBeadPrefixes(cfg))
 	if bp == "" {
 		return ""
 	}
@@ -371,15 +372,110 @@ func FormatBeadLabel(id, title string) string {
 	return id
 }
 
-// BeadPrefix extracts the rig prefix from a bead ID by taking the lowercase
-// letters before the first dash. "HW-7" → "hw", "FE-123" → "fe".
-// Returns "" if the ID has no dash (can't determine prefix).
+// BeadPrefix extracts the rig prefix from a bead ID using the last-hyphen
+// heuristic. It returns everything before the hash or numeric suffix,
+// supporting multi-segment prefixes: "pieces-annotator-x8o" → "pieces-annotator",
+// "ga-5b8i" → "ga", "HW-7" → "hw".
+// Falls back to first-hyphen when the suffix looks like an English word.
+// Returns "" if the ID has no dash or cannot be parsed as a bead ID.
 func BeadPrefix(beadID string) string {
-	i := strings.Index(beadID, "-")
-	if i <= 0 {
+	return beadPrefixHeuristic(beadID)
+}
+
+// BeadPrefixKnown extracts the rig prefix using known prefixes for deterministic
+// longest-match resolution, falling back to BeadPrefix when no known prefix matches.
+// Use this when you have access to the city config to avoid heuristic ambiguity
+// for IDs like "pieces-annotator-baseline" where the suffix is word-like.
+func BeadPrefixKnown(beadID string, knownPrefixes []string) string {
+	lower := strings.ToLower(beadID)
+	sorted := make([]string, len(knownPrefixes))
+	copy(sorted, knownPrefixes)
+	sort.Slice(sorted, func(i, j int) bool { return len(sorted[i]) > len(sorted[j]) })
+	for _, p := range sorted {
+		lp := strings.ToLower(p)
+		if strings.HasPrefix(lower, lp+"-") {
+			return lp
+		}
+	}
+	return beadPrefixHeuristic(beadID)
+}
+
+// CityBeadPrefixes returns all bead ID prefixes configured in a city (HQ + rigs).
+func CityBeadPrefixes(cfg *config.City) []string {
+	if cfg == nil {
+		return nil
+	}
+	prefixes := make([]string, 0, len(cfg.Rigs)+1)
+	if hq := config.EffectiveHQPrefix(cfg); hq != "" {
+		prefixes = append(prefixes, hq)
+	}
+	for _, r := range cfg.Rigs {
+		if p := r.EffectivePrefix(); p != "" {
+			prefixes = append(prefixes, p)
+		}
+	}
+	return prefixes
+}
+
+// beadPrefixHeuristic extracts the bead prefix using last-hyphen with fallback.
+// Uses last hyphen when the suffix is numeric or hash-like (3–8 base36 chars
+// with at least one digit for 4+ char suffixes). Falls back to first hyphen
+// when the suffix looks like an English word (4+ all-letter chars).
+func beadPrefixHeuristic(beadID string) string {
+	lastIdx := strings.LastIndex(beadID, "-")
+	if lastIdx <= 0 {
 		return ""
 	}
-	return strings.ToLower(beadID[:i])
+	suffix := beadID[lastIdx+1:]
+	if len(suffix) == 0 {
+		return strings.ToLower(strings.TrimRight(beadID[:lastIdx], "-"))
+	}
+	// Handle sub-issue suffixes like "mol-123.1" — check the part before the dot.
+	basePart := suffix
+	if dotIdx := strings.Index(suffix, "."); dotIdx > 0 {
+		basePart = suffix[:dotIdx]
+	}
+	if isBeadNumeric(basePart) || isBeadHash(basePart) {
+		return strings.ToLower(strings.TrimRight(beadID[:lastIdx], "-"))
+	}
+	// Suffix looks word-like — fall back to first hyphen.
+	firstIdx := strings.Index(beadID, "-")
+	if firstIdx <= 0 {
+		return ""
+	}
+	return strings.ToLower(beadID[:firstIdx])
+}
+
+// isBeadNumeric reports whether s contains only ASCII digits.
+func isBeadNumeric(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isBeadHash reports whether s looks like a bead hash ID (3–8 base36 chars).
+// 3-char suffixes pass freely; 4+ require at least one digit to distinguish
+// from English words.
+func isBeadHash(s string) bool {
+	if len(s) < 3 || len(s) > 8 {
+		return false
+	}
+	hasDigit := len(s) == 3 // 3-char: free pass (word collision acceptable)
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			hasDigit = true
+		}
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+			return false
+		}
+	}
+	return hasDigit
 }
 
 // RigPrefixForAgent returns the rig prefix that an agent's rig uses for bead IDs.
@@ -401,7 +497,7 @@ func CheckCrossRig(beadID string, a config.Agent, cfg *config.City) string {
 	if cfg == nil || a.Dir == "" {
 		return ""
 	}
-	bp := BeadPrefix(beadID)
+	bp := BeadPrefixKnown(beadID, CityBeadPrefixes(cfg))
 	if bp == "" {
 		return ""
 	}

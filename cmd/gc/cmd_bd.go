@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/spf13/cobra"
 )
 
@@ -239,7 +240,7 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 }
 
 func bdRigForArg(cfg *config.City, arg string) (config.Rig, bool) {
-	if prefix := beadPrefix(arg); prefix != "" {
+	if prefix := sling.BeadPrefixKnown(arg, sling.CityBeadPrefixes(cfg)); prefix != "" {
 		return findRigByPrefix(cfg, prefix)
 	}
 	return config.Rig{}, false

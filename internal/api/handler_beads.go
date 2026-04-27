@@ -12,6 +12,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/sling"
 )
 
 func appendMetadataAttachedChildren(store beads.Store, parent beads.Bead, children []beads.Bead) []beads.Bead {
@@ -232,17 +233,10 @@ type BeadGraphResponse struct {
 	Deps  []workflowDepResponse `json:"deps"`
 }
 
-// beadPrefix extracts the alphabetic prefix from a bead ID (e.g., "ga" from "ga-5b8i").
+// beadPrefix extracts the rig prefix from a bead ID, supporting multi-segment
+// prefixes: "pieces-annotator-x8o" → "pieces-annotator", "ga-5b8i" → "ga".
 func beadPrefix(id string) string {
-	for i, c := range id {
-		if c == '-' {
-			return id[:i]
-		}
-		if c < 'a' || c > 'z' {
-			return ""
-		}
-	}
-	return ""
+	return sling.BeadPrefix(id)
 }
 
 // resolveRoutePrefix reads routes.jsonl from a rig's .beads/ directory and
