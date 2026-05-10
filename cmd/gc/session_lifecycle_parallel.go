@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -751,6 +752,18 @@ func buildPreparedStart(
 	if sk := session.Metadata["session_key"]; sk != "" && tp.ResolvedProvider != nil && !tp.IsACP {
 		firstStart := session.Metadata["started_config_hash"] == ""
 		forceFresh := session.Metadata["wake_mode"] == "fresh"
+		// If this would be a resume (not first start, not force-fresh) but the
+		// provider supports --session-id and the transcript file is missing on
+		// disk, fall back to --session-id. This covers: session_key persisted
+		// without a matching jsonl (manual clear, cross-machine, deleted files).
+		// Without this check, claude exits 0 with "No conversation found" and
+		// the pane dies immediately every reconcile tick.
+		if !firstStart && !forceFresh && tp.ResolvedProvider.SessionIDFlag != "" &&
+			(tp.ResolvedProvider.ResumeFlag != "" || tp.ResolvedProvider.ResumeCommand != "") {
+			if !sessionTranscriptExists(cfg, tp.ResolvedProvider.Name, agentCfg.WorkDir, sk) {
+				firstStart = true
+			}
+		}
 		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, tp.ResolvedProvider, firstStart, forceFresh)
 	}
 	firstStart := session.Metadata["started_config_hash"] == ""
@@ -829,6 +842,14 @@ func buildPreparedStart(
 		agentCfg.Env = mergeEnv(agentCfg.Env, map[string]string{"GC_PROVIDER": gcProvider})
 	}
 	agentCfg = runtime.SyncWorkDirEnv(agentCfg)
+	// Phase 1 preflight: if --settings points to a non-existent file, refuse to
+	// start. Stale paths (from city moves/renames) would otherwise cause claude
+	// to create ghost directories and exit status 1 with a misleading error.
+	if settingsPath := extractSettingsPath(agentCfg.Command); settingsPath != "" {
+		if _, statErr := os.Stat(settingsPath); os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("settings file %q does not exist (stale city path?): skipping session start", settingsPath)
+		}
+	}
 	return &preparedStart{
 		candidate:     candidate,
 		cfg:           agentCfg,
@@ -836,6 +857,21 @@ func buildPreparedStart(
 		coreBreakdown: coreBreakdown,
 		liveHash:      liveHash,
 	}, nil
+}
+
+// extractSettingsPath returns the value of --settings in a shell command
+// string, or "" if the flag is not present.
+func extractSettingsPath(cmd string) string {
+	parts := shellquote.Split(cmd)
+	for i, part := range parts {
+		if part == "--settings" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+		if strings.HasPrefix(part, "--settings=") {
+			return strings.TrimPrefix(part, "--settings=")
+		}
+	}
+	return ""
 }
 
 func executePreparedStartWave(
