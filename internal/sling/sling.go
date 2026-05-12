@@ -417,6 +417,7 @@ func BeadPrefix(beadID string) string {
 }
 
 func beadPrefixHeuristic(beadID string) string {
+	beadID = strings.TrimSpace(beadID)
 	lastIdx := strings.LastIndex(beadID, "-")
 	if lastIdx <= 0 {
 		return ""
@@ -451,6 +452,11 @@ func isBeadNumeric(s string) bool {
 	return true
 }
 
+// isBeadHash is only the config-free BeadPrefix heuristic's suffix gate. It
+// intentionally rejects longer all-letter words so prose like
+// "code-review-please" falls back to the first dash instead of being treated
+// as a hyphenated rig prefix. Config-aware routing must use BeadPrefixForCity
+// and the configured-prefix matchers instead.
 func isBeadHash(s string) bool {
 	if len(s) < 3 || len(s) > 8 {
 		return false
@@ -562,8 +568,10 @@ func configuredBeadPrefixes(cfg *config.City) []string {
 // validBeadSuffix reports whether suffix is a plausible bead-ID suffix:
 // a non-empty alphanumeric base of at most 8 characters, optionally
 // followed by ".child" hierarchical parts. The hierarchical portion is
-// not validated, matching BeadIDParts which truncates at the first dot
-// before validating the base.
+// not validated, matching BeadIDParts which truncates at the first dot before
+// validating the base. This is the configured-prefix suffix gate for
+// LooksLikeConfiguredBeadID; it does not try to distinguish hash-like IDs from
+// prose because the prefix has already matched city config.
 func validBeadSuffix(suffix string) bool {
 	base := suffix
 	if dot := strings.IndexByte(suffix, '.'); dot > 0 {

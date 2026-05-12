@@ -385,7 +385,7 @@ func mergeWorkflowDeps(primary, extra []workflowDepResponse) []workflowDepRespon
 	return primary
 }
 
-// beadPrefix extracts the configured prefix from a bead ID.
+// beadPrefix extracts the config-free heuristic prefix from a bead ID.
 func beadPrefix(id string) string {
 	return sling.BeadPrefix(id)
 }
