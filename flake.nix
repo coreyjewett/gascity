@@ -6,7 +6,12 @@
   outputs =
     { self, nixpkgs }:
     let
-      version = "0.13.4";
+      # Version comes from the flake's git metadata: short commit SHA for clean
+      # builds, "-dirty" suffix for dirty trees, "dev" if no rev is available.
+      # The Makefile uses `git describe --tags --exact-match` instead, which the
+      # nix sandbox can't replicate (no .git access). For tagged-release builds
+      # via nixpkgs, override `version` at callPackage time.
+      version = self.shortRev or self.dirtyShortRev or "dev";
 
       systems = [
         "aarch64-darwin"
