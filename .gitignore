@@ -8,6 +8,8 @@ cmd/gc/.runtime/
 /genschema
 /bd
 /br
+/result
+/result-*
 /tmp/
 .runtime/
 *.test
