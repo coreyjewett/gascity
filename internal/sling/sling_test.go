@@ -300,6 +300,17 @@ func TestBeadPrefixSling(t *testing.T) {
 		{"", ""},
 		{"nohyphen", ""},
 		{"-1", ""},
+		// Hyphenated prefixes: when the suffix looks like a bd-generated
+		// short hash or counter, peel only the trailing segment.
+		{"pieces-annotator-x8o", "pieces-annotator"},
+		{"pieces-annotator-a3f", "pieces-annotator"},
+		{"pieces-cli-5b8i", "pieces-cli"},
+		{"my-cool-app-123", "my-cool-app"},
+		{"beads-vscode-1", "beads-vscode"},
+		// Word-like trailing segments fall back to first-dash so ordinary
+		// prose ("code-review-please") still resolves predictably.
+		{"vc-baseline-test", "vc"},
+		{"pieces-annotator-baseline", "pieces"},
 	}
 	for _, tt := range tests {
 		got := BeadPrefix(tt.id)

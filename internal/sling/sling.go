@@ -404,20 +404,74 @@ func FormatBeadLabel(id, title string) string {
 	return id
 }
 
-// BeadPrefix extracts the rig prefix from a bead ID by taking the lowercase
-// letters before the first dash. "HW-7" → "hw", "FE-123" → "fe".
-// Returns "" if the ID has no dash (can't determine prefix).
+// BeadPrefix extracts the rig prefix from a bead ID using a config-free
+// two-tier heuristic: peel the trailing segment when it looks like a
+// bd-generated short hash or numeric counter ("pieces-annotator-x8o" →
+// "pieces-annotator"); otherwise split on the first dash so ordinary prose
+// ("code-review-please") still resolves predictably ("code").
 //
-// This is a config-free heuristic. For inputs whose rig prefix may itself
-// contain hyphens ("agent-diagnostics-hnn" routed to rig "agent-diagnostics"),
-// callers must use BeadPrefixForCity, which resolves the longest matching
-// configured prefix.
+// For inputs whose rig prefix is known to itself contain hyphens, callers
+// with city config should prefer BeadPrefixForCity for deterministic
+// longest-configured-prefix resolution. BeadPrefix is the fallback used
+// when no city config is available or the prefix is not configured.
 func BeadPrefix(beadID string) string {
-	i := strings.Index(beadID, "-")
-	if i <= 0 {
+	lastIdx := strings.LastIndex(beadID, "-")
+	if lastIdx <= 0 {
 		return ""
 	}
-	return strings.ToLower(beadID[:i])
+	suffix := beadID[lastIdx+1:]
+	if suffix == "" {
+		return strings.ToLower(strings.TrimRight(beadID[:lastIdx], "-"))
+	}
+	// Allow ".child" hierarchical suffixes ("ga-5b8i.1") by inspecting only
+	// the portion before the dot when classifying.
+	base := suffix
+	if dot := strings.IndexByte(suffix, '.'); dot > 0 {
+		base = suffix[:dot]
+	}
+	if isBeadNumericSuffix(base) || isBeadHashSuffix(base) {
+		return strings.ToLower(strings.TrimRight(beadID[:lastIdx], "-"))
+	}
+	firstIdx := strings.Index(beadID, "-")
+	if firstIdx <= 0 {
+		return ""
+	}
+	return strings.ToLower(beadID[:firstIdx])
+}
+
+// isBeadNumericSuffix reports whether s is a non-empty all-digit string,
+// matching counter-style suffixes like "1", "42", "123".
+func isBeadNumericSuffix(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isBeadHashSuffix reports whether s looks like a bd-generated short hash:
+// 3-8 base36 characters, with at least one digit (relaxed for length 3 so
+// all-letter short hashes like "abc" still classify as hash-like). Word-like
+// suffixes ("baseline", "please") return false.
+func isBeadHashSuffix(s string) bool {
+	if len(s) < 3 || len(s) > 8 {
+		return false
+	}
+	hasDigit := len(s) == 3
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			hasDigit = true
+			continue
+		}
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
+	return hasDigit
 }
 
 // BeadPrefixForCity returns the configured rig (or HQ) prefix that beadID
