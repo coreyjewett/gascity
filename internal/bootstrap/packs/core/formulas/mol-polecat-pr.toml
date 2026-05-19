@@ -1,0 +1,335 @@
+description = """
+Polecat upstream-PR variant — branches off an upstream remote, commits on a
+feature branch, pushes the branch to origin (fork), and opens a draft pull
+request against the upstream repository.
+
+Extends mol-polecat-base with a feature-branch workspace setup (worktree
+checked out at <upstream_remote>/<target_base> with a typed branch prefix
+and a slug derived from the bead title) and replaces the terminal step with
+a push-and-pull-request submission instead of a direct commit. Designed for
+contributing work back to a source repository when the local fork is behind
+or when the change needs upstream review.
+
+## Polecat Contract (Feature-Branch + PR Model)
+
+1. Receive work (molecule poured with this formula, assigned to you).
+2. Follow steps in order (read descriptions, execute, move to next).
+3. Cut a feature branch off the upstream remote at HEAD of target_base.
+4. Commit on the feature branch, push to origin, open a draft PR upstream.
+5. Record the PR URL on the bead, close the bead, exit.
+6. You are GONE — no refinery step needed.
+
+The PR body is rendered from the upstream pull-request template (default:
+`.github/pull_request_template.md`) using bead.description as the source
+material, then passed through a private-name denylist that replaces any
+hits with `<redacted>` and emits a WARN log line per hit so the mayor can
+audit during review. If the title hits the denylist, the entire title is
+REPLACED with a generic placeholder rather than emitting a half-redacted
+title.
+
+## Failure Modes
+
+| Situation | Action |
+|-----------|--------|
+| Tests fail | Fix them. Do not proceed with failures. |
+| Push conflict (3 retries exhausted) | Mail witness, drain-ack, exit 1 |
+| Branch-name collision | Append `-<6-hex-uuid>` suffix and retry |
+| Denylist hit on PR body | Replace substring with `<redacted>`, WARN |
+| Denylist hit on PR title | Replace entire title with generic placeholder |
+| Context filling | `gc runtime request-restart` (blocks until controller kills you) |
+| Unsure what to do | Mail Witness, don't guess |"""
+formula = "mol-polecat-pr"
+extends = ["mol-polecat-base"]
+version = 1
+
+[vars]
+[vars.upstream_remote]
+description = "Git remote name for the upstream source repository."
+default = "upstream"
+
+[vars.upstream_org]
+description = "GitHub organization of the upstream repository (passed to gh pr create --repo)."
+default = "gastownhall"
+
+[vars.upstream_repo]
+description = "GitHub repository name on upstream."
+default = "gascity"
+
+[vars.target_base]
+description = "Branch on the upstream remote to open the pull request against."
+default = "main"
+
+[vars.origin_remote]
+description = "Git remote name for the fork (push target for feature branches)."
+default = "origin"
+
+[vars.branch_prefix_bug]
+description = "Branch-name prefix when bead type is bug."
+default = "fix"
+
+[vars.branch_prefix_feature]
+description = "Branch-name prefix when bead type is feature, task, or anything other than bug."
+default = "feat"
+
+[vars.pr_template_path]
+description = "Repo-relative path to the pull-request template to render into the PR body."
+default = ".github/pull_request_template.md"
+
+[vars.pr_private_denylist]
+description = "Comma-separated, case-insensitive substring denylist of private project names to redact from the PR body and title."
+default = "financials,IMPACT,coop-manager,sypl-code,clarity,gascity-clarity"
+
+[[steps]]
+id = "workspace-setup"
+title = "Set up worktree on a feature branch off upstream"
+needs = ["load-context"]
+description = """
+Create an isolated worktree checked out at the upstream remote`s HEAD of
+target_base, then create a typed feature branch.
+
+**Config: upstream_remote = {{upstream_remote}}**
+**Config: target_base = {{target_base}}**
+**Config: origin_remote = {{origin_remote}}**
+**Config: setup_command = {{setup_command}}**
+
+**1. Fetch the upstream remote:**
+```bash
+git fetch {{upstream_remote}}
+```
+
+**2. Resolve the work directory.**
+
+Check if `metadata.work_dir` already records your worktree path:
+```bash
+WORKTREE=$(bd show {{issue}} --json | jq -r '.[0].metadata.work_dir // empty')
+BRANCH=$(bd show {{issue}} --json | jq -r '.[0].metadata.branch // empty')
+```
+
+**If a worktree AND branch are already recorded** — reuse them (resume path):
+```bash
+cd "$WORKTREE"
+git fetch {{upstream_remote}} {{target_base}}
+git rebase {{upstream_remote}}/{{target_base}}
+```
+If the directory is missing, fall through to create a new one.
+
+**If no worktree** — create one off the upstream remote:
+```bash
+WORKTREE_PATH=$(pwd)/worktrees/{{issue}}
+git worktree add "$WORKTREE_PATH" --detach {{upstream_remote}}/{{target_base}}
+cd "$WORKTREE_PATH"
+```
+
+**3. Derive the branch name from bead type and title.**
+
+Choose the prefix by **bead.type** (read via `bd show {{issue}} --json`):
+
+- bead.type = bug → prefix = `{{branch_prefix_bug}}`
+- otherwise (feature, task, …) → prefix = `{{branch_prefix_feature}}`
+
+Derive the slug from the bead title with these rules:
+
+- **lowercase** the title,
+- keep only **alphanumeric** characters and **hyphens** (replace runs of
+  any other character with a single hyphen),
+- collapse repeated hyphens, trim leading/trailing hyphens,
+- truncate to a maximum of **40** characters (no trailing hyphen after
+  truncation).
+
+```bash
+BEAD_TYPE=$(bd show {{issue}} --json | jq -r '.[0].issue_type')
+case "$BEAD_TYPE" in
+    bug) PREFIX="{{branch_prefix_bug}}" ;;
+    *)   PREFIX="{{branch_prefix_feature}}" ;;
+esac
+TITLE=$(bd show {{issue}} --json | jq -r '.[0].title')
+SLUG=$(printf '%s' "$TITLE" \\
+    | tr '[:upper:]' '[:lower:]' \\
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \\
+    | cut -c1-40 \\
+    | sed -E 's/-+$//')
+BRANCH="${PREFIX}/{{issue}}-${SLUG}"
+```
+
+**4. Detect and resolve branch-name collisions.**
+
+If the branch already exists locally (`git rev-parse --verify`) OR on
+origin (`git ls-remote --heads {{origin_remote}}`), append a 6-hex-char
+suffix generated with `openssl rand -hex 3` to disambiguate:
+
+```bash
+if git rev-parse --verify --quiet "$BRANCH" >/dev/null \\
+   || [ -n "$(git ls-remote --heads {{origin_remote}} "$BRANCH")" ]; then
+    BRANCH="${BRANCH}-$(openssl rand -hex 3)"
+fi
+git checkout -b "$BRANCH"
+```
+
+**5. Record work_dir and branch on the bead.**
+
+Both must be recorded so restarts and witness recovery can find them:
+```bash
+bd update {{issue}} --set-metadata work_dir="$WORKTREE_PATH"
+bd update {{issue}} --set-metadata branch="$BRANCH"
+```
+
+**6. Run project setup (if configured):**
+```bash
+{{setup_command}}
+```
+Empty setup_command → skip.
+
+**Exit criteria:** In your worktree on a fresh feature branch off
+{{upstream_remote}}/{{target_base}}, branch and work_dir recorded on the
+bead, deps installed."""
+
+[[steps]]
+id = "commit-and-push"
+title = "Commit, push to origin, and open draft PR upstream"
+needs = ["self-review"]
+description = """
+Commit your work to the feature branch (NOT to {{target_base}}), push the
+feature branch to {{origin_remote}}, render the upstream PR template, sanitize
+it against the private-name denylist, and open a draft pull request against
+{{upstream_org}}/{{upstream_repo}}. You cease to exist after this step.
+
+**1. Final clean-state safeguard:**
+```bash
+git status --porcelain
+```
+If ANY output (untracked files, uncommitted changes):
+```bash
+git add -A && git commit -m "chore: capture remaining work ({{issue}})"
+```
+
+You must remain on the feature branch — do NOT push to {{target_base}}, do
+NOT push to {{upstream_remote}}.
+
+**2. Push the feature branch to origin with rebase-retry (3 attempts):**
+
+```bash
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+for attempt in 1 2 3; do
+    if git push -u {{origin_remote}} "$BRANCH"; then
+        echo "Push succeeded on attempt $attempt"
+        break
+    fi
+    if [ "$attempt" -eq 3 ]; then
+        echo "Push failed after 3 attempts"
+        gc mail send <rig>/witness -s "HELP: PR push failed after 3 retries" \\
+          -m "Issue: {{issue}}. Branch: $BRANCH. Last error: <see session log>."
+        gc runtime drain-ack
+        exit 1
+    fi
+    echo "Push failed (attempt $attempt), rebasing on {{upstream_remote}}/{{target_base}}..."
+    git fetch {{upstream_remote}} {{target_base}}
+    git rebase {{upstream_remote}}/{{target_base}}
+    # If rebase conflicts: resolve them, then `git rebase --continue` and retry.
+done
+```
+
+**3. Render the upstream PR template from the bead.**
+
+Read `{{pr_template_path}}` and fill it in from the bead. The upstream
+template (Summary / Testing / Checklist) expects concise, contributor-style
+prose: trim bead.description into 2–3 sentences for Summary; check off
+Testing rows for verify-phase commands that ran; leave Checklist unchecked
+(the human reviewer toggles those during PR review).
+
+```bash
+BEAD_JSON=$(bd show {{issue}} --json)
+PR_TITLE=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].title')
+PR_BODY=$(render-template "{{pr_template_path}}" "$BEAD_JSON")
+```
+
+`render-template` here is shorthand for the substitution you perform: read
+the template file, fill in `## Summary`, `## Testing`, `## Checklist` (or
+whatever sections are present) from the bead, and emit Markdown. The
+exact tool is up to the worker — `sed`, `awk`, or a small inline script all
+work; just produce the final body string.
+
+**4. Sanitize body and title against the private-name denylist.**
+
+Split `{{pr_private_denylist}}` on commas. For each term, do a
+case-insensitive substring scan of the rendered PR body. Replace each hit
+with the literal placeholder `<redacted>` and emit a WARN log line of the
+form `WARN: denylist hit '<term>' in PR body — replaced with <redacted>`
+so the mayor can audit during review.
+
+For the **title**, the same scan applies but the action differs: if ANY
+denylist term hits the title, **REPLACE the entire title** with a generic
+placeholder derived from the bead type and a leading-word abstract — for
+example `feat: <generic abstract of work> ({{issue}})`. A half-redacted
+title (`<redacted> doctor check for ...`) is unprofessional and signals
+carelessness, so always replace the title as a whole.
+
+```bash
+SANITIZED_BODY="$PR_BODY"
+SANITIZED_TITLE="$PR_TITLE"
+TITLE_HIT=0
+IFS=',' read -r -a DENYLIST <<< "{{pr_private_denylist}}"
+for TERM in "${DENYLIST[@]}"; do
+    TERM_TRIMMED=$(printf '%s' "$TERM" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+    [ -z "$TERM_TRIMMED" ] && continue
+    if printf '%s' "$SANITIZED_BODY" | grep -iq -F "$TERM_TRIMMED"; then
+        SANITIZED_BODY=$(printf '%s' "$SANITIZED_BODY" \\
+            | sed -E "s/$(printf '%s' "$TERM_TRIMMED" | sed 's/[^A-Za-z0-9]/\\\\&/g')/<redacted>/gI")
+        echo "WARN: denylist hit '$TERM_TRIMMED' in PR body — replaced with <redacted>" >&2
+    fi
+    if printf '%s' "$SANITIZED_TITLE" | grep -iq -F "$TERM_TRIMMED"; then
+        TITLE_HIT=1
+        echo "WARN: denylist hit '$TERM_TRIMMED' in PR title — replacing entire title with generic placeholder" >&2
+    fi
+done
+if [ "$TITLE_HIT" -eq 1 ]; then
+    SANITIZED_TITLE="contrib: upstream change ({{issue}})"
+fi
+```
+
+**5. Open a draft PR against upstream.**
+
+The fork owner for the `--head` argument is whatever GitHub account owns
+the {{origin_remote}} remote; resolve it from `gh repo view {{origin_remote}}`
+or `git remote get-url {{origin_remote}}`.
+
+```bash
+FORK_OWNER=$(gh repo view --json owner -q '.owner.login' \\
+    || git remote get-url {{origin_remote}} | sed -E 's#.*[:/]([^/]+)/[^/]+(\\.git)?$#\\1#')
+PR_URL=$(gh pr create --draft --repo "{{upstream_org}}/{{upstream_repo}}" \\
+    --base "{{target_base}}" \\
+    --head "$FORK_OWNER:$BRANCH" \\
+    --title "$SANITIZED_TITLE" \\
+    --body "$SANITIZED_BODY")
+```
+
+**6. Record the PR URL and outcome on the bead.**
+
+```bash
+bd update {{issue}} --set-metadata pr_url="$PR_URL"
+bd update {{issue}} --set-metadata gc.outcome=success
+bd update {{issue}} --notes "Opened draft PR against {{upstream_org}}/{{upstream_repo}}:{{target_base}}: $PR_URL"
+bd close {{issue}}
+```
+
+**7. Clean up the worktree:**
+```bash
+WORKTREE_PATH=$(pwd)
+cd ..
+git worktree remove "$WORKTREE_PATH" --force
+bd update {{issue}} --unset-metadata work_dir
+```
+
+**8. Signal reconciler and exit.**
+```bash
+gc runtime drain-ack
+exit
+```
+
+`gc runtime drain-ack` tells the reconciler to kill this session. The
+reconciler only restarts you if the pool check command finds more work.
+You are GONE. Done means gone. There is no idle state.
+
+**Exit criteria:** Feature branch pushed to {{origin_remote}}, draft PR
+opened against {{upstream_org}}/{{upstream_repo}}:{{target_base}}, PR URL
+recorded on the bead, bead closed with gc.outcome=success, worktree
+cleaned up, session exited."""

@@ -98,10 +98,23 @@ For small installations where merge review is unnecessary.
 gc sling <agent> <bead-id> --on mol-polecat-commit
 ```
 
+**mol-polecat-pr** — Upstream-PR variant. Cuts a feature branch off a
+configurable upstream remote (default `upstream/main`), pushes the branch
+to the fork (`origin`), and opens a draft pull request against
+`<upstream_org>/<upstream_repo>` rendered from the repo's
+`.github/pull_request_template.md`. PR body and title pass through a
+configurable comma-separated denylist (`pr_private_denylist`) that redacts
+private project names. For contributing back to an upstream source repo
+when the fork is behind or the change needs upstream review.
+
+```
+gc sling <agent> <bead-id> --on mol-polecat-pr
+```
+
 **mol-polecat-base** — Shared base for polecat work formulas. Defines
 the common steps (load context, preflight, implement, self-review) that
 variant formulas extend. Not typically used directly — use a variant
-like mol-polecat-commit or mol-polecat-work instead.
+like mol-polecat-commit, mol-polecat-pr, or mol-polecat-work instead.
 
 ### Gastown pack formulas (work variants)
 
